@@ -87,3 +87,50 @@ LEFT JOIN msdb.dbo.backupset bs ON bs.database_name = d.name
 WHERE d.database_id > 4 AND d.name <> 'rdsadmin'
 GROUP BY d.name, d.recovery_model_desc
 ORDER BY d.name;
+
+
+
+/* ============================================================
+   1) See what the wrapper does — naming, file layout, which
+      dbs it includes/excludes, whether it compresses/encrypts
+   ============================================================ */
+EXEC ops.dbo.sp_helptext 'dbo.rds_daily_backups';
+
+/* 2) When did the job last run and did it succeed? */
+SELECT TOP (20)
+    j.name,
+    h.step_id,
+    h.step_name,
+    msdb.dbo.agent_datetime(h.run_date, h.run_time) AS run_dt,
+    CASE h.run_status WHEN 0 THEN 'FAILED' WHEN 1 THEN 'OK'
+                      WHEN 2 THEN 'RETRY'  WHEN 3 THEN 'CANCELED' END AS status,
+    h.run_duration,
+    LEFT(h.message, 300) AS message
+FROM msdb.dbo.sysjobhistory h
+JOIN msdb.dbo.sysjobs j ON j.job_id = h.job_id
+WHERE EXISTS (SELECT 1 FROM msdb.dbo.sysjobsteps s
+              WHERE s.job_id = j.job_id AND s.command LIKE '%rds_daily_backups%')
+ORDER BY run_dt DESC;
+
+/* 3) Native backups actually written so far — the S3 ARNs are here */
+SELECT TOP (50)
+    bs.database_name, bs.backup_start_date,
+    CAST(bs.backup_size/1048576.0 AS DECIMAL(18,2)) AS size_mb,
+    bmf.physical_device_name
+FROM msdb.dbo.backupset bs
+JOIN msdb.dbo.backupmediafamily bmf ON bmf.media_set_id = bs.media_set_id
+WHERE bmf.physical_device_name LIKE 'arn:aws:s3%'
+ORDER BY bs.backup_start_date DESC;
+
+
+/* ============================================================
+   Ad-hoc full backup of MIO_LOAD to the known bucket
+   ============================================================ */
+EXEC msdb.dbo.rds_backup_database
+     @source_db_name           = N'MIO_LOAD',
+     @s3_arn_to_backup_to      = N'arn:aws:s3:::mio-dba-backups-stg/AdHoc/MIO_LOAD_FULL_20260828.bak',
+     @overwrite_s3_backup_file = 0,
+     @type                     = 'FULL';
+
+/* Poll until lifecycle = SUCCESS */
+EXEC msdb.dbo.rds_task_status @db_name = 'MIO_LOAD';
