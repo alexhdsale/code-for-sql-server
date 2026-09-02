@@ -16,7 +16,7 @@
        EXEC #sp_IndexInfo 'tempdb.dbo.StagingTable';                 /* perm in tempdb  */
 
    Output columns:
-       table_name, index_id, index_name, index_type
+       table_name, index_id, index_name, is_disabled, index_type
        key_columns, included_columns, filter_definition
        columns_in_tree, columns_in_leaf      (physical layout incl. clustering key / UNIQUIFIER / RID)
        rows, partitions, reserved_mb, used_mb, data_compression, storage (filegroup / partition scheme)
@@ -94,9 +94,10 @@ ps AS
     GROUP BY p.index_id
 )
 SELECT
-    table_name       = CASE WHEN @obj LIKE N''#%'' THEN N''tempdb..'' + @obj ELSE o.tn3 END,
+    table_name       = CASE WHEN @obj LIKE N''#%'' THEN N''tempdb..'' + @obj COLLATE DATABASE_DEFAULT ELSE o.tn3 END,
     i.index_id,
     index_name       = ISNULL(i.name, N''<HEAP>''),
+    i.is_disabled,
     index_type       = i.type_desc
                      + CASE WHEN i.is_primary_key = 1       THEN N'', PRIMARY KEY''
                             WHEN i.is_unique_constraint = 1 THEN N'', UNIQUE CONSTRAINT''
@@ -213,7 +214,7 @@ OUTER APPLY sys.dm_db_stats_properties(i.object_id, i.index_id) AS sp
 /* DDL fragments */
 OUTER APPLY (SELECT
     tn3     = QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(OBJECT_SCHEMA_NAME(@oid)) + N''.'' + QUOTENAME(OBJECT_NAME(@oid)),
-    tn      = CASE WHEN @obj LIKE N''#%'' THEN @obj ELSE QUOTENAME(OBJECT_SCHEMA_NAME(@oid)) + N''.'' + QUOTENAME(OBJECT_NAME(@oid)) END,
+    tn      = CASE WHEN @obj LIKE N''#%'' THEN @obj COLLATE DATABASE_DEFAULT ELSE QUOTENAME(OBJECT_SCHEMA_NAME(@oid)) + N''.'' + QUOTENAME(OBJECT_NAME(@oid)) END,
     with_rs = N'' WITH (FILLFACTOR = '' + CAST(CASE WHEN i.fill_factor = 0 THEN 100 ELSE i.fill_factor END AS nvarchar(3))
             + N'', PAD_INDEX = '' + CASE WHEN i.is_padded = 1 THEN N''ON'' ELSE N''OFF'' END
             + CASE WHEN ps.compression IN (N''ROW'', N''PAGE'') THEN N'', DATA_COMPRESSION = '' + ps.compression ELSE N'''' END
