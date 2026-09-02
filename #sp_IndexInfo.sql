@@ -15,7 +15,17 @@
        EXEC #sp_IndexInfo '#MyTemp';                                 /* temp table      */
        EXEC #sp_IndexInfo 'tempdb.dbo.StagingTable';                 /* perm in tempdb  */
 
-   Output columns:
+   Result set 1 - the table (one row):
+       table_name, object_id, object_type, structure (HEAP / CLUSTERED / CLUSTERED COLUMNSTORE / MEMORY_OPTIMIZED),
+       created, modified
+       rows, reserved_mb, data_mb, index_mb, unused_mb   (same formulas as sp_spaceused, in MB)
+       lob_mb, row_overflow_mb, partitions, storage
+       columns, indexes_total / _nonclustered / _columnstore / _disabled / _filtered, statistics_count
+       has_primary_key, has_identity, fk_outgoing, fk_incoming, triggers
+       lock_escalation, temporal_type, is_tracked_by_cdc, change_tracking
+       total_reads, total_writes, last_user_read, last_user_update  (all indexes, since last restart)
+
+   Result set 2 - the indexes (one row each, heap included):
        table_name, index_id, index_name, is_disabled, index_type
        key_columns, included_columns, filter_definition
        columns_in_tree, columns_in_leaf      (physical layout incl. clustering key / UNIQUIFIER / RID)
@@ -56,6 +66,86 @@ BEGIN
     RETURN;
 END;
 
+/* ======================= result set 1: the table ======================= */
+SELECT
+    table_name        = CASE WHEN @obj LIKE N''#%'' THEN N''tempdb..'' + @obj COLLATE DATABASE_DEFAULT
+                             ELSE QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(OBJECT_SCHEMA_NAME(@oid)) + N''.'' + QUOTENAME(OBJECT_NAME(@oid)) END,
+    object_id         = @oid,
+    object_type       = o.type_desc,
+    structure         = CASE WHEN t.is_memory_optimized = 1 THEN N''MEMORY_OPTIMIZED''
+                             WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @oid AND index_id = 1 AND type = 1) THEN N''CLUSTERED''
+                             WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @oid AND index_id = 1 AND type = 5) THEN N''CLUSTERED COLUMNSTORE''
+                             ELSE N''HEAP'' END,
+    created           = o.create_date,
+    modified          = o.modify_date,
+    /* sp_spaceused, same formulas, in MB */
+    [rows]            = sz.[rows],
+    reserved_mb       = sz.reserved_mb,
+    data_mb           = sz.data_mb,
+    index_mb          = sz.index_mb,
+    unused_mb         = sz.unused_mb,
+    lob_mb            = sz.lob_mb,
+    row_overflow_mb   = sz.row_overflow_mb,
+    partitions        = sz.partitions,
+    storage           = CASE WHEN ds.type = N''PS'' THEN N''PS: '' + ds.name ELSE ds.name END,
+    /* shape */
+    columns           = (SELECT COUNT(*) FROM sys.columns WHERE object_id = @oid),
+    indexes_total        = ix.total_cnt,
+    indexes_nonclustered = ix.nc_cnt,
+    indexes_columnstore  = ix.cs_cnt,
+    indexes_disabled     = ix.dis_cnt,
+    indexes_filtered     = ix.flt_cnt,
+    statistics_count  = (SELECT COUNT(*) FROM sys.stats WHERE object_id = @oid),
+    has_primary_key   = CAST(OBJECTPROPERTY(@oid, ''TableHasPrimaryKey'') AS bit),
+    has_identity      = CAST(OBJECTPROPERTY(@oid, ''TableHasIdentity'')   AS bit),
+    fk_outgoing       = (SELECT COUNT(*) FROM sys.foreign_keys WHERE parent_object_id     = @oid),
+    fk_incoming       = (SELECT COUNT(*) FROM sys.foreign_keys WHERE referenced_object_id = @oid),
+    triggers          = (SELECT COUNT(*) FROM sys.triggers WHERE parent_id = @oid),
+    lock_escalation   = t.lock_escalation_desc,
+    temporal_type     = t.temporal_type_desc,
+    is_tracked_by_cdc = t.is_tracked_by_cdc,
+    change_tracking   = CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = @oid) THEN 1 ELSE 0 END AS bit),
+    /* usage across all indexes since last restart */
+    total_reads       = ISNULL(us.reads, 0),
+    total_writes      = ISNULL(us.writes, 0),
+    last_user_read    = us.last_read,
+    last_user_update  = us.last_write
+FROM sys.objects AS o
+LEFT JOIN sys.tables AS t ON t.object_id = o.object_id
+LEFT JOIN sys.indexes AS i0 ON i0.object_id = o.object_id AND i0.index_id IN (0, 1)
+LEFT JOIN sys.data_spaces AS ds ON ds.data_space_id = i0.data_space_id
+OUTER APPLY (
+    SELECT [rows]           = SUM(CASE WHEN s.index_id < 2 THEN s.row_count ELSE 0 END),
+           reserved_mb      = CAST(SUM(s.reserved_page_count) / 128.0 AS decimal(18,2)),
+           data_mb          = CAST(SUM(CASE WHEN s.index_id < 2 THEN s.in_row_data_page_count + s.lob_used_page_count + s.row_overflow_used_page_count
+                                            ELSE s.lob_used_page_count + s.row_overflow_used_page_count END) / 128.0 AS decimal(18,2)),
+           index_mb         = CAST((SUM(s.used_page_count)
+                                  - SUM(CASE WHEN s.index_id < 2 THEN s.in_row_data_page_count + s.lob_used_page_count + s.row_overflow_used_page_count
+                                             ELSE s.lob_used_page_count + s.row_overflow_used_page_count END)) / 128.0 AS decimal(18,2)),
+           unused_mb        = CAST((SUM(s.reserved_page_count) - SUM(s.used_page_count)) / 128.0 AS decimal(18,2)),
+           lob_mb           = CAST(SUM(s.lob_used_page_count) / 128.0 AS decimal(18,2)),
+           row_overflow_mb  = CAST(SUM(s.row_overflow_used_page_count) / 128.0 AS decimal(18,2)),
+           partitions       = COUNT(DISTINCT CASE WHEN s.index_id < 2 THEN s.partition_number END)
+    FROM sys.dm_db_partition_stats AS s
+    WHERE s.object_id = @oid) AS sz
+OUTER APPLY (
+    SELECT total_cnt = SUM(CASE WHEN index_id > 0 THEN 1 ELSE 0 END),
+           nc_cnt    = SUM(CASE WHEN type = 2 THEN 1 ELSE 0 END),
+           cs_cnt    = SUM(CASE WHEN type IN (5, 6) THEN 1 ELSE 0 END),
+           dis_cnt   = SUM(CASE WHEN is_disabled = 1 THEN 1 ELSE 0 END),
+           flt_cnt   = SUM(CASE WHEN has_filter = 1 THEN 1 ELSE 0 END)
+    FROM sys.indexes WHERE object_id = @oid AND is_hypothetical = 0) AS ix
+OUTER APPLY (
+    SELECT reads      = SUM(u.user_seeks + u.user_scans + u.user_lookups),
+           writes     = SUM(u.user_updates),
+           last_read  = MAX(x.v),
+           last_write = MAX(u.last_user_update)
+    FROM sys.dm_db_index_usage_stats AS u
+    CROSS APPLY (SELECT MAX(v) AS v FROM (VALUES (u.last_user_seek), (u.last_user_scan), (u.last_user_lookup)) AS t(v)) AS x
+    WHERE u.database_id = DB_ID() AND u.object_id = @oid) AS us
+WHERE o.object_id = @oid;
+
+/* ======================= result set 2: the indexes ===================== */
 WITH ic AS
 (   /* every column of every index on the table, pre-quoted */
     SELECT ic.index_id, ic.column_id, ic.key_ordinal, ic.partition_ordinal,
