@@ -1,0 +1,325 @@
+/* ============================================================
+   XE SESSION: Slow queries / procs > 500 ms with session info + actual plans
+   Target : SQL Server 2025 (works on 2019/2022 as well)
+   Author : generated for Alexey
+   ============================================================
+
+   DESIGN NOTES (read before running on prod)
+   -------------------------------------------
+   1. Duration predicate is in MICROSECONDS: 500000 = 0.5 s.
+   2. Statement-level events (sql_statement_completed / sp_statement_completed)
+      fire for each statement, batch/RPC-level events (sql_batch_completed /
+      rpc_completed) fire once for the whole batch or proc call. Both are
+      captured so you can see the slow proc AND the slow statement inside it.
+   3. PLAN CAPTURE. Two options, pick ONE:
+        a) query_post_execution_plan_profile  (DEFAULT, RECOMMENDED)
+           Uses lightweight profiling (on by default since 2019) -> low overhead,
+           actual plan with per-operator row counts / CPU / IO. Predicate on
+           duration works because the event fires post-execution.
+        b) query_post_execution_showplan  (COMMENTED OUT)
+           Full actual plan incl. all runtime warnings, but the plan XML is
+           built for EVERY statement before the predicate is evaluated ->
+           documented "significant performance overhead". Use only for short
+           targeted troubleshooting windows.
+      Both options also record plan_handle / query_hash / query_plan_hash so
+      you can pull the plan from Query Store (on by default in 2025) or the
+      plan cache without the plan event at all.
+   4. sql_text action is the full input buffer; on big ad-hoc batches it can
+      get large. Keep max_event_size / file size in mind.
+   5. Target is event_file (async, no memory-target locking). Change the path.
+   ============================================================ */
+
+USE [master];
+GO
+
+/* ------------------------------------------------------------
+   PHASE 0: drop existing session with the same name (idempotent)
+   ------------------------------------------------------------ */
+IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'XE_SlowQueries_500ms')
+    DROP EVENT SESSION [XE_SlowQueries_500ms] ON SERVER;
+GO
+
+/* ------------------------------------------------------------
+   PHASE 1: create the session
+   ------------------------------------------------------------ */
+CREATE EVENT SESSION [XE_SlowQueries_500ms] ON SERVER
+
+/* ---- Statement level: ad-hoc / batch statements ---- */
+ADD EVENT sqlserver.sql_statement_completed
+(
+    SET collect_statement = (1), collect_parameterized_plan_handle = (1)
+    ACTION
+    (
+        sqlserver.session_id,
+        sqlserver.request_id,
+        sqlserver.database_id,
+        sqlserver.database_name,
+        sqlserver.username,
+        sqlserver.session_nt_username,
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.client_pid,
+        sqlserver.client_connection_id,
+        sqlserver.transaction_id,
+        sqlserver.is_system,
+        sqlserver.plan_handle,
+        sqlserver.query_hash,
+        sqlserver.query_plan_hash,
+        sqlserver.sql_text,
+        sqlserver.tsql_frame,
+        sqlserver.tsql_stack,
+        sqlserver.session_resource_pool_id,
+        sqlserver.session_resource_group_id,
+        sqlos.task_time,
+        sqlos.scheduler_id
+    )
+    WHERE ( sqlserver.is_system = 0 AND duration > 500000 )
+),
+
+/* ---- Statement level: statements inside stored procs / triggers / functions ---- */
+ADD EVENT sqlserver.sp_statement_completed
+(
+    SET collect_object_name = (1), collect_statement = (1)
+    ACTION
+    (
+        sqlserver.session_id,
+        sqlserver.request_id,
+        sqlserver.database_id,
+        sqlserver.database_name,
+        sqlserver.username,
+        sqlserver.session_nt_username,
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.client_pid,
+        sqlserver.client_connection_id,
+        sqlserver.transaction_id,
+        sqlserver.is_system,
+        sqlserver.plan_handle,
+        sqlserver.query_hash,
+        sqlserver.query_plan_hash,
+        sqlserver.sql_text,
+        sqlserver.tsql_frame,
+        sqlserver.tsql_stack,
+        sqlserver.session_resource_pool_id,
+        sqlserver.session_resource_group_id,
+        sqlos.task_time,
+        sqlos.scheduler_id
+    )
+    WHERE ( sqlserver.is_system = 0 AND duration > 500000 )
+),
+
+/* ---- Batch level: whole ad-hoc batch ---- */
+ADD EVENT sqlserver.sql_batch_completed
+(
+    SET collect_batch_text = (1)
+    ACTION
+    (
+        sqlserver.session_id,
+        sqlserver.request_id,
+        sqlserver.database_id,
+        sqlserver.database_name,
+        sqlserver.username,
+        sqlserver.session_nt_username,
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.client_pid,
+        sqlserver.client_connection_id,
+        sqlserver.transaction_id,
+        sqlserver.is_system,
+        sqlserver.plan_handle,
+        sqlserver.query_hash,
+        sqlserver.query_plan_hash,
+        sqlserver.session_resource_pool_id,
+        sqlserver.session_resource_group_id
+    )
+    WHERE ( sqlserver.is_system = 0 AND duration > 500000 )
+),
+
+/* ---- RPC level: whole stored-proc / parameterized call from the client ---- */
+ADD EVENT sqlserver.rpc_completed
+(
+    SET collect_statement = (1), collect_data_stream = (0), collect_output_parameters = (1)
+    ACTION
+    (
+        sqlserver.session_id,
+        sqlserver.request_id,
+        sqlserver.database_id,
+        sqlserver.database_name,
+        sqlserver.username,
+        sqlserver.session_nt_username,
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.client_pid,
+        sqlserver.client_connection_id,
+        sqlserver.transaction_id,
+        sqlserver.is_system,
+        sqlserver.plan_handle,
+        sqlserver.query_hash,
+        sqlserver.query_plan_hash,
+        sqlserver.session_resource_pool_id,
+        sqlserver.session_resource_group_id
+    )
+    WHERE ( sqlserver.is_system = 0 AND duration > 500000 )
+),
+
+/* ---- Actual execution plan (lightweight profiling) - OPTION (a), default ---- */
+ADD EVENT sqlserver.query_post_execution_plan_profile
+(
+    ACTION
+    (
+        sqlserver.session_id,
+        sqlserver.request_id,
+        sqlserver.database_name,
+        sqlserver.username,
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.plan_handle,
+        sqlserver.query_hash,
+        sqlserver.query_plan_hash,
+        sqlserver.sql_text
+    )
+    WHERE ( sqlserver.is_system = 0 AND duration > 500000 )
+)
+
+/* ---- Full actual showplan - OPTION (b), HIGH OVERHEAD, uncomment only for short windows ----
+,ADD EVENT sqlserver.query_post_execution_showplan
+(
+    ACTION
+    (
+        sqlserver.session_id,
+        sqlserver.request_id,
+        sqlserver.database_name,
+        sqlserver.username,
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.plan_handle,
+        sqlserver.query_hash,
+        sqlserver.query_plan_hash,
+        sqlserver.sql_text
+    )
+    WHERE ( sqlserver.is_system = 0 AND duration > 500000 )
+)
+------------------------------------------------------------------------------------------- */
+
+ADD TARGET package0.event_file
+(
+    SET filename            = N'D:\XE\XE_SlowQueries_500ms.xel',   /* <-- change path */
+        max_file_size       = (256),      /* MB per rollover file */
+        max_rollover_files  = (20)        /* ~5 GB cap on disk */
+)
+WITH
+(
+    MAX_MEMORY            = 64 MB,
+    EVENT_RETENTION_MODE  = ALLOW_SINGLE_EVENT_LOSS,   /* never block the workload */
+    MAX_DISPATCH_LATENCY  = 15 SECONDS,
+    MAX_EVENT_SIZE        = 0 KB,
+    MEMORY_PARTITION_MODE = PER_CPU,                   /* NUMA-friendly on big boxes */
+    TRACK_CAUSALITY       = ON,                        /* correlates proc + inner stmts + plan */
+    STARTUP_STATE         = ON                         /* survives restarts; set OFF if temporary */
+);
+GO
+
+/* UNDO:
+   DROP EVENT SESSION [XE_SlowQueries_500ms] ON SERVER;
+*/
+
+/* ------------------------------------------------------------
+   PHASE 2: start / stop
+   ------------------------------------------------------------ */
+ALTER EVENT SESSION [XE_SlowQueries_500ms] ON SERVER STATE = START;
+GO
+/* ALTER EVENT SESSION [XE_SlowQueries_500ms] ON SERVER STATE = STOP; */
+
+/* ------------------------------------------------------------
+   PHASE 3: sanity check - session running, files being written
+   ------------------------------------------------------------ */
+SELECT s.name, s.create_time, t.target_name, t.execution_count, t.bytes_written
+FROM sys.dm_xe_sessions AS s
+JOIN sys.dm_xe_session_targets AS t ON t.event_session_address = s.address
+WHERE s.name = N'XE_SlowQueries_500ms';
+GO
+
+/* ------------------------------------------------------------
+   PHASE 4: read the file target - slow statements/batches/RPCs
+   (shred once into a temp table, then query; fn_xe_file_target_read_file
+    + XQuery over the raw file is slow on large files)
+   ------------------------------------------------------------ */
+DROP TABLE IF EXISTS #xe;
+SELECT CAST(event_data AS XML) AS x
+INTO #xe
+FROM sys.fn_xe_file_target_read_file(N'D:\XE\XE_SlowQueries_500ms*.xel', NULL, NULL, NULL);
+
+SELECT
+    event_name        = x.value('(event/@name)[1]', 'sysname'),
+    event_time_utc    = x.value('(event/@timestamp)[1]', 'datetime2(3)'),
+    duration_ms       = x.value('(event/data[@name="duration"]/value)[1]', 'bigint') / 1000,
+    cpu_ms            = x.value('(event/data[@name="cpu_time"]/value)[1]', 'bigint') / 1000,
+    logical_reads     = x.value('(event/data[@name="logical_reads"]/value)[1]', 'bigint'),
+    physical_reads    = x.value('(event/data[@name="physical_reads"]/value)[1]', 'bigint'),
+    writes            = x.value('(event/data[@name="writes"]/value)[1]', 'bigint'),
+    row_count         = x.value('(event/data[@name="row_count"]/value)[1]', 'bigint'),
+    object_name       = x.value('(event/data[@name="object_name"]/value)[1]', 'sysname'),
+    statement         = COALESCE(
+                          x.value('(event/data[@name="statement"]/value)[1]', 'nvarchar(max)'),
+                          x.value('(event/data[@name="batch_text"]/value)[1]', 'nvarchar(max)')),
+    session_id        = x.value('(event/action[@name="session_id"]/value)[1]', 'int'),
+    database_name     = x.value('(event/action[@name="database_name"]/value)[1]', 'sysname'),
+    username          = x.value('(event/action[@name="username"]/value)[1]', 'sysname'),
+    nt_username       = x.value('(event/action[@name="session_nt_username"]/value)[1]', 'sysname'),
+    client_app_name   = x.value('(event/action[@name="client_app_name"]/value)[1]', 'nvarchar(256)'),
+    client_hostname   = x.value('(event/action[@name="client_hostname"]/value)[1]', 'nvarchar(256)'),
+    client_pid        = x.value('(event/action[@name="client_pid"]/value)[1]', 'int'),
+    transaction_id    = x.value('(event/action[@name="transaction_id"]/value)[1]', 'bigint'),
+    query_hash        = x.value('(event/action[@name="query_hash"]/value)[1]', 'decimal(20,0)'),
+    query_plan_hash   = x.value('(event/action[@name="query_plan_hash"]/value)[1]', 'decimal(20,0)'),
+    plan_handle       = x.value('xs:hexBinary((event/action[@name="plan_handle"]/value)[1])', 'varbinary(64)'),
+    activity_id       = x.value('(event/action[@name="attach_activity_id"]/value)[1]', 'varchar(60)'),
+    sql_text          = x.value('(event/action[@name="sql_text"]/value)[1]', 'nvarchar(max)')
+FROM #xe
+WHERE x.value('(event/@name)[1]', 'sysname') IN
+      (N'sql_statement_completed', N'sp_statement_completed', N'sql_batch_completed', N'rpc_completed')
+ORDER BY duration_ms DESC;
+
+/* ------------------------------------------------------------
+   PHASE 5: read the captured actual plans (click the XML to open in SSMS)
+   Join to the statement rows on activity_id (TRACK_CAUSALITY) or plan_handle.
+   ------------------------------------------------------------ */
+SELECT
+    event_name        = x.value('(event/@name)[1]', 'sysname'),
+    event_time_utc    = x.value('(event/@timestamp)[1]', 'datetime2(3)'),
+    duration_ms       = x.value('(event/data[@name="duration"]/value)[1]', 'bigint') / 1000,
+    session_id        = x.value('(event/action[@name="session_id"]/value)[1]', 'int'),
+    database_name     = x.value('(event/action[@name="database_name"]/value)[1]', 'sysname'),
+    client_app_name   = x.value('(event/action[@name="client_app_name"]/value)[1]', 'nvarchar(256)'),
+    query_hash        = x.value('(event/action[@name="query_hash"]/value)[1]', 'decimal(20,0)'),
+    query_plan_hash   = x.value('(event/action[@name="query_plan_hash"]/value)[1]', 'decimal(20,0)'),
+    activity_id       = x.value('(event/action[@name="attach_activity_id"]/value)[1]', 'varchar(60)'),
+    sql_text          = x.value('(event/action[@name="sql_text"]/value)[1]', 'nvarchar(max)'),
+    actual_plan_xml   = x.query('event/data[@name="showplan_xml"]/value/*')
+FROM #xe
+WHERE x.value('(event/@name)[1]', 'sysname') IN
+      (N'query_post_execution_plan_profile', N'query_post_execution_showplan')
+ORDER BY duration_ms DESC;
+
+/* ------------------------------------------------------------
+   PHASE 6 (optional): pull the plan from Query Store by query_plan_hash
+   if you decided NOT to run the plan event at all.
+   ------------------------------------------------------------ */
+/*
+USE [YourDatabase];
+SELECT qsq.query_id, qsp.plan_id, qsqt.query_sql_text,
+       CAST(qsp.query_plan AS XML) AS query_plan, qsp.last_execution_time
+FROM sys.query_store_plan       AS qsp
+JOIN sys.query_store_query      AS qsq  ON qsq.query_id = qsp.query_id
+JOIN sys.query_store_query_text AS qsqt ON qsqt.query_text_id = qsq.query_text_id
+WHERE qsp.query_plan_hash = 0x0000000000000000;   -- <- from Phase 4 output
+*/
+
+/* ------------------------------------------------------------
+   CLEANUP / UNDO everything
+   ------------------------------------------------------------ */
+/*
+ALTER EVENT SESSION [XE_SlowQueries_500ms] ON SERVER STATE = STOP;
+DROP EVENT SESSION  [XE_SlowQueries_500ms] ON SERVER;
+-- then delete D:\XE\XE_SlowQueries_500ms*.xel from disk
+*/
