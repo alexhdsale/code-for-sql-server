@@ -82,6 +82,12 @@ $ColNA      = [System.Drawing.Color]::FromArgb(243, 244, 246)
 $ColCrit    = [System.Drawing.Color]::FromArgb(254, 226, 226)
 $ColOk      = [System.Drawing.Color]::FromArgb(220, 252, 231)
 $ColWarn    = [System.Drawing.Color]::FromArgb(254, 243, 199)
+# Feature state badges
+$BadgeOn    = [System.Drawing.Color]::FromArgb(22, 163, 74)     # green  = enabled
+$BadgeOff   = [System.Drawing.Color]::FromArgb(220, 38, 38)     # red    = disabled
+$BadgeNA    = [System.Drawing.Color]::FromArgb(156, 163, 175)   # grey   = not defined / not applicable
+$BadgeEdit  = [System.Drawing.Color]::FromArgb(245, 158, 11)    # orange frame = changed, not applied
+$BadgeSel   = [System.Drawing.Color]::FromArgb(37, 99, 235)     # blue frame = selected
 $UiFont     = New-Object System.Drawing.Font('Segoe UI', 9)
 $UiBold     = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
  
@@ -265,9 +271,27 @@ function Set-ReadOnlyColumns([System.Windows.Forms.DataGridView]$Grid, [string]$
         if (-not $editable) { $col.DefaultCellStyle.ForeColor = [System.Drawing.Color]::FromArgb(55, 65, 81) }
         if ($col -is [System.Windows.Forms.DataGridViewCheckBoxColumn]) {
             $col.AutoSizeMode = 'None'
-            $col.Width = 62
+            $col.Width = 70
+            $col.ReadOnly = $true          # toggled by our click handler, painted as a colored badge
+            $col.SortMode = 'Automatic'
         }
     }
+}
+ 
+function Get-FeatureState($Row, [string]$Col) {
+    # Returns ON | OFF | NA   (NA = not defined / not applicable)
+    $v = $Row.Item($Col)
+    if ($v -is [System.DBNull] -or $null -eq $v) { return 'NA' }
+    $t = $Row.Table
+    if ($t.Columns.Contains('monitored') -and $Col -ne 'monitored' -and -not [bool]$Row.Item('monitored')) { return 'NA' }
+    if ($Col -eq 'log_backup' -and $t.Columns.Contains('recovery_model') -and [string]$Row.Item('recovery_model') -ne 'FULL') { return 'NA' }
+    if ($t.Columns.Contains('state') -and [string]$Row.Item('state') -eq 'DROPPED' -and $Col -ne 'monitored') { return 'NA' }
+    if ([bool]$v) { return 'ON' } else { return 'OFF' }
+}
+ 
+function Test-BoolColumn([System.Windows.Forms.DataGridView]$Grid, [int]$ColIndex) {
+    if ($ColIndex -lt 0) { return $false }
+    return ($Grid.Columns[$ColIndex] -is [System.Windows.Forms.DataGridViewCheckBoxColumn])
 }
  
 function Update-PendingLabel {
@@ -287,9 +311,9 @@ function Set-SelectedCells([bool]$Value) {
     $g = $script:Grids[$tabKey]
     foreach ($cell in $g.SelectedCells) {
         $colName = $g.Columns[$cell.ColumnIndex].DataPropertyName
-        if (($script:Editable[$tabKey] -contains $colName) -and
-            ($g.Columns[$cell.ColumnIndex] -is [System.Windows.Forms.DataGridViewCheckBoxColumn])) {
+        if (($script:Editable[$tabKey] -contains $colName) -and (Test-BoolColumn $g $cell.ColumnIndex)) {
             $drv = $g.Rows[$cell.RowIndex].DataBoundItem
+            if ((Get-FeatureState $drv.Row $colName) -eq 'NA' -and $colName -ne 'monitored') { continue }
             $drv.Row[$colName] = $Value
         }
     }
@@ -314,9 +338,13 @@ function Invoke-LoadEditable {
 SELECT c.database_name, ISNULL(s.recovery_model, N'?') AS recovery_model,
        CASE WHEN ISNULL(s.is_present, 1) = 0 THEN N'DROPPED' ELSE ISNULL(s.state_desc, N'?') END AS state,
        $cols,
-       c.retention_days, c.storage_retention_days, c.notes, c.modified_utc, c.modified_by
+       c.retention_days, c.storage_retention_days, c.notes,
+       CONVERT(varchar(16), mon.fn_UtcToLocal(h.last_checkdb_utc, ISNULL(mon.fn_Setting('display_time_zone'), N'Eastern Standard Time')), 120) AS last_checkdb,
+       LOWER(h.checkdb_source) AS checkdb_source,
+       c.modified_utc, c.modified_by
 FROM mon.DatabaseCheck AS c
 LEFT JOIN mon.DatabaseStatus AS s ON s.database_name = c.database_name
+LEFT JOIN mon.vw_BackupHealth AS h ON h.database_name = c.database_name
 ORDER BY c.database_name;
 "@
         $script:Tables['server'] = Get-MonTable @'
@@ -348,6 +376,9 @@ ORDER BY k.sort_order;
         $h['retention_days'].ToolTipText = 'Required backup history depth. Empty = default setting backup_retention_target_days.'
         $h['storage_retention_days'].HeaderText = 'Storage policy (d)'
         $h['storage_retention_days'].ToolTipText = 'Declared lifecycle of backup files on S3/disk. Empty = default setting backup_storage_retention_days.'
+        $h['last_checkdb'].HeaderText = 'Last good CHECKDB'
+        $h['last_checkdb'].ToolTipText = 'Newest of DATABASEPROPERTYEX LastGoodCheckDbTime / DBCC DBINFO / Ola CommandLog DBCC_CHECKDB.'
+        $h['checkdb_source'].HeaderText = 'CHECKDB source'
         Invoke-ApplyFilter
     } finally {
         $script:Loading = $false
@@ -362,9 +393,17 @@ function Invoke-LoadReadOnly {
         $script:Grids['retsum'].DataSource = $ds.Tables[1]
     } catch { Set-Status ('Backup retention: ' + $_.Exception.Message) }
     try {
-        $ds2 = Get-MonDataSet 'EXEC mon.usp_ShowOlaLog @Hours = 168;'
+        $ds2 = Get-MonDataSet 'EXEC mon.usp_ShowOlaLog @Hours = 720;'
         $script:Grids['ola'].DataSource = $ds2.Tables[0]
         $script:Grids['olafail'].DataSource = $ds2.Tables[1]
+        $script:Grids['oladb'].DataSource = $ds2.Tables[2]
+        $script:Grids['olasrc'].DataSource = $ds2.Tables[3]
+        $types = @($ds2.Tables[0].Rows | ForEach-Object { [string]$_.Item(0) })
+        $src = @($ds2.Tables[3].Rows | Where-Object { $_.Item(1) } | ForEach-Object { [string]$_.Item(0) }) -join ', '
+        $missing = @('DBCC_CHECKDB','BACKUP_DATABASE','BACKUP_LOG') | Where-Object { $types -notcontains $_ }
+        $script:OlaNote.Text = if (-not $src) { 'No dbo.CommandLog found. Set setting ola_commandlog_database or install Ola with @LogToTable = ''Y''.' }
+            elseif ($missing) { ('CommandLog read from: {0}.  Not seen in 30 days: {1}  -> that job does not log here (check @LogToTable = ''Y'' / @DatabaseName of CommandLog in its job step) or did not run. RDS native backups (DBMaintenance - Daily Backups) never appear here.' -f $src, ($missing -join ', ')) }
+            else { ('CommandLog read from: {0}' -f $src) }
     } catch { Set-Status ('Ola log: ' + $_.Exception.Message) }
     try {
         $script:Grids['log'].DataSource = Get-MonTable 'SELECT TOP (1000) changed_utc, changed_by, host_name, object_name, item_name, property_name, old_value, new_value FROM mon.CheckChangeLog ORDER BY change_log_id DESC;'
@@ -457,7 +496,7 @@ $script:BtnApply = Add-Button 'APPLY' 130
 $BtnApply.Font = $UiBold; $BtnApply.BackColor = [System.Drawing.Color]::FromArgb(37, 99, 235); $BtnApply.ForeColor = [System.Drawing.Color]::White
 $BtnApply.FlatStyle = 'Flat'; $BtnApply.Enabled = $false; $BtnDiscard.Enabled = $false
 $hint = New-Object System.Windows.Forms.Label
-$hint.Text = 'Select cells (drag / Ctrl / Shift) then Check/Uncheck.  Yellow = changed, not yet applied.  Grey = not monitored / not applicable.'
+$hint.Text = 'Click a badge to toggle.  GREEN = enabled   RED = disabled   GREY = not defined / not applicable   ORANGE frame = changed, not applied.  Multi-select + Check/Uncheck for bulk.'
 $hint.AutoSize = $true; $hint.Margin = '14,8,0,0'; $hint.ForeColor = [System.Drawing.Color]::FromArgb(107, 114, 128); $bar.Controls.Add($hint)
  
 # --- tabs ---
@@ -488,7 +527,15 @@ Add-Tab 'Databases - what is checked' 'db' $Grids['db']
 Add-Tab 'Server checks' 'server' $Grids['server']
 Add-Tab 'Settings / thresholds' 'settings' $Grids['settings']
 Add-Tab 'Backup retention' 'ret' (New-SplitGrids 'retsum' 'Totals per backup type (files made / on storage / policy)' 'ret' 'Per database and type (live)')
-Add-Tab 'Ola CommandLog (7 days)' 'ola' (New-SplitGrids 'ola' 'Commands per type' 'olafail' 'Failed commands')
+$olaPanel = New-Object System.Windows.Forms.Panel; $olaPanel.Dock = 'Fill'
+$script:OlaNote = New-Object System.Windows.Forms.Label
+$OlaNote.Dock = 'Top'; $OlaNote.Height = 34; $OlaNote.ForeColor = [System.Drawing.Color]::FromArgb(180, 83, 9)
+$olaOuter = New-SplitGrids 'ola' 'Commands per type (30 days)' 'olafail' 'Commands with errors (CORRUPTION FOUND / FAILED / SKIPPED)'
+$olaInner = New-SplitGrids 'oladb' 'Last successful CHECKDB / FULL / DIFF / LOG per database (all imported history)' 'olasrc' 'Where dbo.CommandLog was found'
+$olaMain = New-Object System.Windows.Forms.SplitContainer; $olaMain.Dock = 'Fill'; $olaMain.Orientation = 'Vertical'
+$olaMain.Panel1.Controls.Add($olaOuter); $olaMain.Panel2.Controls.Add($olaInner)
+$olaPanel.Controls.Add($olaMain); $olaPanel.Controls.Add($OlaNote)
+Add-Tab 'Ola CommandLog (30 days)' 'ola' $olaPanel
 Add-Tab 'Change log (audit)' 'log' $Grids['log']
  
 # --- status bar ---
@@ -507,12 +554,57 @@ $Form.Controls.Add($status)
 # --------------------------------------------------------------------------------------------
 foreach ($key in @('db','server','settings')) {
     $g = $script:Grids[$key]
-    # Commit checkbox clicks immediately (default is on cell leave)
-    $g.Add_CurrentCellDirtyStateChanged({
+    # Feature state badges: GREEN = ON, RED = OFF, GREY = not defined / n/a, ORANGE frame = pending change
+    $g.Add_CellPainting({
         param($s, $e)
-        if ($s.IsCurrentCellDirty -and $s.CurrentCell -is [System.Windows.Forms.DataGridViewCheckBoxCell]) {
-            [void]$s.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+        if ($e.RowIndex -lt 0 -or -not (Test-BoolColumn $s $e.ColumnIndex)) { return }
+        $drv = $s.Rows[$e.RowIndex].DataBoundItem
+        if ($null -eq $drv) { return }
+        $row = $drv.Row
+        $colName = $s.Columns[$e.ColumnIndex].DataPropertyName
+        $state = Get-FeatureState $row $colName
+        $changed = Test-ValueChanged $row $colName
+        $selected = ($e.State -band [System.Windows.Forms.DataGridViewElementStates]::Selected) -ne 0
+ 
+        $e.Graphics.FillRectangle([System.Drawing.Brushes]::White, $e.CellBounds)
+        $r = [System.Drawing.Rectangle]::Inflate($e.CellBounds, -3, -2)
+        $color = switch ($state) { 'ON' { $BadgeOn } 'OFF' { $BadgeOff } default { $BadgeNA } }
+        $brush = New-Object System.Drawing.SolidBrush $color
+        $e.Graphics.FillRectangle($brush, $r); $brush.Dispose()
+        $text = switch ($state) { 'ON' { 'ON' } 'OFF' { 'OFF' } default { 'n/a' } }
+        if ($changed) { $text += ' *' }
+        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $UiBold, $r, [System.Drawing.Color]::White,
+            [System.Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine')
+        if ($changed) {
+            $pen = New-Object System.Drawing.Pen($BadgeEdit, 3)
+            $e.Graphics.DrawRectangle($pen, $r.X, $r.Y, $r.Width - 1, $r.Height - 1); $pen.Dispose()
         }
+        if ($selected) {
+            $pen = New-Object System.Drawing.Pen($BadgeSel, 2)
+            $e.Graphics.DrawRectangle($pen, $e.CellBounds.X + 1, $e.CellBounds.Y + 1, $e.CellBounds.Width - 3, $e.CellBounds.Height - 3); $pen.Dispose()
+        }
+        $grid = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(229, 231, 235))
+        $e.Graphics.DrawLine($grid, $e.CellBounds.Left, $e.CellBounds.Bottom - 1, $e.CellBounds.Right, $e.CellBounds.Bottom - 1); $grid.Dispose()
+        $e.Handled = $true
+    })
+    # Single click (no Ctrl/Shift) on a badge toggles it
+    $g.Add_CellMouseClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        if ([System.Windows.Forms.Control]::ModifierKeys -ne [System.Windows.Forms.Keys]::None) { return }
+        if (-not (Test-BoolColumn $s $e.ColumnIndex)) { return }
+        $tabKey = $script:TabControl.SelectedTab.Tag
+        $colName = $s.Columns[$e.ColumnIndex].DataPropertyName
+        if (-not ($script:Editable[$tabKey] -contains $colName)) { return }
+        $row = $s.Rows[$e.RowIndex].DataBoundItem.Row
+        if ((Get-FeatureState $row $colName) -eq 'NA' -and $colName -ne 'monitored') {
+            Set-Status 'Not applicable here (database not monitored, SIMPLE recovery for LOG, or dropped database).'
+            return
+        }
+        $cur = $row.Item($colName)
+        $row[$colName] = -not ($cur -is [bool] -and $cur)
+        $s.InvalidateRow($e.RowIndex)
+        Update-PendingLabel
     })
     $g.Add_CellValueChanged({ if (-not $script:Loading) { Update-PendingLabel } })
     $g.Add_DataError({ param($s, $e) $e.ThrowException = $false; Set-Status ('Invalid value: ' + $e.Exception.Message) })
@@ -525,6 +617,7 @@ foreach ($key in @('db','server','settings')) {
         $row = $drv.Row
         $colName = $s.Columns[$e.ColumnIndex].DataPropertyName
         if (-not $row.Table.Columns.Contains($colName)) { return }
+        if (Test-BoolColumn $s $e.ColumnIndex) { return }
         if (Test-ValueChanged $row $colName) { $e.CellStyle.BackColor = $ColChanged; return }
         if ($row.Table.Columns.Contains('monitored') -and $colName -ne 'monitored' -and $colName -ne 'database_name' -and -not $row.monitored) {
             $e.CellStyle.BackColor = $ColNA; $e.CellStyle.ForeColor = [System.Drawing.Color]::Gray; return
@@ -554,6 +647,9 @@ foreach ($key in @('ret','olafail')) {
             }
         }
         if ($name -eq 'Error' -and $null -ne $e.Value -and -not ($e.Value -is [System.DBNull])) { $e.CellStyle.BackColor = $ColCrit }
+        if ($name -eq 'Outcome') {
+            switch ([string]$e.Value) { 'SKIPPED' { $e.CellStyle.BackColor = $ColWarn } 'OK' { $e.CellStyle.BackColor = $ColOk } default { $e.CellStyle.BackColor = $ColCrit } }
+        }
     })
 }
  
@@ -584,6 +680,7 @@ $BtnConnect.Add_Click({
 $BtnApply.Add_Click({ Invoke-ApplyChanges })
 $BtnRefresh.Add_Click({ if ($script:ConnString) { Invoke-RefreshAll } })
 $BtnOn.Add_Click({ Set-SelectedCells $true })
+foreach ($k in @('db','server')) { $script:Grids[$k].Add_CellValueChanged({ param($s, $e) if ($e.RowIndex -ge 0) { $s.InvalidateRow($e.RowIndex) } }) }
 $BtnOff.Add_Click({ Set-SelectedCells $false })
 $BtnDiscard.Add_Click({
     foreach ($key in @('db','server','settings')) { if ($script:Tables[$key]) { $script:Tables[$key].RejectChanges() } }
