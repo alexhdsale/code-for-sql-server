@@ -121,6 +121,24 @@ IF SCHEMA_ID(N'mon') IS NULL
     EXEC(N'CREATE SCHEMA mon AUTHORIZATION dbo;');
 GO
 
+/*
+   Re-install / upgrade: stop the running engine loop first. Altering mon.usp_EngineLoop while
+   it runs makes that execution fail with error 2801 ("definition ... has changed since it was
+   compiled"). The job's every-minute schedule restarts it automatically with the new code.
+*/
+BEGIN TRY
+    IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'MON - Engine')
+    BEGIN
+        EXEC msdb.dbo.sp_stop_job @job_name = N'MON - Engine';
+        PRINT N'MON - Engine was running: stopped for the upgrade (restarts within 1 minute).';
+        WAITFOR DELAY '00:00:05';
+    END;
+END TRY
+BEGIN CATCH
+    /* job not running (error 22022) - nothing to stop */
+END CATCH;
+GO
+
 /* =============================================================================
    SECTION 1  -  CONFIGURATION
    ============================================================================= */
@@ -1127,6 +1145,8 @@ SELECT v.n, v.v, v.t, v.c, v.d
 FROM (VALUES
     ('ola_commandlog_database', N'', 'text', 'ola',
      N'Database that holds Ola Hallengren dbo.CommandLog. Empty = auto-discover (every online database + master, re-checked hourly).'),
+    ('job_failure_max_age_days', N'7', 'int', 'jobs',
+     N'A job whose LAST run failed stays an open issue (and is listed in the digest) until it succeeds or the failure is older than N days - also for unscheduled / manually started jobs.'),
     ('ola_initial_load_days', N'35', 'int', 'ola',
      N'How many days of CommandLog history are imported on the first run.'),
     ('backup_storage_retention_days', N'', 'text', 'backup',
@@ -1295,6 +1315,20 @@ BEGIN
     SET @value = LTRIM(RTRIM(@value));
     RETURN mon.fn_HtmlEncode(LEFT(@value, @max_len))
          + CASE WHEN LEN(@value) > @max_len THEN N'&#8230;' ELSE N'' END;
+END;
+GO
+
+CREATE OR ALTER FUNCTION mon.fn_CleanAgentMessage(@m nvarchar(max))
+RETURNS nvarchar(max)
+AS
+BEGIN
+    /* Agent step output repeats harmless ANSI warnings (8153 'Null value is eliminated...') that hide
+       the real error. Strip them so the message starts with what matters. */
+    IF @m IS NULL RETURN NULL;
+    SET @m = REPLACE(@m, N'Warning: Null value is eliminated by an aggregate or other SET operation. [SQLSTATE 01003] (Message 8153)', N'');
+    SET @m = REPLACE(@m, N'Warning: Null value is eliminated by an aggregate or other SET operation.', N'');
+    WHILE CHARINDEX(N'  ', @m) > 0 SET @m = REPLACE(@m, N'  ', N' ');
+    RETURN LTRIM(RTRIM(@m));
 END;
 GO
 
@@ -1984,7 +2018,7 @@ BEGIN
                mon.fn_ServerToUtc(DATETIMEFROMPARTS(h.run_date / 10000, (h.run_date / 100) % 100, h.run_date % 100,
                                                     h.run_time / 10000, (h.run_time / 100) % 100, h.run_time % 100, 0)),
                (h.run_duration / 10000) * 3600 + ((h.run_duration / 100) % 100) * 60 + h.run_duration % 100,
-               LEFT(h.message, 4000)
+               LEFT(mon.fn_CleanAgentMessage(h.message), 4000)
         FROM msdb.dbo.sysjobhistory AS h
         JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
         WHERE h.step_id = 0
@@ -1999,7 +2033,7 @@ BEGIN
         OUTER APPLY
         (
             /* The failing step of this execution: last failed step row before the outcome row. */
-            SELECT TOP (1) s.step_id, s.step_name, LEFT(s.message, 4000) AS message
+            SELECT TOP (1) s.step_id, s.step_name, LEFT(mon.fn_CleanAgentMessage(s.message), 4000) AS message
             FROM msdb.dbo.sysjobhistory AS s
             WHERE s.job_id = r.job_id AND s.step_id > 0 AND s.run_status = 0
               AND s.instance_id < r.instance_id
@@ -3285,17 +3319,22 @@ BEGIN
             (
                 SELECT f.job_id, f.job_name, f.run_status, f.run_start_utc, f.failed_step_id, f.failed_step_name, f.message,
                        ROW_NUMBER() OVER (PARTITION BY f.job_id ORDER BY f.run_start_utc DESC, f.instance_id DESC) AS rn,
-                       COUNT(*) OVER (PARTITION BY f.job_id) AS fails
+                       SUM(CASE WHEN f.run_start_utc >= DATEADD(HOUR, -@lookback, @now) THEN 1 ELSE 0 END) OVER (PARTITION BY f.job_id) AS fails
                 FROM mon.AgentFailure AS f
-                WHERE f.run_start_utc >= DATEADD(HOUR, -@lookback, @now)
+                /* not only the event window: a job whose LAST run failed stays open until it succeeds (max N days) */
+                WHERE f.run_start_utc >= DATEADD(DAY, -ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 7), @now)
+                  /* the engine itself: cancel by the installer / error 2801 after a redeploy are expected;
+                     real engine outages are caught by the ENGINE_STALE watchdog */
+                  AND NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
             )
             INSERT #Issue(issue_key, category, severity, is_event, title, detail, event_utc)
             SELECT CONCAT(N'JOBFAIL:', F.job_id), 'AGENT', 'CRITICAL', 0,
                    LEFT(CONCAT(N'Job ', CASE WHEN F.run_status = 3 THEN N'cancelled' ELSE N'failed' END, N': ', F.job_name,
                           CASE WHEN F.fails > 1 THEN CONCAT(N' (', F.fails, N' failures in ', @lookback, N'h)') END), 400),
                    LEFT(CONCAT(N'Last failure ', mon.fn_FmtLocal(F.run_start_utc, @tz),
+                               N' (', mon.fn_Duration(DATEDIFF(SECOND, F.run_start_utc, @now)), N' ago; no successful run since)',
                                N'; step ', ISNULL(CONVERT(nvarchar(10), F.failed_step_id), N'?'), N' "', ISNULL(F.failed_step_name, N'(job outcome)'),
-                               N'": ', ISNULL(F.message, N'')), 4000),
+                               N'": ', ISNULL(mon.fn_CleanAgentMessage(F.message), N'')), 4000),
                    F.run_start_utc
             FROM F
             OUTER APPLY (SELECT TOP (1) r.run_status FROM mon.AgentJobRun AS r
@@ -5027,18 +5066,25 @@ BEGIN
         (
             SELECT TOP (@cap) CONCAT(N'<tr>',
                    mon.fn_Td(CONCAT(N'<b>', mon.fn_HtmlEncode(f.job_name), N'</b>'), 'CRIT'),
-                   mon.fn_Td(mon.fn_Pill(CASE f.run_status WHEN 3 THEN N'CANCELLED' ELSE N'FAILED' END, 'CRIT'), NULL),
+                   mon.fn_Td(CONCAT(mon.fn_Pill(CASE f.run_status WHEN 3 THEN N'CANCELLED' ELSE N'FAILED' END, 'CRIT'),
+                                    CASE WHEN f.run_start_utc < @window_start THEN CONCAT(N'<br>', mon.fn_Pill(N'STILL FAILED', 'WARN')) END), NULL),
                    mon.fn_Td(mon.fn_HtmlEncode(CONCAT(ISNULL(CONVERT(nvarchar(5), f.failed_step_id), N'?'), N'. ', ISNULL(f.failed_step_name, N'(job outcome)'))), NULL),
                    mon.fn_Td(mon.fn_Nw(mon.fn_FmtLocal(f.run_start_utc, @tz)), NULL),
                    mon.fn_Td(mon.fn_Duration(f.duration_s), NULL),
-                   mon.fn_Td(mon.fn_Small(mon.fn_OneLine(f.message, 500)), NULL),
+                   mon.fn_Td(mon.fn_Small(mon.fn_OneLine(mon.fn_CleanAgentMessage(f.message), 500)), NULL),
                    N'</tr>')
             FROM mon.AgentFailure AS f
-            WHERE f.run_start_utc >= @window_start
+            WHERE NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
+              AND (f.run_start_utc >= @window_start
+               /* older failure of a job whose last run is still failed (e.g. unscheduled job, nobody re-ran it) */
+               OR (f.run_start_utc >= DATEADD(DAY, -ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 7), @now)
+                   AND f.instance_id = (SELECT MAX(r.instance_id) FROM mon.AgentJobRun AS r WHERE r.job_id = f.job_id)))
             ORDER BY f.run_start_utc DESC
             FOR XML PATH(''), TYPE
         ).value('(./text())[1]', 'nvarchar(max)');
-        SET @body += mon.fn_Section(CONCAT(N'SQL Agent failures - last ', @lookback, N'h'), N'All jobs, with the step that actually failed.',
+        SET @body += mon.fn_Section(CONCAT(N'SQL Agent failures - last ', @lookback, N'h + jobs still failed'),
+            CONCAT(N'All jobs, with the step that actually failed. STILL FAILED = older failure (up to ',
+                   ISNULL(mon.fn_Setting('job_failure_max_age_days'), N'7'), N' days) and the job has not succeeded since.'),
             N'Job|Outcome|Failed step|Started|Duration|Message',
             ISNULL(@rows, mon.fn_EmptyRow(6, N'No failed or cancelled jobs.')));
 
@@ -5831,6 +5877,10 @@ GO
    ============================================================================= */
 USE [OPS];
 GO
+
+/* clean already-collected Agent messages of the 8153 warning noise */
+UPDATE mon.AgentFailure SET message = mon.fn_CleanAgentMessage(message) WHERE message LIKE N'%Message 8153%';
+UPDATE mon.AgentJobRun  SET message = mon.fn_CleanAgentMessage(message) WHERE message LIKE N'%Message 8153%';
 
 EXEC mon.usp_SyncPolicies;
 EXEC mon.usp_CollectDatabaseState;
