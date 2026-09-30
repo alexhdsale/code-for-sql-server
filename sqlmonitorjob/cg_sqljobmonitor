@@ -1,0 +1,2498 @@
+/*
+    MS-APP-STG / Amazon RDS for SQL Server
+    OPS Professional Backup, Maintenance, and Operational Monitor
+    Revision 11 - one-time backup-monitor reset; sys.databases-only inventory
+
+    What this installer creates
+      - monitor schema and configuration tables in the existing OPS database
+      - collection of RDS native FULL/DIFF tasks, msdb backup history,
+        RDS automated transaction-log metadata, and SQL Agent outcomes
+      - auto-discovery of standard Ola Hallengren maintenance jobs
+      - all SQL Agent failures/cancellations from the last 12 hours
+      - deadlocks from the system_health ring buffer, with XML retained in OPS
+      - high-signal RDS SQL error-log entries and SQL-visible capacity anomalies
+      - 90-day monitoring history
+      - de-duplicated immediate failure/overdue email alerts
+      - change-only highlighted HTML health report checked at 08:00 America/New_York
+        (DST aware); forced reports always send
+      - persistent blocking incidents for waits lasting at least 10 minutes
+      - one-time deletion of OPS.monitor database/backup monitoring history
+      - database inventory populated only from visible sys.databases rows
+      - no creation, alteration, or ownership changes to SQL Agent jobs
+
+    Deployment values selected by the DBA team
+      Server label : MS-APP-STG
+      OPS database : OPS
+      Mail profile : Notifications
+      Recipients   : aleksey_kokit@miopartners.com
+      Thresholds  : FULL 24h, DIFF/effective data backup 6h, LOG 30m,
+                    blocking 10m
+
+    RDS notes
+      - RDS SQL Agent operator notifications are not used. Email is sent by
+        msdb.dbo.sp_send_dbmail.
+      - RDS native FULL/DIFF tasks are asynchronous; final status is collected
+        from msdb.dbo.rds_task_status.
+      - RDS automated transaction-log backups are not assumed to exist in
+        msdb.dbo.backupset. When available, the monitor reads
+        msdb.dbo.rds_fn_list_tlog_backup_metadata.
+      - SQL cannot verify an S3 lifecycle/retention rule. The report therefore
+        shows backup age, task duration, S3 object ARN, and msdb expiration date
+        when present. OPS monitoring history is retained for 90 days.
+      - This revision never grants/denies a server permission, changes a login,
+        changes a database, or creates/alters/deletes a SQL Agent job.
+      - This revision intentionally does not use backup history, RDS task
+        history, Ola CommandLog, deadlocks, or manual entries to discover
+        database names. Only user-database rows returned by sys.databases to
+        the executing login are eligible for the backup grid.
+
+    Run this entire file in SSMS using the normal monitoring deployment login.
+    OPS must already exist. The installer is idempotent and changes only
+    objects in OPS.monitor. Existing SQL Agent jobs may continue to call the
+    same monitor procedures; this installer does not touch those jobs.
+
+    Design references
+      - AWS RDS SQL Server Database Mail:
+        https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/SQLServer.DBMail.html
+      - AWS RDS transaction-log backup metadata:
+        https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER.SQLServer.AddlFeat.TransactionLogAccess.Listing.html
+      - AWS RDS database-name visibility:
+        https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.SQLServer.CommonDBATasks.ManageView.html
+      - Microsoft blocking DMV guidance:
+        https://learn.microsoft.com/sql/relational-databases/system-dynamic-management-views/sys-dm-exec-requests-transact-sql
+*/
+
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+GO
+
+USE [OPS];
+GO
+
+IF SCHEMA_ID(N'monitor') IS NULL
+    EXEC(N'CREATE SCHEMA monitor AUTHORIZATION dbo;');
+GO
+
+/* ---------- Configuration and history tables ---------- */
+
+IF OBJECT_ID(N'monitor.Settings', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.Settings
+    (
+        settings_id                 tinyint       NOT NULL CONSTRAINT PK_Settings PRIMARY KEY,
+        server_label                sysname       NOT NULL,
+        mail_profile                sysname       NOT NULL,
+        recipients                  nvarchar(4000) NOT NULL,
+        report_hour_eastern         tinyint       NOT NULL,
+        history_retention_days      smallint      NOT NULL,
+        repeat_critical_minutes     int           NOT NULL,
+        send_immediate_alerts       bit           NOT NULL,
+        send_daily_report           bit           NOT NULL,
+        send_only_on_change         bit           NOT NULL CONSTRAINT DF_Settings_ChangeOnly DEFAULT (1),
+        blocking_threshold_minutes  smallint      NOT NULL CONSTRAINT DF_Settings_BlockingMinutes DEFAULT (10),
+        modified_utc                datetime2(0)   NOT NULL CONSTRAINT DF_Settings_Modified DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT CK_Settings_Singleton CHECK (settings_id = 1),
+        CONSTRAINT CK_Settings_Hour CHECK (report_hour_eastern BETWEEN 0 AND 23),
+        CONSTRAINT CK_Settings_Retention CHECK (history_retention_days BETWEEN 7 AND 3650),
+        CONSTRAINT CK_Settings_BlockingThreshold CHECK (blocking_threshold_minutes BETWEEN 1 AND 1440)
+    );
+END;
+GO
+
+/* Upgrade existing installations without replacing the Settings row. */
+IF COL_LENGTH(N'monitor.Settings', N'send_only_on_change') IS NULL
+    EXEC(N'ALTER TABLE monitor.Settings
+           ADD send_only_on_change bit NOT NULL
+               CONSTRAINT DF_Settings_ChangeOnly_Upgrade DEFAULT (1) WITH VALUES;');
+GO
+
+IF COL_LENGTH(N'monitor.Settings', N'blocking_threshold_minutes') IS NULL
+    EXEC(N'ALTER TABLE monitor.Settings
+           ADD blocking_threshold_minutes smallint NOT NULL
+               CONSTRAINT DF_Settings_BlockingMinutes_Upgrade DEFAULT (10) WITH VALUES;');
+GO
+
+IF NOT EXISTS
+   (SELECT 1 FROM sys.check_constraints
+    WHERE parent_object_id = OBJECT_ID(N'monitor.Settings')
+      AND name = N'CK_Settings_BlockingThreshold')
+    EXEC(N'ALTER TABLE monitor.Settings WITH CHECK
+           ADD CONSTRAINT CK_Settings_BlockingThreshold
+               CHECK (blocking_threshold_minutes BETWEEN 1 AND 1440);');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM monitor.Settings WHERE settings_id = 1)
+BEGIN
+    INSERT monitor.Settings
+    (
+        settings_id, server_label, mail_profile, recipients,
+        report_hour_eastern, history_retention_days,
+        repeat_critical_minutes, send_immediate_alerts, send_daily_report,
+        send_only_on_change, blocking_threshold_minutes
+    )
+    VALUES
+    (1, N'MS-APP-STG', N'Notifications', N'aleksey_kokit@miopartners.com',
+     8, 90, 1440, 1, 1, 1, 10);
+END;
+ELSE
+BEGIN
+    UPDATE monitor.Settings
+       SET server_label = N'MS-APP-STG',
+           mail_profile = N'Notifications',
+           recipients = N'aleksey_kokit@miopartners.com',
+           report_hour_eastern = 8,
+           send_only_on_change = 1,
+           blocking_threshold_minutes = 10,
+           modified_utc = SYSUTCDATETIME()
+     WHERE settings_id = 1;
+END;
+GO
+
+IF OBJECT_ID(N'monitor.DatabaseBackupPolicy', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.DatabaseBackupPolicy
+    (
+        database_name               sysname      NOT NULL CONSTRAINT PK_DatabaseBackupPolicy PRIMARY KEY,
+        is_enabled                  bit          NOT NULL CONSTRAINT DF_DBPolicy_Enabled DEFAULT (1),
+        require_full                bit          NOT NULL CONSTRAINT DF_DBPolicy_Full DEFAULT (1),
+        require_diff                bit          NOT NULL CONSTRAINT DF_DBPolicy_Diff DEFAULT (1),
+        require_log                 bit          NOT NULL CONSTRAINT DF_DBPolicy_Log DEFAULT (1),
+        full_max_age_minutes        int          NOT NULL CONSTRAINT DF_DBPolicy_FullAge DEFAULT (1440),
+        diff_max_age_minutes        int          NOT NULL CONSTRAINT DF_DBPolicy_DiffAge DEFAULT (360),
+        log_max_age_minutes         int          NOT NULL CONSTRAINT DF_DBPolicy_LogAge DEFAULT (30),
+        notes                       nvarchar(1000) NULL,
+        added_utc                   datetime2(0)  NOT NULL CONSTRAINT DF_DBPolicy_Added DEFAULT SYSUTCDATETIME(),
+        modified_utc                datetime2(0)  NOT NULL CONSTRAINT DF_DBPolicy_Modified DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT CK_DBPolicy_Ages CHECK
+        (
+            full_max_age_minutes > 0 AND diff_max_age_minutes > 0 AND log_max_age_minutes > 0
+        )
+    );
+END;
+GO
+
+/*
+   Authoritative database list for reporting.  This is deliberately independent
+   of sys.databases because metadata visibility can be restricted on RDS.
+   Rows are never removed by discovery.  Only an explicit DBA call to
+   monitor.usp_SetDatabaseMonitoring can disable a row.
+*/
+IF OBJECT_ID(N'monitor.DatabaseInventory', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.DatabaseInventory
+    (
+        database_name               sysname        NOT NULL CONSTRAINT PK_DatabaseInventory PRIMARY KEY,
+        is_enabled                  bit            NOT NULL CONSTRAINT DF_DBInventory_Enabled DEFAULT (1),
+        is_manually_confirmed       bit            NOT NULL CONSTRAINT DF_DBInventory_Manual DEFAULT (0),
+        discovery_source            nvarchar(40)   NOT NULL,
+        first_seen_utc              datetime2(0)   NOT NULL CONSTRAINT DF_DBInventory_First DEFAULT SYSUTCDATETIME(),
+        last_seen_utc               datetime2(0)   NOT NULL CONSTRAINT DF_DBInventory_Last DEFAULT SYSUTCDATETIME(),
+        last_visible_utc            datetime2(0)   NULL,
+        last_known_state            nvarchar(60)   NULL,
+        last_known_recovery_model   nvarchar(60)   NULL,
+        notes                       nvarchar(1000) NULL,
+        modified_utc                datetime2(0)   NOT NULL CONSTRAINT DF_DBInventory_Modified DEFAULT SYSUTCDATETIME()
+    );
+END;
+GO
+
+IF OBJECT_ID(N'monitor.RdsTaskHistory', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.RdsTaskHistory
+    (
+        task_id                     int            NOT NULL CONSTRAINT PK_RdsTaskHistory PRIMARY KEY,
+        task_type                   nvarchar(128)  NULL,
+        database_name               sysname        NULL,
+        percent_complete            decimal(9,2)   NULL,
+        duration_minutes            int            NULL,
+        lifecycle                   nvarchar(40)   NULL,
+        task_info                   nvarchar(max)  NULL,
+        last_updated_server_time    datetime2(0)   NULL,
+        created_at_server_time      datetime2(0)   NULL,
+        s3_object_arn               nvarchar(4000) NULL,
+        first_collected_utc          datetime2(0)   NOT NULL CONSTRAINT DF_RdsTask_First DEFAULT SYSUTCDATETIME(),
+        last_collected_utc           datetime2(0)   NOT NULL CONSTRAINT DF_RdsTask_Last DEFAULT SYSUTCDATETIME()
+    );
+    CREATE INDEX IX_RdsTask_DbTypeTime
+        ON monitor.RdsTaskHistory(database_name, task_type, created_at_server_time DESC);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.TlogBackupHistory', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.TlogBackupHistory
+    (
+        database_name               sysname         NOT NULL,
+        rds_backup_seq_id           int             NOT NULL,
+        backup_file_time_utc        datetime2(0)    NOT NULL,
+        starting_lsn                numeric(25,0)   NULL,
+        ending_lsn                  numeric(25,0)   NULL,
+        is_log_chain_broken         bit             NULL,
+        file_size_bytes             bigint          NULL,
+        error_message               nvarchar(4000)  NULL,
+        collected_utc               datetime2(0)    NOT NULL CONSTRAINT DF_Tlog_Collected DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_TlogBackupHistory PRIMARY KEY(database_name, rds_backup_seq_id)
+    );
+    CREATE INDEX IX_TlogBackup_Time
+        ON monitor.TlogBackupHistory(database_name, backup_file_time_utc DESC);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.BackupSample', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.BackupSample
+    (
+        sample_id                   bigint         IDENTITY(1,1) NOT NULL CONSTRAINT PK_BackupSample PRIMARY KEY,
+        captured_utc                datetime2(0)   NOT NULL,
+        captured_server_time        datetime2(0)   NOT NULL,
+        database_name               sysname        NOT NULL,
+        database_state              nvarchar(60)   NOT NULL,
+        recovery_model              nvarchar(60)   NOT NULL,
+        full_finish_time            datetime2(0)   NULL,
+        full_duration_seconds       int            NULL,
+        full_size_bytes             bigint         NULL,
+        full_source                 nvarchar(40)   NULL,
+        full_location               nvarchar(4000) NULL,
+        full_expiration_time        datetime2(0)   NULL,
+        diff_finish_time            datetime2(0)   NULL,
+        diff_duration_seconds       int            NULL,
+        diff_size_bytes             bigint         NULL,
+        diff_source                 nvarchar(40)   NULL,
+        diff_location               nvarchar(4000) NULL,
+        diff_expiration_time        datetime2(0)   NULL,
+        log_finish_time             datetime2(0)   NULL,
+        log_duration_seconds        int            NULL,
+        log_size_bytes              bigint         NULL,
+        log_source                  nvarchar(40)   NULL,
+        log_chain_broken            bit            NULL,
+        log_visibility              nvarchar(40)   NOT NULL,
+        collection_note             nvarchar(2000) NULL
+    );
+    CREATE INDEX IX_BackupSample_DbTime
+        ON monitor.BackupSample(database_name, captured_utc DESC);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.MaintenanceJobPolicy', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.MaintenanceJobPolicy
+    (
+        job_id                      uniqueidentifier NOT NULL CONSTRAINT PK_MaintenanceJobPolicy PRIMARY KEY,
+        job_name                    sysname          NOT NULL,
+        maintenance_type            nvarchar(40)     NOT NULL,
+        is_monitored                bit              NOT NULL CONSTRAINT DF_JobPolicy_Monitored DEFAULT (1),
+        max_hours_since_success     decimal(9,2)     NOT NULL,
+        auto_discovered             bit              NOT NULL CONSTRAINT DF_JobPolicy_Auto DEFAULT (1),
+        last_seen_utc               datetime2(0)     NOT NULL CONSTRAINT DF_JobPolicy_Seen DEFAULT SYSUTCDATETIME(),
+        notes                       nvarchar(1000)   NULL,
+        CONSTRAINT UQ_MaintenanceJobPolicy_Name UNIQUE(job_name),
+        CONSTRAINT CK_JobPolicy_Age CHECK (max_hours_since_success > 0)
+    );
+END;
+GO
+
+IF OBJECT_ID(N'monitor.AgentJobRun', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.AgentJobRun
+    (
+        job_id                      uniqueidentifier NOT NULL,
+        instance_id                int              NOT NULL,
+        job_name                    sysname          NOT NULL,
+        run_status                  int              NOT NULL,
+        run_start_server_time       datetime2(0)     NOT NULL,
+        run_duration_seconds        int              NOT NULL,
+        message                     nvarchar(4000)   NULL,
+        imported_utc                datetime2(0)     NOT NULL CONSTRAINT DF_AgentJobRun_Imported DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_AgentJobRun PRIMARY KEY(job_id, instance_id)
+    );
+    CREATE INDEX IX_AgentJobRun_NameTime
+        ON monitor.AgentJobRun(job_name, run_start_server_time DESC);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.CollectorRun', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.CollectorRun
+    (
+        collector_run_id            bigint          IDENTITY(1,1) NOT NULL CONSTRAINT PK_CollectorRun PRIMARY KEY,
+        started_utc                 datetime2(0)    NOT NULL,
+        finished_utc                datetime2(0)    NULL,
+        succeeded                   bit             NULL,
+        backup_rows                 int             NULL,
+        job_rows                    int             NULL,
+        error_number                int             NULL,
+        error_message               nvarchar(2048)  NULL
+    );
+END;
+GO
+
+IF OBJECT_ID(N'monitor.AlertState', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.AlertState
+    (
+        alert_key                   nvarchar(450)  NOT NULL CONSTRAINT PK_AlertState PRIMARY KEY,
+        alert_kind                  nvarchar(20)   NOT NULL,
+        category                    nvarchar(40)   NOT NULL,
+        severity                    nvarchar(20)   NOT NULL,
+        summary                     nvarchar(1000) NOT NULL,
+        detail                      nvarchar(4000) NULL,
+        is_active                   bit            NOT NULL,
+        first_seen_utc              datetime2(0)   NOT NULL,
+        last_seen_utc               datetime2(0)   NOT NULL,
+        last_sent_utc               datetime2(0)   NULL,
+        resolved_utc                datetime2(0)   NULL
+    );
+END;
+GO
+
+IF OBJECT_ID(N'monitor.NotificationLog', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.NotificationLog
+    (
+        notification_id             bigint          IDENTITY(1,1) NOT NULL CONSTRAINT PK_NotificationLog PRIMARY KEY,
+        notification_type           nvarchar(20)    NOT NULL,
+        queued_utc                  datetime2(0)    NOT NULL,
+        report_date_eastern         date            NULL,
+        subject                     nvarchar(255)   NOT NULL,
+        recipients                  nvarchar(4000)  NOT NULL,
+        mailitem_id                 int             NULL,
+        exception_count             int             NULL
+    );
+    CREATE UNIQUE INDEX UX_NotificationLog_Daily
+        ON monitor.NotificationLog(report_date_eastern, notification_type)
+        WHERE report_date_eastern IS NOT NULL AND notification_type = N'DAILY';
+END;
+GO
+
+IF OBJECT_ID(N'monitor.ReportState', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.ReportState
+    (
+        report_name                 sysname       NOT NULL CONSTRAINT PK_ReportState PRIMARY KEY,
+        last_state_hash             varbinary(32) NULL,
+        last_evaluated_utc          datetime2(0)  NULL,
+        last_sent_utc               datetime2(0)  NULL,
+        last_overall                nvarchar(20)  NULL,
+        last_exception_count        int           NULL
+    );
+END;
+GO
+
+IF OBJECT_ID(N'monitor.AgentFailureEvent', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.AgentFailureEvent
+    (
+        job_id                      uniqueidentifier NOT NULL,
+        instance_id                int              NOT NULL,
+        job_name                    sysname          NOT NULL,
+        run_status                  int              NOT NULL,
+        run_start_server_time       datetime2(0)     NOT NULL,
+        run_duration_seconds        int              NOT NULL,
+        failure_step_name           sysname          NULL,
+        message                     nvarchar(4000)   NULL,
+        collected_utc               datetime2(0)     NOT NULL CONSTRAINT DF_AgentFailure_Collected DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_AgentFailureEvent PRIMARY KEY(job_id, instance_id)
+    );
+    CREATE INDEX IX_AgentFailure_Time
+        ON monitor.AgentFailureEvent(run_start_server_time DESC, job_name);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.DeadlockEvent', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.DeadlockEvent
+    (
+        deadlock_hash               binary(32)     NOT NULL CONSTRAINT PK_DeadlockEvent PRIMARY KEY,
+        event_utc                   datetime2(3)   NOT NULL,
+        database_name               sysname        NULL,
+        victim_process_id           nvarchar(100)  NULL,
+        process_count               int            NULL,
+        deadlock_xml                xml            NOT NULL,
+        collected_utc               datetime2(0)   NOT NULL CONSTRAINT DF_Deadlock_Collected DEFAULT SYSUTCDATETIME()
+    );
+    CREATE INDEX IX_DeadlockEvent_Time
+        ON monitor.DeadlockEvent(event_utc DESC, database_name);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.ServerErrorLogEvent', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.ServerErrorLogEvent
+    (
+        event_hash                  binary(32)     NOT NULL CONSTRAINT PK_ServerErrorLogEvent PRIMARY KEY,
+        log_date_server_time        datetime2(0)   NOT NULL,
+        process_info                nvarchar(100)  NULL,
+        message                     nvarchar(4000) NOT NULL,
+        collected_utc               datetime2(0)   NOT NULL CONSTRAINT DF_ServerError_Collected DEFAULT SYSUTCDATETIME()
+    );
+    CREATE INDEX IX_ServerError_Time
+        ON monitor.ServerErrorLogEvent(log_date_server_time DESC);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.BlockingIncident', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.BlockingIncident
+    (
+        incident_hash               binary(32)      NOT NULL CONSTRAINT PK_BlockingIncident PRIMARY KEY,
+        first_seen_utc              datetime2(0)    NOT NULL,
+        last_seen_utc               datetime2(0)    NOT NULL,
+        resolved_utc                datetime2(0)    NULL,
+        is_active                   bit             NOT NULL,
+        request_start_server_time   datetime2(0)    NULL,
+        blocked_session_id          smallint        NOT NULL,
+        blocking_session_id         smallint        NOT NULL,
+        database_name               sysname         NULL,
+        wait_type                   nvarchar(120)   NULL,
+        wait_resource               nvarchar(512)   NULL,
+        max_wait_ms                 bigint          NOT NULL,
+        blocked_login_name          sysname         NULL,
+        blocked_host_name           nvarchar(128)   NULL,
+        blocked_program_name        nvarchar(256)   NULL,
+        blocker_login_name          sysname         NULL,
+        blocker_host_name           nvarchar(128)   NULL,
+        blocker_program_name        nvarchar(256)   NULL,
+        blocked_sql                 nvarchar(4000)  NULL,
+        blocker_sql                 nvarchar(4000)  NULL
+    );
+    CREATE INDEX IX_BlockingIncident_Time
+        ON monitor.BlockingIncident(last_seen_utc DESC, is_active)
+        INCLUDE(database_name, blocked_session_id, blocking_session_id, max_wait_ms);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.DatabaseLogSample', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.DatabaseLogSample
+    (
+        captured_utc                datetime2(3)  NOT NULL,
+        database_name               sysname       NOT NULL,
+        log_size_mb                 decimal(19,2) NULL,
+        log_used_percent            decimal(9,2)  NULL,
+        status_code                 int           NULL,
+        CONSTRAINT PK_DatabaseLogSample PRIMARY KEY(captured_utc, database_name)
+    );
+    CREATE INDEX IX_DatabaseLogSample_DbTime
+        ON monitor.DatabaseLogSample(database_name, captured_utc DESC);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.StorageSample', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.StorageSample
+    (
+        captured_utc                datetime2(3)  NOT NULL,
+        volume_mount_point          nvarchar(512) NOT NULL,
+        total_bytes                 bigint        NULL,
+        available_bytes             bigint        NULL,
+        CONSTRAINT PK_StorageSample PRIMARY KEY(captured_utc, volume_mount_point)
+    );
+    CREATE INDEX IX_StorageSample_Time
+        ON monitor.StorageSample(captured_utc DESC);
+END;
+GO
+
+IF OBJECT_ID(N'monitor.ComponentStatus', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.ComponentStatus
+    (
+        component_name              sysname        NOT NULL CONSTRAINT PK_ComponentStatus PRIMARY KEY,
+        last_attempt_utc            datetime2(0)   NOT NULL,
+        last_success_utc            datetime2(0)   NULL,
+        last_error_number           int            NULL,
+        last_error_message          nvarchar(2000) NULL
+    );
+END;
+GO
+
+IF OBJECT_ID(N'monitor.DeploymentState', N'U') IS NULL
+BEGIN
+    CREATE TABLE monitor.DeploymentState
+    (
+        deployment_key  sysname       NOT NULL CONSTRAINT PK_DeploymentState PRIMARY KEY,
+        applied_utc     datetime2(0)  NOT NULL,
+        applied_by      sysname       NOT NULL,
+        details         nvarchar(2000) NULL
+    );
+END;
+GO
+
+/*
+   One-time, idempotent reset of monitor-owned database and backup history.
+   This does NOT delete msdb backupset rows, RDS backups, S3 files, or databases.
+*/
+IF NOT EXISTS
+   (SELECT 1 FROM monitor.DeploymentState
+    WHERE deployment_key = N'SYS_DATABASES_ONLY_RESET_V11')
+BEGIN
+    SET XACT_ABORT ON;
+    BEGIN TRANSACTION;
+
+    DELETE FROM monitor.BackupSample;
+    DELETE FROM monitor.TlogBackupHistory;
+    DELETE FROM monitor.RdsTaskHistory;
+    DELETE FROM monitor.DatabaseLogSample;
+    DELETE FROM monitor.DatabaseBackupPolicy;
+    DELETE FROM monitor.DatabaseInventory;
+    DELETE FROM monitor.AlertState WHERE category = N'BACKUP';
+    DELETE FROM monitor.ReportState WHERE report_name = N'DAILY_HEALTH';
+
+    INSERT monitor.DeploymentState
+        (deployment_key, applied_utc, applied_by, details)
+    VALUES
+        (N'SYS_DATABASES_ONLY_RESET_V11', SYSUTCDATETIME(), SUSER_SNAME(),
+         N'Cleared OPS.monitor database/backup history and switched inventory to visible sys.databases rows only.');
+
+    COMMIT TRANSACTION;
+END;
+GO
+
+/* ---------- Helper functions ---------- */
+
+CREATE OR ALTER FUNCTION monitor.fn_HtmlEncode(@value nvarchar(max))
+RETURNS nvarchar(max)
+AS
+BEGIN
+    IF @value IS NULL RETURN N'';
+    SET @value = REPLACE(@value, N'&', N'&amp;');
+    SET @value = REPLACE(@value, N'<', N'&lt;');
+    SET @value = REPLACE(@value, N'>', N'&gt;');
+    SET @value = REPLACE(@value, N'"', N'&quot;');
+    SET @value = REPLACE(@value, N'''', N'&#39;');
+    RETURN @value;
+END;
+GO
+
+/* ---------- Collection ---------- */
+
+CREATE OR ALTER PROCEDURE monitor.usp_SyncDatabaseBackupPolicy
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    CREATE TABLE #VisibleDatabase
+    (
+        database_name sysname NOT NULL PRIMARY KEY,
+        state_desc nvarchar(60) NOT NULL,
+        recovery_model_desc nvarchar(60) NOT NULL
+    );
+
+    INSERT #VisibleDatabase(database_name, state_desc, recovery_model_desc)
+    SELECT d.name COLLATE DATABASE_DEFAULT,
+           d.state_desc COLLATE DATABASE_DEFAULT,
+           d.recovery_model_desc COLLATE DATABASE_DEFAULT
+    FROM sys.databases AS d
+    WHERE d.database_id > 4
+      AND d.name COLLATE DATABASE_DEFAULT <> N'rdsadmin'
+      AND d.source_database_id IS NULL;
+
+    /* Remove only monitor configuration rows no longer returned by sys.databases. */
+    DELETE p
+    FROM monitor.DatabaseBackupPolicy AS p
+    WHERE NOT EXISTS
+          (SELECT 1 FROM #VisibleDatabase AS d
+           WHERE d.database_name = p.database_name);
+
+    DELETE i
+    FROM monitor.DatabaseInventory AS i
+    WHERE NOT EXISTS
+          (SELECT 1 FROM #VisibleDatabase AS d
+           WHERE d.database_name = i.database_name);
+
+    UPDATE i
+       SET is_enabled = 1,
+           is_manually_confirmed = 0,
+           discovery_source = N'SYS_DATABASES',
+           last_seen_utc = SYSUTCDATETIME(),
+           last_visible_utc = SYSUTCDATETIME(),
+           last_known_state = d.state_desc,
+           last_known_recovery_model = d.recovery_model_desc,
+           modified_utc = SYSUTCDATETIME()
+    FROM monitor.DatabaseInventory AS i
+    JOIN #VisibleDatabase AS d ON d.database_name = i.database_name;
+
+    INSERT monitor.DatabaseInventory
+        (database_name, is_enabled, is_manually_confirmed, discovery_source,
+         last_seen_utc, last_visible_utc,
+         last_known_state, last_known_recovery_model)
+    SELECT d.database_name, 1, 0, N'SYS_DATABASES',
+           SYSUTCDATETIME(), SYSUTCDATETIME(),
+           d.state_desc, d.recovery_model_desc
+    FROM #VisibleDatabase AS d
+    WHERE NOT EXISTS
+          (SELECT 1 FROM monitor.DatabaseInventory AS i
+           WHERE i.database_name = d.database_name);
+
+    INSERT monitor.DatabaseBackupPolicy
+        (database_name, require_full, require_diff, require_log, notes)
+    SELECT d.database_name, 1, 1,
+           CASE WHEN d.recovery_model_desc = N'SIMPLE' THEN 0 ELSE 1 END,
+           N'Automatically managed from sys.databases only'
+    FROM #VisibleDatabase AS d
+    WHERE NOT EXISTS
+          (SELECT 1 FROM monitor.DatabaseBackupPolicy AS p
+           WHERE p.database_name = d.database_name);
+END;
+GO
+
+CREATE OR ALTER PROCEDURE monitor.usp_RegisterDatabase
+    @DatabaseName sysname,
+    @RequireFull bit = 1,
+    @RequireDiff bit = 1,
+    @RequireLog bit = 1,
+    @Notes nvarchar(1000) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    THROW 50001, 'Manual database registration is disabled in revision 11. Inventory is synchronized only from sys.databases.', 1;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE monitor.usp_RegisterDatabaseList
+    @DatabaseList nvarchar(max),
+    @RequireFull bit = 1,
+    @RequireDiff bit = 1,
+    @RequireLog bit = 1,
+    @Notes nvarchar(1000) = N'Authoritative DBA inventory'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    THROW 50004, 'Manual database-list registration is disabled in revision 11. Inventory is synchronized only from sys.databases.', 1;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE monitor.usp_SetDatabaseMonitoring
+    @DatabaseName sysname,
+    @Enabled bit
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NOT EXISTS
+       (SELECT 1 FROM monitor.DatabaseInventory WHERE database_name = @DatabaseName)
+        THROW 50003, 'Database is not registered in monitor.DatabaseInventory.', 1;
+
+    UPDATE monitor.DatabaseInventory
+       SET is_enabled = @Enabled, modified_utc = SYSUTCDATETIME()
+     WHERE database_name = @DatabaseName;
+    UPDATE monitor.DatabaseBackupPolicy
+       SET is_enabled = @Enabled, modified_utc = SYSUTCDATETIME()
+     WHERE database_name = @DatabaseName;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE monitor.usp_CollectBackupAndMaintenance
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT OFF;
+    SET DEADLOCK_PRIORITY LOW;
+    SET LOCK_TIMEOUT 3000;
+
+    DECLARE @run_id bigint,
+            @backup_rows int = 0,
+            @job_rows int = 0,
+            @tlog_note nvarchar(2000) = NULL;
+
+    INSERT monitor.CollectorRun(started_utc) VALUES(SYSUTCDATETIME());
+    SET @run_id = SCOPE_IDENTITY();
+
+    BEGIN TRY
+        /* Add newly created/restored databases without overwriting DBA policy changes. */
+        EXEC monitor.usp_SyncDatabaseBackupPolicy;
+
+        /* Standard Ola Hallengren job names. Policy overrides are preserved. */
+        ;WITH OlaJobs AS
+        (
+            SELECT j.job_id, j.name,
+                   CASE
+                       WHEN j.name LIKE N'DatabaseBackup%LOG%'  THEN N'BACKUP_LOG'
+                       WHEN j.name LIKE N'DatabaseBackup%DIFF%' THEN N'BACKUP_DIFF'
+                       WHEN j.name LIKE N'DatabaseBackup%FULL%' THEN N'BACKUP_FULL'
+                       WHEN j.name LIKE N'DatabaseIntegrityCheck%' THEN N'INTEGRITY_CHECK'
+                       WHEN j.name LIKE N'IndexOptimize%' THEN N'INDEX_OPTIMIZE'
+                       WHEN j.name = N'DBMaintenance - Daily Backups'
+                         THEN N'RDS_NATIVE_BACKUP'
+                       ELSE N'CLEANUP'
+                   END AS maintenance_type,
+                   CONVERT(decimal(9,2),
+                       CASE
+                           WHEN j.name LIKE N'DatabaseBackup%LOG%'  THEN 0.50
+                           WHEN j.name LIKE N'DatabaseBackup%DIFF%' THEN 6.00
+                           WHEN j.name LIKE N'DatabaseBackup%FULL%' THEN 24.00
+                           WHEN j.name LIKE N'DatabaseIntegrityCheck%' THEN 192.00
+                           WHEN j.name LIKE N'IndexOptimize%' THEN 192.00
+                           WHEN j.name = N'DBMaintenance - Daily Backups'
+                             THEN 24.00
+                           ELSE 192.00
+                       END) AS max_hours
+            FROM msdb.dbo.sysjobs AS j
+            WHERE j.name LIKE N'DatabaseBackup%'
+               OR j.name LIKE N'DatabaseIntegrityCheck%'
+               OR j.name LIKE N'IndexOptimize%'
+               OR j.name = N'DBMaintenance - Daily Backups'
+               OR j.name IN
+                  (N'CommandLog Cleanup', N'Output File Cleanup',
+                   N'sp_delete_backuphistory', N'sp_purge_jobhistory')
+        )
+        INSERT monitor.MaintenanceJobPolicy
+            (job_id, job_name, maintenance_type, max_hours_since_success)
+        SELECT o.job_id, o.name, o.maintenance_type, o.max_hours
+        FROM OlaJobs AS o
+        WHERE NOT EXISTS
+              (SELECT 1 FROM monitor.MaintenanceJobPolicy AS p
+               WHERE p.job_id = o.job_id OR p.job_name = o.name);
+
+        UPDATE p
+           SET p.job_name = j.name,
+               p.last_seen_utc = SYSUTCDATETIME()
+        FROM monitor.MaintenanceJobPolicy AS p
+        JOIN msdb.dbo.sysjobs AS j ON j.job_id = p.job_id;
+
+        /* Import job-level outcomes (step_id 0); use server-local time consistently. */
+        INSERT monitor.AgentJobRun
+        (
+            job_id, instance_id, job_name, run_status,
+            run_start_server_time, run_duration_seconds, message
+        )
+        SELECT j.job_id,
+               h.instance_id,
+               j.name,
+               h.run_status,
+               DATETIMEFROMPARTS
+               (
+                   h.run_date / 10000,
+                   (h.run_date / 100) % 100,
+                   h.run_date % 100,
+                   h.run_time / 10000,
+                   (h.run_time / 100) % 100,
+                   h.run_time % 100,
+                   0
+               ),
+               (h.run_duration / 10000) * 3600
+                 + ((h.run_duration / 100) % 100) * 60
+                 + h.run_duration % 100,
+               LEFT(h.message, 4000)
+        FROM msdb.dbo.sysjobhistory AS h
+        JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
+        JOIN monitor.MaintenanceJobPolicy AS p ON p.job_id = j.job_id
+        WHERE h.step_id = 0
+          AND h.run_date > 0
+          AND NOT EXISTS
+              (SELECT 1 FROM monitor.AgentJobRun AS x
+               WHERE x.job_id = h.job_id AND x.instance_id = h.instance_id);
+        SET @job_rows = @@ROWCOUNT;
+
+        /* Collect all visible RDS backup/restore task statuses. */
+        CREATE TABLE #RdsTasks
+        (
+            task_id                     int,
+            task_type                   nvarchar(128),
+            database_name               sysname,
+            percent_complete_text       nvarchar(100),
+            duration_minutes_text       nvarchar(100),
+            lifecycle                   nvarchar(40),
+            task_info                   nvarchar(max),
+            last_updated                datetime,
+            created_at                  datetime,
+            s3_object_arn               nvarchar(max),
+            overwrite_s3_backup_file    nvarchar(100),
+            kms_master_key_arn          nvarchar(max),
+            filepath                    nvarchar(max),
+            overwrite_file              nvarchar(100)
+        );
+
+        BEGIN TRY
+            INSERT #RdsTasks
+            EXEC msdb.dbo.rds_task_status;
+        END TRY
+        BEGIN CATCH
+            SET @tlog_note = CONCAT(N'rds_task_status unavailable: ', ERROR_MESSAGE());
+        END CATCH;
+
+        UPDATE t
+           SET task_type = r.task_type,
+               database_name = r.database_name,
+               percent_complete = TRY_CONVERT(decimal(9,2), REPLACE(r.percent_complete_text, N'%', N'')),
+               duration_minutes = TRY_CONVERT(int, r.duration_minutes_text),
+               lifecycle = r.lifecycle,
+               task_info = r.task_info,
+               last_updated_server_time = r.last_updated,
+               created_at_server_time = r.created_at,
+               s3_object_arn = r.s3_object_arn,
+               last_collected_utc = SYSUTCDATETIME()
+        FROM monitor.RdsTaskHistory AS t
+        JOIN #RdsTasks AS r ON r.task_id = t.task_id;
+
+        INSERT monitor.RdsTaskHistory
+        (
+            task_id, task_type, database_name, percent_complete,
+            duration_minutes, lifecycle, task_info,
+            last_updated_server_time, created_at_server_time, s3_object_arn
+        )
+        SELECT r.task_id, r.task_type, r.database_name,
+               TRY_CONVERT(decimal(9,2), REPLACE(r.percent_complete_text, N'%', N'')),
+               TRY_CONVERT(int, r.duration_minutes_text), r.lifecycle, r.task_info,
+               r.last_updated, r.created_at, r.s3_object_arn
+        FROM #RdsTasks AS r
+        WHERE NOT EXISTS
+              (SELECT 1 FROM monitor.RdsTaskHistory AS t WHERE t.task_id = r.task_id);
+
+        /* Newly observed RDS tasks can reveal a catalog-hidden database. */
+        EXEC monitor.usp_SyncDatabaseBackupPolicy;
+
+        /* Collect RDS automated transaction-log metadata, database by database. */
+        CREATE TABLE #TlogMetadata
+        (
+            db_name                     sysname,
+            db_id                       int,
+            family_guid                 uniqueidentifier,
+            rds_backup_seq_id           int,
+            backup_file_epoch           bigint,
+            backup_file_time_utc        datetime,
+            starting_lsn                numeric(25,0),
+            ending_lsn                  numeric(25,0),
+            is_log_chain_broken         bit,
+            file_size_bytes             bigint,
+            error_message               varchar(4000)
+        );
+
+        CREATE TABLE #TlogProbe
+        (
+            database_name               sysname PRIMARY KEY,
+            is_visible                  bit NOT NULL,
+            error_message               nvarchar(2000) NULL
+        );
+
+        DECLARE @db sysname, @sql nvarchar(max);
+        DECLARE db_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT p.database_name
+            FROM monitor.DatabaseBackupPolicy AS p
+            JOIN monitor.DatabaseInventory AS di
+              ON di.database_name = p.database_name
+            WHERE p.is_enabled = 1 AND p.require_log = 1
+              AND di.is_enabled = 1;
+
+        OPEN db_cursor;
+        FETCH NEXT FROM db_cursor INTO @db;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            BEGIN TRY
+                SET @sql = N'
+                    SELECT db_name, db_id, family_guid, rds_backup_seq_id,
+                           backup_file_epoch, backup_file_time_utc,
+                           starting_lsn, ending_lsn, is_log_chain_broken,
+                           file_size_bytes, [Error]
+                    FROM msdb.dbo.rds_fn_list_tlog_backup_metadata(@p_db);';
+                INSERT #TlogMetadata
+                EXEC sys.sp_executesql @sql, N'@p_db sysname', @p_db = @db;
+
+                INSERT #TlogProbe(database_name, is_visible, error_message)
+                SELECT @db,
+                       CASE WHEN EXISTS
+                            (SELECT 1 FROM #TlogMetadata
+                             WHERE db_name = @db AND error_message IS NOT NULL)
+                            THEN 0 ELSE 1 END,
+                       (SELECT TOP (1) LEFT(error_message, 2000)
+                        FROM #TlogMetadata
+                        WHERE db_name = @db AND error_message IS NOT NULL);
+            END TRY
+            BEGIN CATCH
+                INSERT #TlogProbe(database_name, is_visible, error_message)
+                VALUES(@db, 0, LEFT(ERROR_MESSAGE(), 2000));
+            END CATCH;
+
+            FETCH NEXT FROM db_cursor INTO @db;
+        END;
+        CLOSE db_cursor;
+        DEALLOCATE db_cursor;
+
+        INSERT monitor.TlogBackupHistory
+        (
+            database_name, rds_backup_seq_id, backup_file_time_utc,
+            starting_lsn, ending_lsn, is_log_chain_broken,
+            file_size_bytes, error_message
+        )
+        SELECT m.db_name, m.rds_backup_seq_id, m.backup_file_time_utc,
+               m.starting_lsn, m.ending_lsn, m.is_log_chain_broken,
+               m.file_size_bytes, m.error_message
+        FROM #TlogMetadata AS m
+        WHERE m.rds_backup_seq_id IS NOT NULL
+          AND m.backup_file_time_utc IS NOT NULL
+          AND NOT EXISTS
+              (SELECT 1 FROM monitor.TlogBackupHistory AS t
+               WHERE t.database_name = m.db_name
+                 AND t.rds_backup_seq_id = m.rds_backup_seq_id);
+
+        /* Normalize all usable backup evidence into one candidate set. */
+        CREATE TABLE #BackupCandidate
+        (
+            database_name               sysname,
+            backup_type                 char(1),
+            finish_time                 datetime2(0),
+            duration_seconds            int,
+            size_bytes                  bigint,
+            source_name                 nvarchar(40),
+            location                    nvarchar(4000),
+            expiration_time             datetime2(0),
+            chain_broken                bit
+        );
+
+        INSERT #BackupCandidate
+        SELECT b.database_name,
+               b.type,
+               b.backup_finish_date,
+               DATEDIFF(SECOND, b.backup_start_date, b.backup_finish_date),
+               COALESCE(b.compressed_backup_size, b.backup_size),
+               N'MSDB_BACKUPSET',
+               LEFT(m.physical_device_name, 4000),
+               b.expiration_date,
+               NULL
+        FROM msdb.dbo.backupset AS b
+        OUTER APPLY
+        (
+            SELECT TOP (1) mf.physical_device_name
+            FROM msdb.dbo.backupmediafamily AS mf
+            WHERE mf.media_set_id = b.media_set_id
+            ORDER BY mf.family_sequence_number
+        ) AS m
+        JOIN monitor.DatabaseBackupPolicy AS p ON p.database_name = b.database_name
+        LEFT JOIN #TlogProbe AS tp ON tp.database_name = b.database_name
+        WHERE b.type IN ('D', 'I', 'L')
+          /* Do not compare server-local msdb log times with UTC RDS metadata. */
+          AND (b.type <> 'L' OR ISNULL(tp.is_visible, 0) = 0);
+
+        INSERT #BackupCandidate
+        SELECT r.database_name,
+               CASE WHEN r.task_type = N'BACKUP_DB' THEN 'D' ELSE 'I' END,
+               r.last_updated_server_time,
+               r.duration_minutes * 60,
+               NULL,
+               N'RDS_TASK_STATUS',
+               r.s3_object_arn,
+               NULL,
+               NULL
+        FROM monitor.RdsTaskHistory AS r
+        JOIN monitor.DatabaseBackupPolicy AS p ON p.database_name = r.database_name
+        WHERE r.lifecycle = N'SUCCESS'
+          AND r.task_type IN (N'BACKUP_DB', N'BACKUP_DB_DIFFERENTIAL')
+          AND r.last_updated_server_time IS NOT NULL;
+
+        INSERT #BackupCandidate
+        SELECT t.database_name, 'L', t.backup_file_time_utc, NULL,
+               t.file_size_bytes, N'RDS_TLOG_METADATA', NULL, NULL,
+               t.is_log_chain_broken
+        FROM monitor.TlogBackupHistory AS t
+        JOIN monitor.DatabaseBackupPolicy AS p ON p.database_name = t.database_name;
+
+        ;WITH Ranked AS
+        (
+            SELECT c.*,
+                   ROW_NUMBER() OVER
+                   (PARTITION BY c.database_name, c.backup_type
+                    ORDER BY c.finish_time DESC, c.source_name) AS rn
+            FROM #BackupCandidate AS c
+        )
+        SELECT * INTO #LatestBackup FROM Ranked WHERE rn = 1;
+
+        INSERT monitor.BackupSample
+        (
+            captured_utc, captured_server_time, database_name,
+            database_state, recovery_model,
+            full_finish_time, full_duration_seconds, full_size_bytes,
+            full_source, full_location, full_expiration_time,
+            diff_finish_time, diff_duration_seconds, diff_size_bytes,
+            diff_source, diff_location, diff_expiration_time,
+            log_finish_time, log_duration_seconds, log_size_bytes,
+            log_source, log_chain_broken, log_visibility, collection_note
+        )
+        SELECT SYSUTCDATETIME(), GETDATE(), di.database_name,
+               COALESCE(d.state_desc, di.last_known_state, N'NOT_VISIBLE'),
+               COALESCE(d.recovery_model_desc, di.last_known_recovery_model, N'UNKNOWN'),
+               f.finish_time, f.duration_seconds, f.size_bytes,
+               f.source_name, f.location, f.expiration_time,
+               i.finish_time, i.duration_seconds, i.size_bytes,
+               i.source_name, i.location, i.expiration_time,
+               l.finish_time, l.duration_seconds, l.size_bytes,
+               l.source_name, l.chain_broken,
+               CASE
+                   WHEN p.require_log = 0 OR d.recovery_model_desc <> N'FULL' THEN N'NOT_REQUIRED'
+                   WHEN tp.is_visible = 1 THEN N'RDS_TLOG_VISIBLE'
+                   WHEN l.finish_time IS NOT NULL THEN N'MSDB_VISIBLE'
+                   ELSE N'UNVERIFIED'
+               END,
+               LEFT(CONCAT(@tlog_note,
+                    CASE WHEN tp.error_message IS NOT NULL
+                         THEN CONCAT(N' T-log metadata: ', tp.error_message) END), 2000)
+        FROM monitor.DatabaseInventory AS di
+        JOIN monitor.DatabaseBackupPolicy AS p
+          ON p.database_name = di.database_name
+        LEFT JOIN sys.databases AS d
+          ON d.name COLLATE DATABASE_DEFAULT = di.database_name
+        LEFT JOIN #LatestBackup AS f
+               ON f.database_name = p.database_name AND f.backup_type = 'D'
+        LEFT JOIN #LatestBackup AS i
+               ON i.database_name = p.database_name AND i.backup_type = 'I'
+        LEFT JOIN #LatestBackup AS l
+               ON l.database_name = p.database_name AND l.backup_type = 'L'
+        LEFT JOIN #TlogProbe AS tp ON tp.database_name = p.database_name
+        WHERE di.is_enabled = 1 AND p.is_enabled = 1;
+        SET @backup_rows = @@ROWCOUNT;
+
+        UPDATE monitor.CollectorRun
+           SET finished_utc = SYSUTCDATETIME(), succeeded = 1,
+               backup_rows = @backup_rows, job_rows = @job_rows
+         WHERE collector_run_id = @run_id;
+    END TRY
+    BEGIN CATCH
+        UPDATE monitor.CollectorRun
+           SET finished_utc = SYSUTCDATETIME(), succeeded = 0,
+               backup_rows = @backup_rows, job_rows = @job_rows,
+               error_number = ERROR_NUMBER(),
+               error_message = LEFT(ERROR_MESSAGE(), 2048)
+         WHERE collector_run_id = @run_id;
+        THROW;
+    END CATCH;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE monitor.usp_SetComponentStatus
+    @ComponentName sysname,
+    @Succeeded bit,
+    @ErrorNumber int = NULL,
+    @ErrorMessage nvarchar(2000) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE monitor.ComponentStatus
+       SET last_attempt_utc = SYSUTCDATETIME(),
+           last_success_utc = CASE WHEN @Succeeded = 1 THEN SYSUTCDATETIME() ELSE last_success_utc END,
+           last_error_number = CASE WHEN @Succeeded = 1 THEN NULL ELSE @ErrorNumber END,
+           last_error_message = CASE WHEN @Succeeded = 1 THEN NULL ELSE LEFT(@ErrorMessage, 2000) END
+     WHERE component_name = @ComponentName;
+
+    IF @@ROWCOUNT = 0
+        INSERT monitor.ComponentStatus
+        (
+            component_name, last_attempt_utc, last_success_utc,
+            last_error_number, last_error_message
+        )
+        VALUES
+        (
+            @ComponentName, SYSUTCDATETIME(),
+            CASE WHEN @Succeeded = 1 THEN SYSUTCDATETIME() END,
+            CASE WHEN @Succeeded = 0 THEN @ErrorNumber END,
+            CASE WHEN @Succeeded = 0 THEN LEFT(@ErrorMessage, 2000) END
+        );
+END;
+GO
+
+CREATE OR ALTER PROCEDURE monitor.usp_CollectOperationalHealth
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT OFF;
+    SET DEADLOCK_PRIORITY LOW;
+    SET LOCK_TIMEOUT 3000;
+
+    DECLARE @captured_utc datetime2(3) = SYSUTCDATETIME();
+
+    /* Persist failures/cancellations for every SQL Agent job, not only maintenance jobs. */
+    BEGIN TRY
+        INSERT monitor.AgentFailureEvent
+        (
+            job_id, instance_id, job_name, run_status,
+            run_start_server_time, run_duration_seconds,
+            failure_step_name, message
+        )
+        SELECT j.job_id,
+               h.instance_id,
+               j.name,
+               h.run_status,
+               DATETIMEFROMPARTS
+               (
+                   h.run_date / 10000,
+                   (h.run_date / 100) % 100,
+                   h.run_date % 100,
+                   h.run_time / 10000,
+                   (h.run_time / 100) % 100,
+                   h.run_time % 100,
+                   0
+               ),
+               (h.run_duration / 10000) * 3600
+                 + ((h.run_duration / 100) % 100) * 60
+                 + h.run_duration % 100,
+               NULLIF(h.step_name, N'(Job outcome)'),
+               LEFT(h.message, 4000)
+        FROM msdb.dbo.sysjobhistory AS h
+        JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
+        WHERE
+          (
+              (h.step_id > 0 AND h.run_status IN (0, 2, 3))
+              OR (h.step_id = 0 AND h.run_status = 3)
+          )
+          AND h.run_date > 0
+          AND NOT EXISTS
+              (SELECT 1 FROM monitor.AgentFailureEvent AS x
+               WHERE x.job_id = h.job_id AND x.instance_id = h.instance_id);
+
+        EXEC monitor.usp_SetComponentStatus N'ALL_AGENT_FAILURES', 1;
+    END TRY
+    BEGIN CATCH
+        DECLARE @agent_error_number int = ERROR_NUMBER(),
+                @agent_error_message nvarchar(4000) = ERROR_MESSAGE();
+        EXEC monitor.usp_SetComponentStatus
+             N'ALL_AGENT_FAILURES', 0, @agent_error_number, @agent_error_message;
+    END CATCH;
+
+    /* Import recent xml_deadlock_report events from the built-in system_health ring buffer. */
+    BEGIN TRY
+        DECLARE @ring_buffer xml;
+        SELECT @ring_buffer = TRY_CAST(t.target_data AS xml)
+        FROM sys.dm_xe_session_targets AS t
+        JOIN sys.dm_xe_sessions AS s
+          ON s.address = t.event_session_address
+        WHERE s.name = N'system_health'
+          AND t.target_name = N'ring_buffer';
+
+        ;WITH Deadlocks AS
+        (
+            SELECT n.query('.') AS event_xml
+            FROM @ring_buffer.nodes
+                 ('/RingBufferTarget/event[@name="xml_deadlock_report"]') AS x(n)
+        ), Shaped AS
+        (
+            SELECT TRY_CONVERT(datetime2(3),
+                       event_xml.value('(event/@timestamp)[1]', 'nvarchar(50)')) AS event_utc,
+                   event_xml.value
+                       ('(event/data/value/deadlock/process-list/process[1]/@currentdbname)[1]', 'nvarchar(128)') AS database_name,
+                   event_xml.value
+                       ('(event/data/value/deadlock/victim-list/victimProcess[1]/@id)[1]', 'nvarchar(100)') AS victim_process_id,
+                   event_xml.value
+                       ('count(event/data/value/deadlock/process-list/process)', 'int') AS process_count,
+                   event_xml.query('(event/data/value/deadlock)[1]') AS deadlock_xml
+            FROM Deadlocks
+        ), Hashed AS
+        (
+            SELECT HASHBYTES('SHA2_256',
+                       CONVERT(varbinary(max), CONVERT(nvarchar(max), deadlock_xml))) AS deadlock_hash,
+                   event_utc, database_name, victim_process_id,
+                   process_count, deadlock_xml
+            FROM Shaped
+            WHERE event_utc IS NOT NULL
+              AND deadlock_xml.exist('/deadlock[1]') = 1
+        )
+        INSERT monitor.DeadlockEvent
+        (
+            deadlock_hash, event_utc, database_name,
+            victim_process_id, process_count, deadlock_xml
+        )
+        SELECT h.deadlock_hash, h.event_utc, NULLIF(h.database_name, N''),
+               h.victim_process_id, h.process_count, h.deadlock_xml
+        FROM Hashed AS h
+        WHERE NOT EXISTS
+              (SELECT 1 FROM monitor.DeadlockEvent AS d
+               WHERE d.deadlock_hash = h.deadlock_hash);
+
+        EXEC monitor.usp_SetComponentStatus N'DEADLOCK_RING_BUFFER', 1;
+    END TRY
+    BEGIN CATCH
+        DECLARE @deadlock_error_number int = ERROR_NUMBER(),
+                @deadlock_error_message nvarchar(4000) = ERROR_MESSAGE();
+        EXEC monitor.usp_SetComponentStatus
+             N'DEADLOCK_RING_BUFFER', 0, @deadlock_error_number, @deadlock_error_message;
+    END CATCH;
+
+    /* Collect high-signal entries from the current and previous RDS SQL error logs. */
+    IF NOT EXISTS
+       (SELECT 1 FROM monitor.ComponentStatus
+        WHERE component_name = N'RDS_ERROR_LOG'
+          AND last_attempt_utc >= DATEADD(MINUTE, -15, SYSUTCDATETIME()))
+    BEGIN
+    BEGIN TRY
+        CREATE TABLE #ErrorLog
+        (
+            LogDate datetime,
+            ProcessInfo nvarchar(100),
+            [Text] nvarchar(max)
+        );
+
+        INSERT #ErrorLog EXEC rdsadmin.dbo.rds_read_error_log @index = 0, @type = 1;
+        BEGIN TRY
+            INSERT #ErrorLog EXEC rdsadmin.dbo.rds_read_error_log @index = 1, @type = 1;
+        END TRY
+        BEGIN CATCH
+            /* Previous log can be absent on a recently created/restarted instance. */
+        END CATCH;
+
+        ;WITH HighSignal AS
+        (
+            SELECT LogDate, ProcessInfo, LEFT([Text], 4000) AS message
+            FROM #ErrorLog
+            WHERE LogDate >= DATEADD(DAY, -2, GETDATE())
+              AND
+              (
+                   [Text] LIKE N'%Severity: 2[0-5]%'
+                OR [Text] LIKE N'%Error: 823,%'
+                OR [Text] LIKE N'%Error: 824,%'
+                OR [Text] LIKE N'%Error: 825,%'
+                OR [Text] LIKE N'%Error: 832,%'
+                OR [Text] LIKE N'%Error: 833,%'
+                OR [Text] LIKE N'%Error: 9002,%'
+                OR [Text] LIKE N'%Error: 1105,%'
+                OR [Text] LIKE N'%SQL Server Assertion%'
+                OR [Text] LIKE N'%stack dump%'
+                OR [Text] LIKE N'%corruption%'
+                OR [Text] LIKE N'%I/O requests taking longer%'
+                OR [Text] LIKE N'%failed to allocate%page%'
+              )
+        ), Hashed AS
+        (
+            SELECT HASHBYTES('SHA2_256', CONVERT(varbinary(max),
+                       CONCAT(CONVERT(nvarchar(23), LogDate, 121), N'|',
+                              ProcessInfo, N'|', message))) AS event_hash,
+                   LogDate, ProcessInfo, message
+            FROM HighSignal
+        )
+        INSERT monitor.ServerErrorLogEvent
+            (event_hash, log_date_server_time, process_info, message)
+        SELECT h.event_hash, h.LogDate, h.ProcessInfo, h.message
+        FROM Hashed AS h
+        WHERE NOT EXISTS
+              (SELECT 1 FROM monitor.ServerErrorLogEvent AS e
+               WHERE e.event_hash = h.event_hash);
+
+        EXEC monitor.usp_SetComponentStatus N'RDS_ERROR_LOG', 1;
+    END TRY
+    BEGIN CATCH
+        DECLARE @errorlog_error_number int = ERROR_NUMBER(),
+                @errorlog_error_message nvarchar(4000) = ERROR_MESSAGE();
+        EXEC monitor.usp_SetComponentStatus
+             N'RDS_ERROR_LOG', 0, @errorlog_error_number, @errorlog_error_message;
+    END CATCH;
+    END;
+
+    /* Database log utilization. */
+    BEGIN TRY
+        CREATE TABLE #LogSpace
+        (
+            database_name sysname,
+            log_size_mb decimal(19,2),
+            log_used_percent decimal(9,2),
+            status_code int
+        );
+        INSERT #LogSpace EXEC(N'DBCC SQLPERF(LOGSPACE) WITH NO_INFOMSGS;');
+
+        INSERT monitor.DatabaseLogSample
+            (captured_utc, database_name, log_size_mb, log_used_percent, status_code)
+        SELECT @captured_utc, database_name, log_size_mb, log_used_percent, status_code
+        FROM #LogSpace;
+
+        EXEC monitor.usp_SetComponentStatus N'DATABASE_LOG_SPACE', 1;
+    END TRY
+    BEGIN CATCH
+        DECLARE @logspace_error_number int = ERROR_NUMBER(),
+                @logspace_error_message nvarchar(4000) = ERROR_MESSAGE();
+        EXEC monitor.usp_SetComponentStatus
+             N'DATABASE_LOG_SPACE', 0, @logspace_error_number, @logspace_error_message;
+    END CATCH;
+
+    /* SQL-visible volume capacity. CloudWatch FreeStorageSpace remains authoritative for RDS. */
+    BEGIN TRY
+        INSERT monitor.StorageSample
+            (captured_utc, volume_mount_point, total_bytes, available_bytes)
+        SELECT @captured_utc,
+               COALESCE(NULLIF(v.volume_mount_point, N''), N'(RDS volume)'),
+               MAX(v.total_bytes), MIN(v.available_bytes)
+        FROM sys.master_files AS f
+        CROSS APPLY sys.dm_os_volume_stats(f.database_id, f.file_id) AS v
+        WHERE f.database_id > 4
+        GROUP BY COALESCE(NULLIF(v.volume_mount_point, N''), N'(RDS volume)');
+
+        EXEC monitor.usp_SetComponentStatus N'SQL_VOLUME_SPACE', 1;
+    END TRY
+    BEGIN CATCH
+        DECLARE @storage_error_number int = ERROR_NUMBER(),
+                @storage_error_message nvarchar(4000) = ERROR_MESSAGE();
+        EXEC monitor.usp_SetComponentStatus
+             N'SQL_VOLUME_SPACE', 0, @storage_error_number, @storage_error_message;
+    END CATCH;
+
+    /* Persist blocking requests only after they exceed the configured threshold. */
+    BEGIN TRY
+        DECLARE @blocking_threshold_minutes smallint =
+            (SELECT blocking_threshold_minutes
+             FROM monitor.Settings WHERE settings_id = 1);
+        IF @blocking_threshold_minutes IS NULL SET @blocking_threshold_minutes = 10;
+
+        CREATE TABLE #CurrentBlocking
+        (
+            incident_hash binary(32) NOT NULL PRIMARY KEY,
+            request_start_server_time datetime2(0) NULL,
+            blocked_session_id smallint NOT NULL,
+            blocking_session_id smallint NOT NULL,
+            database_name sysname NULL,
+            wait_type nvarchar(120) NULL,
+            wait_resource nvarchar(512) NULL,
+            wait_ms bigint NOT NULL,
+            blocked_login_name sysname NULL,
+            blocked_host_name nvarchar(128) NULL,
+            blocked_program_name nvarchar(256) NULL,
+            blocker_login_name sysname NULL,
+            blocker_host_name nvarchar(128) NULL,
+            blocker_program_name nvarchar(256) NULL,
+            blocked_sql nvarchar(4000) NULL,
+            blocker_sql nvarchar(4000) NULL
+        );
+
+        INSERT #CurrentBlocking
+        SELECT HASHBYTES('SHA2_256', CONVERT(varbinary(max),
+                   CONCAT(r.session_id, N'|', r.blocking_session_id, N'|',
+                          CONVERT(nvarchar(30), r.start_time, 126)))),
+               r.start_time, r.session_id, r.blocking_session_id,
+               DB_NAME(r.database_id), r.wait_type, r.wait_resource,
+               CONVERT(bigint, r.wait_time),
+               blocked_s.login_name, blocked_s.host_name, blocked_s.program_name,
+               blocker_s.login_name, blocker_s.host_name, blocker_s.program_name,
+               LEFT(CASE WHEN blocked_text.text IS NULL THEN NULL
+                         ELSE SUBSTRING
+                         (
+                             blocked_text.text,
+                             (r.statement_start_offset / 2) + 1,
+                             ((CASE r.statement_end_offset
+                                   WHEN -1 THEN DATALENGTH(blocked_text.text)
+                                   ELSE r.statement_end_offset END
+                               - r.statement_start_offset) / 2) + 1
+                         ) END, 4000),
+               LEFT(blocker_text.text, 4000)
+        FROM sys.dm_exec_requests AS r
+        LEFT JOIN sys.dm_exec_sessions AS blocked_s
+          ON blocked_s.session_id = r.session_id
+        LEFT JOIN sys.dm_exec_sessions AS blocker_s
+          ON blocker_s.session_id = r.blocking_session_id
+        OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS blocked_text
+        OUTER APPLY
+        (
+            SELECT TOP (1) br.sql_handle
+            FROM sys.dm_exec_requests AS br
+            WHERE br.session_id = r.blocking_session_id
+            ORDER BY br.request_id
+        ) AS blocker_request
+        OUTER APPLY sys.dm_exec_sql_text(blocker_request.sql_handle) AS blocker_text
+        WHERE r.blocking_session_id > 0
+          AND r.wait_time >= @blocking_threshold_minutes * 60000;
+
+        UPDATE b
+           SET last_seen_utc = SYSUTCDATETIME(),
+               resolved_utc = NULL,
+               is_active = 1,
+               max_wait_ms = CASE WHEN c.wait_ms > b.max_wait_ms
+                                  THEN c.wait_ms ELSE b.max_wait_ms END,
+               wait_type = c.wait_type,
+               wait_resource = c.wait_resource,
+               blocked_sql = COALESCE(c.blocked_sql, b.blocked_sql),
+               blocker_sql = COALESCE(c.blocker_sql, b.blocker_sql)
+        FROM monitor.BlockingIncident AS b
+        JOIN #CurrentBlocking AS c ON c.incident_hash = b.incident_hash;
+
+        INSERT monitor.BlockingIncident
+        (
+            incident_hash, first_seen_utc, last_seen_utc, is_active,
+            request_start_server_time, blocked_session_id, blocking_session_id,
+            database_name, wait_type, wait_resource, max_wait_ms,
+            blocked_login_name, blocked_host_name, blocked_program_name,
+            blocker_login_name, blocker_host_name, blocker_program_name,
+            blocked_sql, blocker_sql
+        )
+        SELECT c.incident_hash, SYSUTCDATETIME(), SYSUTCDATETIME(), 1,
+               c.request_start_server_time, c.blocked_session_id,
+               c.blocking_session_id, c.database_name, c.wait_type,
+               c.wait_resource, c.wait_ms,
+               c.blocked_login_name, c.blocked_host_name, c.blocked_program_name,
+               c.blocker_login_name, c.blocker_host_name, c.blocker_program_name,
+               c.blocked_sql, c.blocker_sql
+        FROM #CurrentBlocking AS c
+        WHERE NOT EXISTS
+              (SELECT 1 FROM monitor.BlockingIncident AS b
+               WHERE b.incident_hash = c.incident_hash);
+
+        UPDATE b
+           SET is_active = 0,
+               resolved_utc = SYSUTCDATETIME()
+        FROM monitor.BlockingIncident AS b
+        WHERE b.is_active = 1
+          AND NOT EXISTS
+              (SELECT 1 FROM #CurrentBlocking AS c
+               WHERE c.incident_hash = b.incident_hash);
+
+        EXEC monitor.usp_SetComponentStatus N'BLOCKING_MONITOR', 1;
+    END TRY
+    BEGIN CATCH
+        DECLARE @blocking_error_number int = ERROR_NUMBER(),
+                @blocking_error_message nvarchar(4000) = ERROR_MESSAGE();
+        EXEC monitor.usp_SetComponentStatus
+             N'BLOCKING_MONITOR', 0,
+             @blocking_error_number, @blocking_error_message;
+    END CATCH;
+END;
+GO
+
+/* ---------- Current-health views ---------- */
+
+CREATE OR ALTER VIEW monitor.vw_BackupHealth
+AS
+WITH H AS
+(
+    SELECT i.database_name,
+           i.discovery_source,
+           i.is_manually_confirmed,
+           i.last_seen_utc AS inventory_last_seen_utc,
+           i.last_visible_utc,
+           COALESCE(l.captured_utc, CONVERT(datetime2(0), SYSUTCDATETIME())) AS captured_utc,
+           COALESCE(l.captured_server_time, CONVERT(datetime2(0), GETDATE())) AS captured_server_time,
+           COALESCE(d.state_desc COLLATE DATABASE_DEFAULT,
+                    l.database_state COLLATE DATABASE_DEFAULT,
+                    i.last_known_state,
+                    N'NOT_VISIBLE') COLLATE DATABASE_DEFAULT AS database_state,
+           COALESCE(d.recovery_model_desc COLLATE DATABASE_DEFAULT,
+                    l.recovery_model COLLATE DATABASE_DEFAULT,
+                    i.last_known_recovery_model,
+                    N'UNKNOWN') COLLATE DATABASE_DEFAULT AS recovery_model,
+           l.full_finish_time, l.full_duration_seconds, l.full_size_bytes,
+           l.full_source, l.full_location, l.full_expiration_time,
+           l.diff_finish_time, l.diff_duration_seconds, l.diff_size_bytes,
+           l.diff_source, l.diff_location, l.diff_expiration_time,
+           l.log_finish_time, l.log_duration_seconds, l.log_size_bytes,
+           l.log_source, l.log_chain_broken,
+           COALESCE(l.log_visibility, N'UNVERIFIED') AS log_visibility,
+           l.collection_note,
+           CONVERT(bit, CASE WHEN i.is_enabled = 1 AND COALESCE(p.is_enabled, 1) = 1
+                             THEN 1 ELSE 0 END) AS monitoring_enabled,
+           COALESCE(p.require_full, CONVERT(bit, 1)) AS require_full,
+           COALESCE(p.require_diff, CONVERT(bit, 1)) AS require_diff,
+           COALESCE(p.require_log, CONVERT(bit, 1)) AS require_log,
+           COALESCE(p.full_max_age_minutes, 1440) AS full_max_age_minutes,
+           COALESCE(p.diff_max_age_minutes, 360) AS diff_max_age_minutes,
+           COALESCE(p.log_max_age_minutes, 30) AS log_max_age_minutes,
+           CASE
+               WHEN l.diff_finish_time IS NULL THEN l.full_finish_time
+               WHEN l.full_finish_time IS NULL THEN l.diff_finish_time
+               WHEN l.diff_finish_time > l.full_finish_time THEN l.diff_finish_time
+               ELSE l.full_finish_time
+           END AS effective_data_finish_time
+    FROM sys.databases AS d
+    JOIN monitor.DatabaseInventory AS i
+      ON i.database_name = d.name COLLATE DATABASE_DEFAULT
+    LEFT JOIN monitor.DatabaseBackupPolicy AS p
+      ON p.database_name = i.database_name
+    OUTER APPLY
+    (
+        SELECT TOP (1) s.*
+        FROM monitor.BackupSample AS s
+        WHERE s.database_name = i.database_name
+        ORDER BY s.captured_utc DESC, s.sample_id DESC
+    ) AS l
+    WHERE d.database_id > 4
+      AND d.name COLLATE DATABASE_DEFAULT <> N'rdsadmin'
+      AND d.source_database_id IS NULL
+)
+SELECT h.*,
+       CASE
+           WHEN h.monitoring_enabled = 0 THEN N'NOT_MONITORED'
+           WHEN h.database_state NOT IN (N'ONLINE', N'NOT_VISIBLE', N'UNKNOWN') THEN N'NOT_ONLINE'
+           WHEN h.require_full = 0 THEN N'NOT_REQUIRED'
+           WHEN h.full_finish_time IS NULL THEN N'MISSING'
+           WHEN DATEDIFF(MINUTE, h.full_finish_time, h.captured_server_time) > h.full_max_age_minutes THEN N'OVERDUE'
+           ELSE N'OK'
+       END AS full_status,
+       CASE
+           WHEN h.monitoring_enabled = 0 THEN N'NOT_MONITORED'
+           WHEN h.database_state NOT IN (N'ONLINE', N'NOT_VISIBLE', N'UNKNOWN') THEN N'NOT_ONLINE'
+           WHEN h.require_diff = 0 THEN N'NOT_REQUIRED'
+           WHEN h.effective_data_finish_time IS NULL THEN N'MISSING'
+           WHEN DATEDIFF(MINUTE, h.effective_data_finish_time, h.captured_server_time) > h.diff_max_age_minutes THEN N'OVERDUE'
+           ELSE N'OK'
+       END AS diff_status,
+       CASE
+           WHEN h.monitoring_enabled = 0 THEN N'NOT_MONITORED'
+           WHEN h.database_state NOT IN (N'ONLINE', N'NOT_VISIBLE', N'UNKNOWN') THEN N'NOT_ONLINE'
+           WHEN h.require_log = 0 THEN N'NOT_REQUIRED'
+           WHEN h.log_visibility = N'UNVERIFIED' THEN N'UNVERIFIED'
+           WHEN h.log_finish_time IS NULL THEN N'MISSING'
+           WHEN h.log_chain_broken = 1 THEN N'CHAIN_BROKEN'
+           WHEN DATEDIFF(MINUTE, h.log_finish_time, h.captured_utc) > h.log_max_age_minutes THEN N'OVERDUE'
+           ELSE N'OK'
+       END AS log_status
+FROM H AS h;
+GO
+
+CREATE OR ALTER VIEW monitor.vw_BackupIssueSummary
+AS
+SELECT COUNT_BIG(*) AS inventory_database_count,
+       SUM(CONVERT(bigint, CASE WHEN monitoring_enabled = 1 THEN 1 ELSE 0 END)) AS monitored_database_count,
+       SUM(CONVERT(bigint, CASE WHEN monitoring_enabled = 1
+                                 AND (full_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+                                   OR diff_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+                                   OR log_status IN (N'MISSING', N'OVERDUE', N'CHAIN_BROKEN', N'NOT_ONLINE'))
+                                THEN 1 ELSE 0 END)) AS databases_with_backup_issues,
+       SUM(CONVERT(bigint, CASE WHEN monitoring_enabled = 1
+                                 AND full_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+                                THEN 1 ELSE 0 END)) AS full_issue_count,
+       SUM(CONVERT(bigint, CASE WHEN monitoring_enabled = 1
+                                 AND diff_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+                                THEN 1 ELSE 0 END)) AS diff_issue_count,
+       SUM(CONVERT(bigint, CASE WHEN monitoring_enabled = 1
+                                 AND log_status IN (N'MISSING', N'OVERDUE', N'CHAIN_BROKEN', N'NOT_ONLINE')
+                                THEN 1 ELSE 0 END)) AS log_issue_count,
+       SUM(CONVERT(bigint, CASE WHEN monitoring_enabled = 1
+                                 AND log_status = N'UNVERIFIED'
+                                THEN 1 ELSE 0 END)) AS unverified_log_check_count
+FROM monitor.vw_BackupHealth;
+GO
+
+CREATE OR ALTER VIEW monitor.vw_MaintenanceJobHealth
+AS
+SELECT p.job_id, p.job_name, p.maintenance_type,
+       p.max_hours_since_success, p.is_monitored,
+       j.enabled AS agent_job_enabled,
+       lr.run_status AS last_run_status,
+       lr.run_start_server_time AS last_run_server_time,
+       lr.run_duration_seconds AS last_run_duration_seconds,
+       lr.message AS last_run_message,
+       ls.last_success_server_time,
+       CASE
+           WHEN j.job_id IS NULL THEN N'NOT_FOUND'
+           WHEN p.is_monitored = 0 THEN N'NOT_MONITORED'
+           WHEN j.enabled = 0 THEN N'DISABLED'
+           WHEN lr.run_status IN (0, 2, 3) THEN N'FAILED'
+           WHEN ls.last_success_server_time IS NULL THEN N'NEVER_SUCCEEDED'
+           WHEN DATEDIFF(MINUTE, ls.last_success_server_time, GETDATE())
+                  > p.max_hours_since_success * 60.0 THEN N'OVERDUE'
+           ELSE N'OK'
+       END AS health_status
+FROM monitor.MaintenanceJobPolicy AS p
+LEFT JOIN msdb.dbo.sysjobs AS j ON j.job_id = p.job_id
+OUTER APPLY
+(
+    SELECT TOP (1) r.run_status, r.run_start_server_time,
+           r.run_duration_seconds, r.message
+    FROM monitor.AgentJobRun AS r
+    WHERE r.job_id = p.job_id
+    ORDER BY r.run_start_server_time DESC, r.instance_id DESC
+) AS lr
+OUTER APPLY
+(
+    SELECT MAX(r.run_start_server_time) AS last_success_server_time
+    FROM monitor.AgentJobRun AS r
+    WHERE r.job_id = p.job_id AND r.run_status = 1
+) AS ls;
+GO
+
+/* ---------- Email rendering and alerting ---------- */
+
+CREATE OR ALTER PROCEDURE monitor.usp_SendImmediateAlerts
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @enabled bit, @profile sysname, @recipients nvarchar(4000),
+            @server sysname;
+    SELECT @enabled = send_immediate_alerts, @profile = mail_profile,
+           @recipients = recipients, @server = server_label
+    FROM monitor.Settings WHERE settings_id = 1;
+    IF ISNULL(@enabled, 0) = 0 RETURN;
+
+    CREATE TABLE #CurrentException
+    (
+        alert_key nvarchar(450) PRIMARY KEY,
+        alert_kind nvarchar(20),
+        category nvarchar(40),
+        severity nvarchar(20),
+        summary nvarchar(1000),
+        detail nvarchar(4000)
+    );
+
+    INSERT #CurrentException
+    SELECT CONCAT(N'BACKUP:', database_name), N'STATE', N'BACKUP', N'CRITICAL',
+           CONCAT(database_name, N' backup is not compliant'),
+           CONCAT(N'FULL=', full_status, N'; DIFF/effective=', diff_status,
+                  N'; LOG=', log_status, N'; recovery=', recovery_model)
+    FROM monitor.vw_BackupHealth
+    WHERE full_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+       OR diff_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+       OR log_status IN (N'MISSING', N'OVERDUE', N'CHAIN_BROKEN', N'NOT_ONLINE');
+
+    INSERT #CurrentException
+    SELECT CONCAT(N'JOB:', CONVERT(nvarchar(36), job_id)), N'STATE',
+           N'MAINTENANCE', N'CRITICAL',
+           CONCAT(job_name, N' is ', health_status),
+           CONCAT(N'Type=', maintenance_type,
+                  N'; last run=', COALESCE(CONVERT(nvarchar(19), last_run_server_time, 120), N'never'),
+                  N'; last success=', COALESCE(CONVERT(nvarchar(19), last_success_server_time, 120), N'never'),
+                  N'; SLA hours=', CONVERT(nvarchar(30), max_hours_since_success),
+                  N'; message=', COALESCE(last_run_message, N''))
+    FROM monitor.vw_MaintenanceJobHealth
+    WHERE is_monitored = 1
+      /* Failed runs are sent by the all-Agent failure event below. */
+      AND health_status IN (N'OVERDUE', N'NEVER_SUCCEEDED');
+
+    INSERT #CurrentException
+    SELECT CONCAT(N'AGENT_FAILURE:', CONVERT(nvarchar(36), job_id), N':', instance_id),
+           N'EVENT', N'SQL_AGENT', N'CRITICAL',
+           CONCAT(job_name, N' ',
+                  CASE run_status WHEN 3 THEN N'was cancelled'
+                                      WHEN 2 THEN N'entered retry'
+                                      ELSE N'had a failed step' END),
+           CONCAT(N'Run=', CONVERT(nvarchar(19), run_start_server_time, 120),
+                  N'; step=', COALESCE(failure_step_name, N'(job outcome)'),
+                  N'; duration=', run_duration_seconds, N's; message=', COALESCE(message, N''))
+    FROM monitor.AgentFailureEvent
+    WHERE run_start_server_time >= DATEADD(HOUR, -12, GETDATE());
+
+    INSERT #CurrentException
+    SELECT CONCAT(N'DEADLOCK:', CONVERT(varchar(64), deadlock_hash, 2)),
+           N'EVENT', N'DEADLOCK', N'CRITICAL',
+           CONCAT(N'Deadlock detected',
+                  CASE WHEN database_name IS NOT NULL THEN CONCAT(N' in ', database_name) ELSE N'' END),
+           CONCAT(N'UTC=', CONVERT(nvarchar(23), event_utc, 121),
+                  N'; victim=', COALESCE(victim_process_id, N'unknown'),
+                  N'; processes=', COALESCE(CONVERT(nvarchar(20), process_count), N'unknown'))
+    FROM monitor.DeadlockEvent
+    WHERE event_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME());
+
+    INSERT #CurrentException
+    SELECT CONCAT(N'SERVER_ERROR:', CONVERT(varchar(64), event_hash, 2)),
+           N'EVENT', N'SERVER_ERROR', N'CRITICAL',
+           CONCAT(N'High-signal SQL Server error: ', LEFT(message, 300)),
+           CONCAT(N'Time=', CONVERT(nvarchar(19), log_date_server_time, 120),
+                  N'; process=', COALESCE(process_info, N''), N'; ', message)
+    FROM monitor.ServerErrorLogEvent
+    WHERE log_date_server_time >= DATEADD(HOUR, -12, GETDATE());
+
+    INSERT #CurrentException
+    SELECT CONCAT(N'BLOCKING:', CONVERT(varchar(64), incident_hash, 2)),
+           N'STATE', N'BLOCKING', N'CRITICAL',
+           CONCAT(N'Blocking exceeded threshold in ',
+                  COALESCE(database_name, N'(unknown database)'),
+                  N': session ', blocked_session_id,
+                  N' blocked by ', blocking_session_id),
+           CONCAT(N'First seen UTC=', CONVERT(nvarchar(19), first_seen_utc, 120),
+                  N'; wait=', COALESCE(wait_type, N''),
+                  N'; blocked login=', COALESCE(blocked_login_name, N''),
+                  N'; blocker login=', COALESCE(blocker_login_name, N''),
+                  N'; blocked SQL=', COALESCE(blocked_sql, N''),
+                  N'; blocker SQL=', COALESCE(blocker_sql, N''))
+    FROM monitor.BlockingIncident
+    WHERE is_active = 1;
+
+    INSERT #CurrentException
+    SELECT CONCAT(N'RDS_TASK:', task_id), N'EVENT', N'RDS_BACKUP_TASK', N'CRITICAL',
+           CONCAT(database_name, N' ', task_type, N' task ', task_id, N' failed'),
+           CONCAT(N'Created=', COALESCE(CONVERT(nvarchar(19), created_at_server_time, 120), N''),
+                  N'; S3=', COALESCE(s3_object_arn, N''),
+                  N'; error=', COALESCE(task_info, N''))
+    FROM monitor.RdsTaskHistory
+    WHERE task_type IN (N'BACKUP_DB', N'BACKUP_DB_DIFFERENTIAL')
+      AND lifecycle IN (N'ERROR', N'CANCELLED')
+      /* Avoid flooding the first deployment with AWS's 36-day task history. */
+      AND created_at_server_time >= DATEADD(HOUR, -12, GETDATE());
+
+    UPDATE s
+       SET is_active = 0, resolved_utc = SYSUTCDATETIME()
+    FROM monitor.AlertState AS s
+    WHERE s.alert_kind = N'STATE' AND s.is_active = 1
+      AND NOT EXISTS (SELECT 1 FROM #CurrentException AS c WHERE c.alert_key = s.alert_key);
+
+    UPDATE s
+       SET category = c.category, severity = c.severity,
+           summary = c.summary, detail = c.detail,
+           last_sent_utc = CASE
+               WHEN s.is_active = 0
+                 OR s.category <> c.category
+                 OR s.severity <> c.severity
+                 OR s.summary <> c.summary
+                 OR ISNULL(s.detail, N'') <> ISNULL(c.detail, N'')
+               THEN NULL ELSE s.last_sent_utc END,
+           is_active = 1, last_seen_utc = SYSUTCDATETIME(), resolved_utc = NULL
+    FROM monitor.AlertState AS s
+    JOIN #CurrentException AS c ON c.alert_key = s.alert_key;
+
+    INSERT monitor.AlertState
+    (
+        alert_key, alert_kind, category, severity, summary, detail,
+        is_active, first_seen_utc, last_seen_utc
+    )
+    SELECT c.alert_key, c.alert_kind, c.category, c.severity,
+           c.summary, c.detail, 1, SYSUTCDATETIME(), SYSUTCDATETIME()
+    FROM #CurrentException AS c
+    WHERE NOT EXISTS (SELECT 1 FROM monitor.AlertState AS s WHERE s.alert_key = c.alert_key);
+
+    CREATE TABLE #Due
+    (
+        alert_key nvarchar(450) PRIMARY KEY,
+        category nvarchar(40), severity nvarchar(20),
+        summary nvarchar(1000), detail nvarchar(4000)
+    );
+    INSERT #Due
+    SELECT s.alert_key, s.category, s.severity, s.summary, s.detail
+    FROM monitor.AlertState AS s
+    WHERE s.is_active = 1
+      AND s.last_sent_utc IS NULL;
+
+    DECLARE @count int = (SELECT COUNT(*) FROM #Due);
+    IF @count = 0 RETURN;
+
+    DECLARE @rows nvarchar(max) = N'', @body nvarchar(max),
+            @subject nvarchar(255), @mailitem_id int;
+    SELECT @rows = @rows
+         + N'<tr><td>' + monitor.fn_HtmlEncode(category) + N'</td>'
+         + N'<td><b>' + monitor.fn_HtmlEncode(severity) + N'</b></td>'
+         + N'<td>' + monitor.fn_HtmlEncode(summary) + N'</td>'
+         + N'<td>' + monitor.fn_HtmlEncode(detail) + N'</td></tr>'
+    FROM #Due ORDER BY category, summary;
+
+    SET @subject = LEFT(CONCAT(N'[CRITICAL] ', @server,
+                        N' SQL Server operational alert (', @count, N')'), 255);
+    SET @body = N'<html><head><style>'
+        + N'body{font-family:Segoe UI,Arial;color:#1f2937}h2{color:#991b1b}'
+        + N'table{border-collapse:collapse;width:100%}th{background:#7f1d1d;color:white}'
+        + N'th,td{border:1px solid #d1d5db;padding:7px;text-align:left;vertical-align:top}'
+        + N'tr:nth-child(even){background:#f9fafb}.small{color:#6b7280;font-size:12px}'
+        + N'</style></head><body><h2>' + monitor.fn_HtmlEncode(@server)
+        + N' SQL Server Operational Alert</h2><p>' + CONVERT(nvarchar(20), @count)
+        + N' newly detected critical condition(s) require review. Unchanged conditions are not resent.</p>'
+        + N'<table><tr><th>Category</th><th>Severity</th><th>Condition</th><th>Details</th></tr>'
+        + @rows + N'</table><p class="small">Generated '
+        + CONVERT(nvarchar(19), SYSUTCDATETIME(), 120) + N' UTC by OPS.monitor.</p></body></html>';
+
+    EXEC msdb.dbo.sp_send_dbmail
+         @profile_name = @profile,
+         @recipients = @recipients,
+         @subject = @subject,
+         @body = @body,
+         @body_format = 'HTML',
+         @importance = 'High',
+         @mailitem_id = @mailitem_id OUTPUT;
+
+    UPDATE s SET last_sent_utc = SYSUTCDATETIME()
+    FROM monitor.AlertState AS s JOIN #Due AS d ON d.alert_key = s.alert_key;
+
+    INSERT monitor.NotificationLog
+        (notification_type, queued_utc, subject, recipients, mailitem_id, exception_count)
+    VALUES(N'IMMEDIATE', SYSUTCDATETIME(), @subject, @recipients, @mailitem_id, @count);
+END;
+GO
+
+CREATE OR ALTER PROCEDURE monitor.usp_SendDailyReport
+    @Force bit = 0,
+    @IgnoreSchedule bit = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @enabled bit, @profile sysname, @recipients nvarchar(4000),
+            @server sysname, @report_hour tinyint, @retention smallint,
+            @send_only_on_change bit, @blocking_threshold_minutes smallint;
+    SELECT @enabled = send_daily_report, @profile = mail_profile,
+           @recipients = recipients, @server = server_label,
+           @report_hour = report_hour_eastern,
+           @retention = history_retention_days,
+           @send_only_on_change = send_only_on_change,
+           @blocking_threshold_minutes = blocking_threshold_minutes
+    FROM monitor.Settings WHERE settings_id = 1;
+    IF ISNULL(@enabled, 0) = 0 AND @Force = 0 RETURN;
+
+    /* Ensure a newly created/restored database appears even before the next collector run. */
+    EXEC monitor.usp_SyncDatabaseBackupPolicy;
+
+    DECLARE @eastern_now datetimeoffset =
+        (SYSUTCDATETIME() AT TIME ZONE 'UTC') AT TIME ZONE 'Eastern Standard Time';
+    DECLARE @report_date date = CONVERT(date, @eastern_now);
+
+    IF @Force = 0 AND @IgnoreSchedule = 0
+       AND DATEPART(HOUR, @eastern_now) <> @report_hour RETURN;
+    IF @Force = 0 AND EXISTS
+       (SELECT 1 FROM monitor.NotificationLog
+        WHERE notification_type = N'DAILY' AND report_date_eastern = @report_date) RETURN;
+
+    DECLARE @backup_bad int =
+    (
+        SELECT COUNT(*) FROM monitor.vw_BackupHealth
+        WHERE monitoring_enabled = 1
+          AND (full_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+            OR diff_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+            OR log_status IN (N'MISSING', N'OVERDUE', N'CHAIN_BROKEN', N'NOT_ONLINE'))
+    );
+    DECLARE @full_bad int =
+    (
+        SELECT COUNT(*) FROM monitor.vw_BackupHealth
+        WHERE monitoring_enabled = 1
+          AND full_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+    );
+    DECLARE @diff_bad int =
+    (
+        SELECT COUNT(*) FROM monitor.vw_BackupHealth
+        WHERE monitoring_enabled = 1
+          AND diff_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+    );
+    DECLARE @log_bad int =
+    (
+        SELECT COUNT(*) FROM monitor.vw_BackupHealth
+        WHERE monitoring_enabled = 1
+          AND log_status IN (N'MISSING', N'OVERDUE', N'CHAIN_BROKEN', N'NOT_ONLINE')
+    );
+    DECLARE @log_unverified int =
+    (
+        SELECT COUNT(*) FROM monitor.vw_BackupHealth
+        WHERE monitoring_enabled = 1 AND log_status = N'UNVERIFIED'
+    );
+    DECLARE @job_bad int =
+    (
+        SELECT COUNT(*) FROM monitor.vw_MaintenanceJobHealth
+        WHERE is_monitored = 1 AND health_status <> N'OK'
+    );
+    DECLARE @rds_fail int =
+    (
+        SELECT COUNT(*) FROM monitor.RdsTaskHistory
+        WHERE task_type IN (N'BACKUP_DB', N'BACKUP_DB_DIFFERENTIAL')
+          AND lifecycle IN (N'ERROR', N'CANCELLED')
+          AND created_at_server_time >= DATEADD(HOUR, -12, GETDATE())
+    );
+    DECLARE @agent_fail int =
+    (
+        SELECT COUNT(*) FROM monitor.AgentFailureEvent
+        WHERE run_start_server_time >= DATEADD(HOUR, -12, GETDATE())
+    );
+    DECLARE @deadlock_count int =
+    (
+        SELECT COUNT(*) FROM monitor.DeadlockEvent
+        WHERE event_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME())
+    );
+    DECLARE @server_error_count int =
+    (
+        SELECT COUNT(*) FROM monitor.ServerErrorLogEvent
+        WHERE log_date_server_time >= DATEADD(HOUR, -12, GETDATE())
+    );
+    DECLARE @blocking_count int =
+    (
+        SELECT COUNT(*) FROM monitor.BlockingIncident
+        WHERE is_active = 1
+           OR last_seen_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME())
+    );
+    DECLARE @last_collection_utc datetime2(0) =
+    (
+        SELECT MAX(finished_utc) FROM monitor.CollectorRun WHERE succeeded = 1
+    );
+    DECLARE @collector_bad int =
+        CASE WHEN @last_collection_utc IS NULL
+                   OR @last_collection_utc < DATEADD(MINUTE, -15, SYSUTCDATETIME())
+             THEN 1 ELSE 0 END;
+
+    CREATE TABLE #Anomaly
+    (
+        severity nvarchar(20) NOT NULL,
+        anomaly nvarchar(300) NOT NULL,
+        details nvarchar(4000) NULL
+    );
+
+    IF NOT EXISTS (SELECT 1 FROM monitor.DatabaseInventory WHERE is_enabled = 1)
+        INSERT #Anomaly VALUES
+        (N'CRITICAL', N'Database inventory is empty',
+         N'Register each user database with monitor.usp_RegisterDatabase.');
+
+    INSERT #Anomaly
+    SELECT N'CRITICAL', CONCAT(N'Database ', name, N' is ', state_desc),
+           CONCAT(N'user_access=', user_access_desc,
+                  N'; recovery=', recovery_model_desc,
+                  N'; log_reuse_wait=', log_reuse_wait_desc)
+    FROM sys.databases
+    WHERE database_id > 4 AND name <> N'rdsadmin'
+      AND source_database_id IS NULL AND state_desc <> N'ONLINE';
+
+    ;WITH Latest AS
+    (
+        SELECT s.*,
+               ROW_NUMBER() OVER(PARTITION BY database_name ORDER BY captured_utc DESC) AS rn
+        FROM monitor.DatabaseLogSample AS s
+    )
+    INSERT #Anomaly
+    SELECT CASE WHEN log_used_percent >= 90 THEN N'CRITICAL' ELSE N'WARNING' END,
+           CONCAT(N'High transaction-log utilization: ', database_name),
+           CONCAT(CONVERT(nvarchar(30), log_used_percent), N'% used of ',
+                  CONVERT(nvarchar(30), log_size_mb), N' MB')
+    FROM Latest
+    WHERE rn = 1 AND log_used_percent >= 80;
+
+    ;WITH Latest AS
+    (
+        SELECT s.*,
+               ROW_NUMBER() OVER(PARTITION BY volume_mount_point ORDER BY captured_utc DESC) AS rn
+        FROM monitor.StorageSample AS s
+    )
+    INSERT #Anomaly
+    SELECT CASE WHEN available_bytes * 100.0 / NULLIF(total_bytes, 0) <= 10
+                     OR available_bytes < 10737418240 THEN N'CRITICAL' ELSE N'WARNING' END,
+           CONCAT(N'Low SQL-visible storage: ', volume_mount_point),
+           CONCAT(CONVERT(decimal(19,2), available_bytes / 1073741824.0), N' GB free of ',
+                  CONVERT(decimal(19,2), total_bytes / 1073741824.0), N' GB (',
+                  CONVERT(decimal(9,2), available_bytes * 100.0 / NULLIF(total_bytes, 0)), N'%)')
+    FROM Latest
+    WHERE rn = 1
+      AND (available_bytes * 100.0 / NULLIF(total_bytes, 0) < 15
+           OR available_bytes < 21474836480);
+
+    INSERT #Anomaly
+    SELECT N'WARNING', CONCAT(N'Monitoring component unavailable: ', component_name),
+           CONCAT(N'Error ', COALESCE(CONVERT(nvarchar(20), last_error_number), N''),
+                  N': ', COALESCE(last_error_message, N''),
+                  N'; last successful UTC=',
+                  COALESCE(CONVERT(nvarchar(19), last_success_utc, 120), N'never'))
+    FROM monitor.ComponentStatus
+    WHERE last_error_message IS NOT NULL
+      AND (last_success_utc IS NULL OR last_attempt_utc > last_success_utc);
+
+    INSERT #Anomaly
+    SELECT N'WARNING', N'OPS collector execution failed',
+           CONCAT(N'UTC=', CONVERT(nvarchar(19), started_utc, 120),
+                  N'; error ', COALESCE(CONVERT(nvarchar(20), error_number), N''),
+                  N': ', COALESCE(error_message, N''))
+    FROM monitor.CollectorRun
+    WHERE succeeded = 0 AND started_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME());
+
+    IF @collector_bad = 1
+        INSERT #Anomaly VALUES
+        (N'CRITICAL', N'Backup/maintenance collector is stale',
+         CONCAT(N'Last successful UTC=', COALESCE(CONVERT(nvarchar(19), @last_collection_utc, 120), N'never')));
+
+    INSERT #Anomaly
+    SELECT N'WARNING', CONCAT(N'RDS task appears stuck: ', database_name, N' ', task_type),
+           CONCAT(N'Task ', task_id, N'; lifecycle=', lifecycle,
+                  N'; created=', CONVERT(nvarchar(19), created_at_server_time, 120),
+                  N'; percent=', COALESCE(CONVERT(nvarchar(30), percent_complete), N'unknown'))
+    FROM monitor.RdsTaskHistory
+    WHERE lifecycle IN (N'CREATED', N'IN_PROGRESS')
+      AND created_at_server_time < DATEADD(HOUR, -4, GETDATE());
+
+    BEGIN TRY
+        INSERT #Anomaly
+        SELECT N'WARNING', N'SQL Server restarted or failed over within 12 hours',
+               CONCAT(N'SQL Server start time=', CONVERT(nvarchar(19), sqlserver_start_time, 120))
+        FROM sys.dm_os_sys_info
+        WHERE sqlserver_start_time >= DATEADD(HOUR, -12, GETDATE());
+    END TRY
+    BEGIN CATCH
+        /* RDS can restrict server-state DMVs; ComponentStatus covers core collectors. */
+    END CATCH;
+
+    BEGIN TRY
+        INSERT #Anomaly
+        SELECT CASE WHEN sent_status = N'failed' THEN N'CRITICAL' ELSE N'WARNING' END,
+               CONCAT(N'Database Mail item ', mailitem_id, N' is ', sent_status),
+               CONCAT(N'Requested=', CONVERT(nvarchar(19), send_request_date, 120),
+                      N'; recipients=', COALESCE(recipients, N''),
+                      N'; subject=', COALESCE(subject, N''))
+        FROM msdb.dbo.rds_fn_sysmail_allitems()
+        WHERE
+             (sent_status = N'failed' AND send_request_date >= DATEADD(HOUR, -12, GETDATE()))
+          OR (sent_status = N'unsent' AND send_request_date < DATEADD(MINUTE, -15, GETDATE())
+                                      AND send_request_date >= DATEADD(HOUR, -12, GETDATE()));
+    END TRY
+    BEGIN CATCH
+        INSERT #Anomaly VALUES
+        (N'WARNING', N'Database Mail delivery status could not be checked', LEFT(ERROR_MESSAGE(), 4000));
+    END CATCH;
+
+    DECLARE @anomaly_count int = (SELECT COUNT(*) FROM #Anomaly);
+    DECLARE @database_count int = (SELECT COUNT(*) FROM monitor.vw_BackupHealth);
+    DECLARE @exception_count int =
+        @backup_bad + @log_unverified + @job_bad + @rds_fail + @collector_bad
+        + @agent_fail + @deadlock_count + @server_error_count
+        + @blocking_count + @anomaly_count;
+    DECLARE @overall nvarchar(20) =
+        CASE WHEN @exception_count > 0 THEN N'ATTENTION' ELSE N'HEALTHY' END;
+
+    /*
+       Build a deterministic health-state fingerprint. Routine successful backup
+       timestamps are intentionally excluded: only status/incident changes send
+       another scheduled email. @Force always bypasses suppression.
+    */
+    DECLARE @db_state nvarchar(max), @job_state nvarchar(max),
+            @event_state nvarchar(max), @anomaly_state nvarchar(max),
+            @state_material nvarchar(max), @state_hash varbinary(32),
+            @previous_state_hash varbinary(32);
+
+    SELECT @db_state =
+    (
+        SELECT CONCAT(database_name, N'=', discovery_source, N'/', is_manually_confirmed,
+                      N'/', database_state, N'/', recovery_model,
+                      N'/', full_status, N'/', diff_status, N'/', log_status, N';') AS [text()]
+        FROM monitor.vw_BackupHealth
+        ORDER BY database_name
+        FOR XML PATH('')
+    );
+
+    SELECT @job_state =
+    (
+        SELECT CONCAT(job_name, N'=', health_status, N';') AS [text()]
+        FROM monitor.vw_MaintenanceJobHealth
+        WHERE is_monitored = 1
+        ORDER BY job_name
+        FOR XML PATH('')
+    );
+
+    SELECT @event_state = CONCAT
+    (
+        (SELECT CONCAT(N'RDS:', task_id, N'=', lifecycle, N';') AS [text()]
+         FROM monitor.RdsTaskHistory
+         WHERE lifecycle IN (N'ERROR', N'CANCELLED')
+           AND created_at_server_time >= DATEADD(HOUR, -12, GETDATE())
+         ORDER BY task_id FOR XML PATH('')),
+        (SELECT CONCAT(N'AGENT:', CONVERT(nvarchar(36), job_id), N':', instance_id,
+                       N'=', run_status, N';') AS [text()]
+         FROM monitor.AgentFailureEvent
+         WHERE run_start_server_time >= DATEADD(HOUR, -12, GETDATE())
+         ORDER BY job_id, instance_id FOR XML PATH('')),
+        (SELECT CONCAT(N'DEADLOCK:', CONVERT(varchar(64), deadlock_hash, 2), N';') AS [text()]
+         FROM monitor.DeadlockEvent
+         WHERE event_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME())
+         ORDER BY event_utc, deadlock_hash FOR XML PATH('')),
+        (SELECT CONCAT(N'ERROR:', CONVERT(varchar(64), event_hash, 2), N';') AS [text()]
+         FROM monitor.ServerErrorLogEvent
+         WHERE log_date_server_time >= DATEADD(HOUR, -12, GETDATE())
+         ORDER BY log_date_server_time, event_hash FOR XML PATH('')),
+        (SELECT CONCAT(N'BLOCK:', CONVERT(varchar(64), incident_hash, 2),
+                       N'=', is_active, N';') AS [text()]
+         FROM monitor.BlockingIncident
+         WHERE is_active = 1
+            OR last_seen_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME())
+         ORDER BY first_seen_utc, incident_hash FOR XML PATH(''))
+    );
+
+    SELECT @anomaly_state =
+    (
+        SELECT CONCAT(severity, N'=', anomaly, N';') AS [text()]
+        FROM #Anomaly
+        ORDER BY severity, anomaly
+        FOR XML PATH('')
+    );
+
+    SET @state_material = CONCAT(N'REVISION=11|OVERALL=', @overall,
+        N'|COLLECTOR=', @collector_bad, N'|DB=', COALESCE(@db_state, N''),
+        N'|JOB=', COALESCE(@job_state, N''),
+        N'|EVENT=', COALESCE(@event_state, N''),
+        N'|ANOMALY=', COALESCE(@anomaly_state, N''));
+    SET @state_hash = HASHBYTES('SHA2_256', CONVERT(varbinary(max), @state_material));
+
+    SELECT @previous_state_hash = last_state_hash
+    FROM monitor.ReportState
+    WHERE report_name = N'DAILY_HEALTH';
+
+    IF @Force = 0
+       AND ISNULL(@send_only_on_change, 1) = 1
+       AND @previous_state_hash = @state_hash
+    BEGIN
+        UPDATE monitor.ReportState
+           SET last_evaluated_utc = SYSUTCDATETIME(),
+               last_overall = @overall,
+               last_exception_count = @exception_count
+         WHERE report_name = N'DAILY_HEALTH';
+        RETURN;
+    END;
+
+    DECLARE @backup_rows nvarchar(max) = N'', @job_rows nvarchar(max) = N'',
+            @failure_rows nvarchar(max) = N'', @agent_rows nvarchar(max) = N'',
+            @deadlock_rows nvarchar(max) = N'', @server_error_rows nvarchar(max) = N'',
+            @blocking_rows nvarchar(max) = N'', @anomaly_rows nvarchar(max) = N'';
+
+    SELECT @backup_rows = @backup_rows
+         + N'<tr class="'
+         + CASE
+               WHEN full_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+                 OR diff_status IN (N'MISSING', N'OVERDUE', N'NOT_ONLINE')
+                 OR log_status IN (N'MISSING', N'OVERDUE', N'CHAIN_BROKEN', N'NOT_ONLINE')
+                   THEN N'critical'
+               WHEN database_state IN (N'NOT_VISIBLE', N'UNKNOWN')
+                 OR log_status IN (N'UNVERIFIED', N'NOT_MONITORED')
+                 OR full_status = N'NOT_MONITORED'
+                 OR diff_status = N'NOT_MONITORED' THEN N'warning'
+               ELSE N'okrow'
+           END
+         + N'"><td><b>' + monitor.fn_HtmlEncode(database_name) + N'</b></td>'
+         + N'<td><b>' + monitor.fn_HtmlEncode(discovery_source) + N'</b><br><span class="small">'
+             + CASE WHEN is_manually_confirmed = 1 THEN N'Manually confirmed'
+                    ELSE N'Auto-discovered' END
+             + N'<br>Last visible UTC: '
+             + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), last_visible_utc, 120), N'never'))
+             + N'</span></td>'
+         + N'<td><b>' + monitor.fn_HtmlEncode(database_state) + N'</b><br><span class="small">'
+             + monitor.fn_HtmlEncode(recovery_model) + N' recovery</span></td>'
+         + N'<td><span class="status">' + monitor.fn_HtmlEncode(full_status) + N'</span><br><span class="small">Completed: '
+             + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), full_finish_time, 120), N'never'))
+             + N'<br>Age: ' + COALESCE(CONVERT(nvarchar(30), CONVERT(decimal(10,1), DATEDIFF(MINUTE, full_finish_time, captured_server_time) / 60.0)), N'-') + N'h'
+             + N' | Size: ' + COALESCE(CONVERT(nvarchar(30), CONVERT(decimal(12,2), full_size_bytes / 1073741824.0)), N'-') + N' GB'
+             + N'<br>Duration: ' + COALESCE(CONVERT(nvarchar(20), full_duration_seconds), N'-') + N's'
+             + N' | ' + monitor.fn_HtmlEncode(COALESCE(full_source, N'')) + N'</span></td>'
+         + N'<td><span class="status">' + monitor.fn_HtmlEncode(diff_status) + N'</span><br><span class="small">DIFF: '
+             + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), diff_finish_time, 120), N'never'))
+             + N'<br>Effective age: ' + COALESCE(CONVERT(nvarchar(30), CONVERT(decimal(10,1), DATEDIFF(MINUTE, effective_data_finish_time, captured_server_time) / 60.0)), N'-') + N'h'
+             + N' | Size: ' + COALESCE(CONVERT(nvarchar(30), CONVERT(decimal(12,2), diff_size_bytes / 1073741824.0)), N'-') + N' GB'
+             + N'<br>Duration: ' + COALESCE(CONVERT(nvarchar(20), diff_duration_seconds), N'-') + N's'
+             + N' | ' + monitor.fn_HtmlEncode(COALESCE(diff_source, N'')) + N'</span></td>'
+         + N'<td><span class="status">' + monitor.fn_HtmlEncode(log_status) + N'</span><br><span class="small">Completed: '
+             + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), log_finish_time, 120), N'never'))
+             + N'<br>Age: ' + COALESCE(CONVERT(nvarchar(30), DATEDIFF(MINUTE, log_finish_time, captured_utc)), N'-') + N'm'
+             + N' | Size: ' + COALESCE(CONVERT(nvarchar(30), CONVERT(decimal(12,2), log_size_bytes / 1048576.0)), N'-') + N' MB'
+             + N'<br>' + monitor.fn_HtmlEncode(log_visibility)
+             + CASE WHEN log_chain_broken = 1 THEN N' | CHAIN BROKEN' ELSE N'' END
+             + N'</span></td>'
+         + N'<td class="small">' + monitor.fn_HtmlEncode(COALESCE(full_location, diff_location, N''))
+             + N'<br>FULL expires: ' + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), full_expiration_time, 120), N'not recorded'))
+             + N'<br>DIFF expires: ' + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), diff_expiration_time, 120), N'not recorded'))
+             + N'</td></tr>'
+    FROM monitor.vw_BackupHealth
+    ORDER BY
+        CASE WHEN full_status <> N'OK' OR diff_status <> N'OK'
+                    OR log_status NOT IN (N'OK', N'NOT_REQUIRED') THEN 0 ELSE 1 END,
+        database_name;
+
+    SELECT @job_rows = @job_rows
+         + N'<tr class="' + CASE WHEN health_status = N'OK' THEN N'okrow'
+                                  WHEN health_status IN (N'DISABLED', N'NOT_MONITORED') THEN N'warning'
+                                  ELSE N'critical' END
+         + N'"><td><b>' + monitor.fn_HtmlEncode(job_name) + N'</b></td>'
+         + N'<td>' + monitor.fn_HtmlEncode(maintenance_type) + N'</td>'
+         + N'<td>' + monitor.fn_HtmlEncode(health_status) + N'</td>'
+         + N'<td>' + CONVERT(nvarchar(30), max_hours_since_success) + N'h</td>'
+         + N'<td>' + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), last_run_server_time, 120), N'never'))
+             + N'<br><span class="small">duration '
+             + COALESCE(CONVERT(nvarchar(20), last_run_duration_seconds), N'-') + N's</span></td>'
+         + N'<td>' + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), last_success_server_time, 120), N'never')) + N'</td>'
+         + N'<td class="small">' + monitor.fn_HtmlEncode(COALESCE(last_run_message, N'')) + N'</td></tr>'
+    FROM monitor.vw_MaintenanceJobHealth
+    WHERE is_monitored = 1
+    ORDER BY CASE WHEN health_status = N'OK' THEN 1 ELSE 0 END, job_name;
+
+    SELECT @failure_rows = @failure_rows
+         + N'<tr class="critical"><td>' + CONVERT(nvarchar(20), task_id) + N'</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(database_name, N'')) + N'</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(task_type, N'')) + N'</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(CONVERT(nvarchar(19), created_at_server_time, 120), N'')) + N'</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(task_info, N'')) + N'</td></tr>'
+    FROM monitor.RdsTaskHistory
+    WHERE task_type IN (N'BACKUP_DB', N'BACKUP_DB_DIFFERENTIAL')
+      AND lifecycle IN (N'ERROR', N'CANCELLED')
+      AND created_at_server_time >= DATEADD(HOUR, -12, GETDATE())
+    ORDER BY created_at_server_time DESC;
+
+    SELECT @agent_rows = @agent_rows
+         + N'<tr class="critical"><td><b>' + monitor.fn_HtmlEncode(job_name) + N'</b></td><td>'
+         + CASE run_status WHEN 3 THEN N'CANCELLED' WHEN 2 THEN N'RETRY' ELSE N'FAILED' END + N'</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(failure_step_name, N'(job outcome)')) + N'</td><td>'
+         + monitor.fn_HtmlEncode(CONVERT(nvarchar(19), run_start_server_time, 120)) + N'</td><td>'
+         + CONVERT(nvarchar(20), run_duration_seconds) + N's</td><td class="small">'
+         + monitor.fn_HtmlEncode(COALESCE(message, N'')) + N'</td></tr>'
+    FROM monitor.AgentFailureEvent
+    WHERE run_start_server_time >= DATEADD(HOUR, -12, GETDATE())
+    ORDER BY run_start_server_time DESC, job_name;
+
+    SELECT @blocking_rows = @blocking_rows
+         + N'<tr class="' + CASE WHEN is_active = 1 THEN N'critical' ELSE N'warning' END + N'"><td>'
+         + CASE WHEN is_active = 1 THEN N'<b>ACTIVE</b>' ELSE N'RESOLVED' END + N'</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(database_name, N'(unknown)')) + N'</td><td>'
+         + CONVERT(nvarchar(20), blocked_session_id) + N' &larr; '
+         + CONVERT(nvarchar(20), blocking_session_id) + N'</td><td>'
+         + CONVERT(nvarchar(19), first_seen_utc, 120) + N' UTC<br><span class="small">last seen '
+         + CONVERT(nvarchar(19), last_seen_utc, 120) + N' UTC</span></td><td>'
+         + CONVERT(nvarchar(30), CONVERT(decimal(19,1), max_wait_ms / 60000.0)) + N' min<br><span class="small">'
+         + monitor.fn_HtmlEncode(COALESCE(wait_type, N'')) + N' | '
+         + monitor.fn_HtmlEncode(COALESCE(wait_resource, N'')) + N'</span></td><td class="small"><b>Blocked:</b> '
+         + monitor.fn_HtmlEncode(CONCAT(COALESCE(blocked_login_name, N''), N' @ ', COALESCE(blocked_host_name, N''), N' / ', COALESCE(blocked_program_name, N'')))
+         + N'<br>' + monitor.fn_HtmlEncode(COALESCE(blocked_sql, N''))
+         + N'<br><br><b>Blocker:</b> '
+         + monitor.fn_HtmlEncode(CONCAT(COALESCE(blocker_login_name, N''), N' @ ', COALESCE(blocker_host_name, N''), N' / ', COALESCE(blocker_program_name, N'')))
+         + N'<br>' + monitor.fn_HtmlEncode(COALESCE(blocker_sql, N'')) + N'</td></tr>'
+    FROM monitor.BlockingIncident
+    WHERE is_active = 1
+       OR last_seen_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME())
+    ORDER BY is_active DESC, last_seen_utc DESC;
+
+    SELECT @deadlock_rows = @deadlock_rows
+         + N'<tr class="critical"><td>' + monitor.fn_HtmlEncode(CONVERT(nvarchar(23), event_utc, 121)) + N' UTC</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(database_name, N'(not identified)')) + N'</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(victim_process_id, N'unknown')) + N'</td><td>'
+         + COALESCE(CONVERT(nvarchar(20), process_count), N'unknown') + N'</td><td class="small">'
+         + monitor.fn_HtmlEncode(CONVERT(varchar(64), deadlock_hash, 2)) + N'</td></tr>'
+    FROM monitor.DeadlockEvent
+    WHERE event_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME())
+    ORDER BY event_utc DESC;
+
+    SELECT @server_error_rows = @server_error_rows
+         + N'<tr class="critical"><td>'
+         + monitor.fn_HtmlEncode(CONVERT(nvarchar(19), log_date_server_time, 120)) + N'</td><td>'
+         + monitor.fn_HtmlEncode(COALESCE(process_info, N'')) + N'</td><td class="small">'
+         + monitor.fn_HtmlEncode(message) + N'</td></tr>'
+    FROM monitor.ServerErrorLogEvent
+    WHERE log_date_server_time >= DATEADD(HOUR, -12, GETDATE())
+    ORDER BY log_date_server_time DESC;
+
+    SELECT @anomaly_rows = @anomaly_rows
+         + N'<tr class="' + CASE WHEN severity = N'CRITICAL' THEN N'critical' ELSE N'warning' END
+         + N'"><td><b>' + monitor.fn_HtmlEncode(severity) + N'</b></td><td>'
+         + monitor.fn_HtmlEncode(anomaly) + N'</td><td class="small">'
+         + monitor.fn_HtmlEncode(COALESCE(details, N'')) + N'</td></tr>'
+    FROM #Anomaly
+    ORDER BY CASE WHEN severity = N'CRITICAL' THEN 0 ELSE 1 END, anomaly;
+
+    IF @backup_rows = N'' SET @backup_rows = N'<tr class="critical"><td colspan="7">No monitored databases found. Populate monitor.DatabaseInventory.</td></tr>';
+    IF @job_rows = N'' SET @job_rows = N'<tr><td colspan="7">No standard Ola Hallengren jobs were discovered. Add custom jobs to monitor.MaintenanceJobPolicy if needed.</td></tr>';
+    IF @failure_rows = N'' SET @failure_rows = N'<tr class="okrow"><td colspan="5">No failed or cancelled RDS native backup tasks in the last 12 hours.</td></tr>';
+    IF @agent_rows = N'' SET @agent_rows = N'<tr class="okrow"><td colspan="6">No failed, retried, or cancelled SQL Agent job steps in the last 12 hours.</td></tr>';
+    IF @blocking_rows = N'' SET @blocking_rows = N'<tr class="okrow"><td colspan="6">No blocking incident exceeded the configured threshold in the last 12 hours.</td></tr>';
+    IF @deadlock_rows = N'' SET @deadlock_rows = N'<tr class="okrow"><td colspan="5">No deadlocks captured in the last 12 hours.</td></tr>';
+    IF @server_error_rows = N'' SET @server_error_rows = N'<tr class="okrow"><td colspan="3">No high-signal SQL Server error-log entries in the last 12 hours.</td></tr>';
+    IF @anomaly_rows = N'' SET @anomaly_rows = N'<tr class="okrow"><td colspan="3">No current server anomalies detected by the SQL-visible checks.</td></tr>';
+
+    DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @overall, N'] ', @server,
+        N' SQL Server Health Change - ', CONVERT(nvarchar(10), @report_date, 120)), 255);
+    DECLARE @body nvarchar(max), @mailitem_id int;
+
+    SET @body = N'<html><head><style>'
+        + N'body{font-family:Segoe UI,Arial,sans-serif;color:#1f2937;background:#f1f5f9;margin:0;padding:18px}h1{margin:0;color:#0f2747}h2{color:#173b67;margin:26px 0 8px;border-bottom:2px solid #dbeafe;padding-bottom:5px}'
+        + N'.panel{background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:20px}.card{display:inline-block;background:#f8fafc;border:1px solid #cbd5e1;border-radius:7px;padding:10px 15px;margin:8px 7px 0 0;min-width:125px}'
+        + N'.ok{color:#166534}.bad{color:#991b1b}.status{font-weight:700}table{border-collapse:collapse;width:100%;font-size:12px;background:#fff}'
+        + N'th{background:#173b67;color:#fff}th,td{border:1px solid #cbd5e1;padding:7px;text-align:left;vertical-align:top;word-break:break-word}'
+        + N'tr:nth-child(even){background:#f8fafc}.small{font-size:11px;color:#64748b;line-height:1.45}'
+        + N'tr.critical td{background:#fee2e2;color:#7f1d1d}tr.warning td{background:#fef3c7;color:#78350f}'
+        + N'tr.okrow td{background:#ecfdf5;color:#14532d}'
+        + N'</style></head><body><div class="panel"><h1>' + monitor.fn_HtmlEncode(@server)
+        + N' SQL Server Operational Health Change</h1><div class="small">Report time: '
+        + monitor.fn_HtmlEncode(CONVERT(nvarchar(30), @eastern_now, 120)) + N' Eastern | Collection times shown in SQL Server time unless marked UTC</div>'
+        + N'<p class="small">This full report was sent because the monitored health state changed. Routine backup timestamps do not trigger duplicate email.</p>'
+        + N'<p><span class="card"><b>Overall</b><br><span class="'
+        + CASE WHEN @overall = N'HEALTHY' THEN N'ok' ELSE N'bad' END + N'">' + @overall + N'</span></span>'
+        + N'<span class="card"><b>Inventory databases</b><br>' + CONVERT(nvarchar(20), @database_count) + N'</span>'
+        + N'<span class="card"><b>Databases with backup issues</b><br>' + CONVERT(nvarchar(20), @backup_bad) + N'</span>'
+        + N'<span class="card"><b>FULL issues</b><br>' + CONVERT(nvarchar(20), @full_bad) + N'</span>'
+        + N'<span class="card"><b>DIFF issues</b><br>' + CONVERT(nvarchar(20), @diff_bad) + N'</span>'
+        + N'<span class="card"><b>LOG issues</b><br>' + CONVERT(nvarchar(20), @log_bad) + N'</span>'
+        + N'<span class="card"><b>Unverified LOG checks</b><br>' + CONVERT(nvarchar(20), @log_unverified) + N'</span>'
+        + N'<span class="card"><b>Agent failures (12h)</b><br>' + CONVERT(nvarchar(20), @agent_fail) + N'</span>'
+        + N'<span class="card"><b>Maintenance exceptions</b><br>' + CONVERT(nvarchar(20), @job_bad) + N'</span>'
+        + N'<span class="card"><b>Deadlocks (12h)</b><br>' + CONVERT(nvarchar(20), @deadlock_count) + N'</span>'
+        + N'<span class="card"><b>Blocking incidents (12h)</b><br>' + CONVERT(nvarchar(20), @blocking_count) + N'</span>'
+        + N'<span class="card"><b>Server errors (12h)</b><br>' + CONVERT(nvarchar(20), @server_error_count) + N'</span>'
+        + N'<span class="card"><b>Server anomalies</b><br>' + CONVERT(nvarchar(20), @anomaly_count) + N'</span>'
+        + N'<span class="card"><b>RDS task failures (12h)</b><br>' + CONVERT(nvarchar(20), @rds_fail) + N'</span>'
+        + N'<span class="card"><b>Collector freshness</b><br>'
+        + CASE WHEN @collector_bad = 0 THEN N'<span class="ok">OK</span>' ELSE N'<span class="bad">STALE</span>' END
+        + N'<br><span class="small">' + COALESCE(CONVERT(nvarchar(19), @last_collection_utc, 120), N'never') + N' UTC</span></span></p>'
+        + N'<h2>Backup Health — Visible sys.databases Inventory</h2><p class="small">The grid contains only user databases currently returned by sys.databases to the collector login. “Databases with backup issues” counts databases with a confirmed missing, overdue, broken-chain, or offline condition. UNVERIFIED is counted separately and does not mean a backup failed. Red = confirmed issue. Amber = unverified metadata or deliberately unmonitored. Green = compliant. SLA: FULL 24h; DIFF/effective data 6h; LOG 30m.</p>'
+        + N'<table><tr><th>Database</th><th>Inventory evidence</th><th>State / Recovery</th><th>FULL</th><th>DIFF / Effective</th><th>LOG</th><th>S3 / Device / Retention</th></tr>'
+        + @backup_rows + N'</table>'
+        + N'<h2>All SQL Agent Failures / Retries / Cancellations — Last 12 Hours</h2><table><tr><th>Job</th><th>Outcome</th><th>Step</th><th>Run time</th><th>Duration</th><th>Message</th></tr>'
+        + @agent_rows + N'</table>'
+        + N'<h2>Blocking Incidents Over ' + CONVERT(nvarchar(10), @blocking_threshold_minutes) + N' Minutes — Last 12 Hours</h2><table><tr><th>Status</th><th>Database</th><th>Blocked &larr; Blocker</th><th>Observed</th><th>Maximum wait</th><th>Sessions and SQL</th></tr>'
+        + @blocking_rows + N'</table>'
+        + N'<h2>Current Server Anomalies</h2><table><tr><th>Severity</th><th>Anomaly</th><th>Details</th></tr>'
+        + @anomaly_rows + N'</table>'
+        + N'<h2>Deadlocks — Last 12 Hours</h2><p class="small">The complete deadlock XML is retained in OPS.monitor.DeadlockEvent for investigation.</p><table><tr><th>UTC time</th><th>Database</th><th>Victim process</th><th>Processes</th><th>Event hash</th></tr>'
+        + @deadlock_rows + N'</table>'
+        + N'<h2>High-Signal SQL Server Error Log — Last 12 Hours</h2><table><tr><th>Server time</th><th>Process</th><th>Message</th></tr>'
+        + @server_error_rows + N'</table>'
+        + N'<h2>Ola Hallengren Maintenance Job Health</h2><table><tr><th>Job</th><th>Type</th><th>Health</th><th>Max age</th><th>Last run</th><th>Last success</th><th>Last message</th></tr>'
+        + @job_rows + N'</table>'
+        + N'<h2>Failed / Cancelled RDS Native Backup Tasks — Last 12 Hours</h2><table><tr><th>Task</th><th>Database</th><th>Type</th><th>Created</th><th>Error</th></tr>'
+        + @failure_rows + N'</table>'
+        + N'<h2>Interpretation Notes</h2><ul>'
+        + N'<li><b>UNVERIFIED</b> transaction-log status means SQL cannot read RDS log-backup metadata; it does not mean the log backup failed.</li>'
+        + N'<li>S3 lifecycle retention is not exposed through these T-SQL interfaces. Verify the bucket lifecycle policy separately.</li>'
+        + N'<li>CloudWatch remains authoritative for RDS CPU, FreeableMemory, FreeStorageSpace, failover events, and host-level health.</li>'
+        + N'<li>OPS monitoring history retention: ' + CONVERT(nvarchar(10), @retention) + N' days. RDS task history itself is retained by AWS for 36 days.</li>'
+        + N'<li>Scheduled email is change-only. Use <code>EXEC monitor.usp_SendDailyReport @Force = 1;</code> for an on-demand full report.</li>'
+        + N'</ul><p class="small">Generated by OPS.monitor on ' + monitor.fn_HtmlEncode(@server) + N'.</p></div></body></html>';
+
+    EXEC msdb.dbo.sp_send_dbmail
+         @profile_name = @profile,
+         @recipients = @recipients,
+         @subject = @subject,
+         @body = @body,
+         @body_format = 'HTML',
+         @mailitem_id = @mailitem_id OUTPUT;
+
+    UPDATE monitor.ReportState
+       SET last_state_hash = @state_hash,
+           last_evaluated_utc = SYSUTCDATETIME(),
+           last_sent_utc = SYSUTCDATETIME(),
+           last_overall = @overall,
+           last_exception_count = @exception_count
+     WHERE report_name = N'DAILY_HEALTH';
+    IF @@ROWCOUNT = 0
+        INSERT monitor.ReportState
+            (report_name, last_state_hash, last_evaluated_utc, last_sent_utc,
+             last_overall, last_exception_count)
+        VALUES
+            (N'DAILY_HEALTH', @state_hash, SYSUTCDATETIME(), SYSUTCDATETIME(),
+             @overall, @exception_count);
+
+    INSERT monitor.NotificationLog
+        (notification_type, queued_utc, report_date_eastern, subject,
+         recipients, mailitem_id, exception_count)
+    VALUES(N'DAILY', SYSUTCDATETIME(),
+           CASE WHEN @Force = 1 THEN NULL ELSE @report_date END, @subject,
+           @recipients, @mailitem_id,
+           @exception_count);
+END;
+GO
+
+CREATE OR ALTER PROCEDURE monitor.usp_PurgeHistory
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET DEADLOCK_PRIORITY LOW;
+    DECLARE @days int =
+        (SELECT history_retention_days FROM monitor.Settings WHERE settings_id = 1);
+    IF @days IS NULL SET @days = 90;
+
+    DELETE TOP (10000) FROM monitor.BackupSample
+     WHERE captured_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.AgentJobRun
+     WHERE imported_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.AgentFailureEvent
+     WHERE collected_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.DeadlockEvent
+     WHERE event_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.ServerErrorLogEvent
+     WHERE collected_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.BlockingIncident
+     WHERE is_active = 0
+       AND last_seen_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.DatabaseLogSample
+     WHERE captured_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.StorageSample
+     WHERE captured_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.RdsTaskHistory
+     WHERE last_collected_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.TlogBackupHistory
+     WHERE collected_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.CollectorRun
+     WHERE started_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.NotificationLog
+     WHERE queued_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+    DELETE TOP (10000) FROM monitor.AlertState
+     WHERE is_active = 0 AND resolved_utc < DATEADD(DAY, -@days, SYSUTCDATETIME());
+END;
+GO
+
+/*
+   Scheduling is intentionally outside this installer. Existing Agent jobs are
+   neither inspected for ownership nor created, altered, enabled, or deleted.
+   If the two previously-created monitor jobs exist, their current steps keep
+   calling these monitor-schema procedures without any job change.
+*/
+
+/* Initial collection. No email is sent by this installer. */
+EXEC monitor.usp_CollectBackupAndMaintenance;
+EXEC monitor.usp_CollectOperationalHealth;
+GO
+
+/* Validation result sets. Review these before forcing a test email. */
+SELECT
+    (SELECT COUNT(*) FROM sys.databases
+      WHERE database_id > 4 AND name <> N'rdsadmin'
+        AND source_database_id IS NULL) AS visible_sys_databases,
+    (SELECT COUNT(*) FROM monitor.DatabaseInventory) AS monitor_inventory_databases;
+
+SELECT N'VISIBLE_BUT_NOT_IN_INVENTORY' AS discrepancy, d.name AS database_name
+FROM sys.databases AS d
+WHERE d.database_id > 4 AND d.name <> N'rdsadmin'
+  AND d.source_database_id IS NULL
+  AND NOT EXISTS
+      (SELECT 1 FROM monitor.DatabaseInventory AS i
+       WHERE i.database_name = d.name COLLATE DATABASE_DEFAULT)
+UNION ALL
+SELECT N'IN_INVENTORY_BUT_NOT_VISIBLE', i.database_name
+FROM monitor.DatabaseInventory AS i
+WHERE NOT EXISTS
+      (SELECT 1 FROM sys.databases AS d
+       WHERE d.database_id > 4 AND d.name <> N'rdsadmin'
+         AND d.source_database_id IS NULL
+         AND d.name COLLATE DATABASE_DEFAULT = i.database_name);
+
+SELECT database_name, is_enabled, is_manually_confirmed, discovery_source,
+       last_seen_utc, last_visible_utc, last_known_state,
+       last_known_recovery_model, notes
+FROM monitor.DatabaseInventory
+ORDER BY database_name;
+SELECT * FROM monitor.vw_BackupIssueSummary;
+SELECT * FROM monitor.vw_BackupHealth ORDER BY database_name;
+SELECT * FROM monitor.vw_MaintenanceJobHealth ORDER BY job_name;
+SELECT TOP (20) * FROM monitor.CollectorRun ORDER BY collector_run_id DESC;
+SELECT * FROM monitor.ComponentStatus ORDER BY component_name;
+SELECT TOP (100) * FROM monitor.AgentFailureEvent
+ WHERE run_start_server_time >= DATEADD(HOUR, -12, GETDATE())
+ ORDER BY run_start_server_time DESC;
+SELECT TOP (100) event_utc, database_name, victim_process_id, process_count, deadlock_hash
+ FROM monitor.DeadlockEvent
+ WHERE event_utc >= DATEADD(HOUR, -12, SYSUTCDATETIME())
+ ORDER BY event_utc DESC;
+SELECT TOP (100) * FROM monitor.BlockingIncident
+ ORDER BY is_active DESC, last_seen_utc DESC;
+SELECT * FROM monitor.ReportState ORDER BY report_name;
+GO
+
+/*
+    After reviewing the result sets, send one test report manually:
+
+        USE OPS;
+        EXEC monitor.usp_SendDailyReport @Force = 1;
+
+    Then verify change suppression without waiting for 08:00 Eastern. This call
+    evaluates immediately but should not queue another email when state is unchanged:
+
+        EXEC monitor.usp_SendDailyReport @Force = 0, @IgnoreSchedule = 1;
+
+    The scheduled report sends only when health status or the incident set
+    changes. A forced report always sends and refreshes the saved fingerprint.
+
+    Verify RDS Database Mail delivery:
+
+        SELECT TOP (20) *
+        FROM msdb.dbo.rds_fn_sysmail_allitems()
+        ORDER BY send_request_date DESC;
+
+        SELECT TOP (100) *
+        FROM msdb.dbo.rds_fn_sysmail_event_log()
+        ORDER BY log_date DESC;
+
+    Common policy overrides:
+
+        -- Manual database registration is intentionally disabled. The grid is
+        -- synchronized only from user-database rows visible in sys.databases.
+
+        -- Disable monitoring deliberately without deleting inventory/history:
+        EXEC OPS.monitor.usp_SetDatabaseMonitoring
+             @DatabaseName = N'RetiredDatabase', @Enabled = 0;
+
+        -- A database does not use differential backups:
+        UPDATE OPS.monitor.DatabaseBackupPolicy
+        SET require_diff = 0, notes = N'FULL + LOG strategy'
+        WHERE database_name = N'YourDatabase';
+
+        -- A weekly Ola job may go 8 days between successes:
+        UPDATE OPS.monitor.MaintenanceJobPolicy
+        SET max_hours_since_success = 192
+        WHERE job_name = N'IndexOptimize - USER_DATABASES';
+
+        -- Add a custom maintenance job not matching standard Ola names:
+        INSERT OPS.monitor.MaintenanceJobPolicy
+            (job_id, job_name, maintenance_type, max_hours_since_success, auto_discovered)
+        SELECT job_id, name, N'CUSTOM', 24, 0
+        FROM msdb.dbo.sysjobs
+        WHERE name = N'Your custom maintenance job';
+
+        -- Change-only delivery and blocking threshold:
+        UPDATE OPS.monitor.Settings
+        SET send_only_on_change = 1,
+            blocking_threshold_minutes = 10
+        WHERE settings_id = 1;
+*/
