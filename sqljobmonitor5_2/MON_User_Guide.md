@@ -77,6 +77,26 @@ Object Explorer → **OPS → Tables → mon.DatabaseCheck** → правый к
 - Так же редактируются **mon.ServerCheck** (колонка `is_enabled`) и **mon.DatabasePolicy** (SLA в минутах).
 - Если строка не сохраняется («row was not committed»), значит, введено неверное значение. Нажмите Esc, чтобы откатить строку.
 
+### 3.2a Вариант 1: MON Check Editor (PowerShell, настоящие чекбоксы + APPLY)
+Файл `MON-CheckEditor.ps1` работает только на Windows и ничего не устанавливает: использует встроенный .NET SqlClient.
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\MON-CheckEditor.ps1 -Server ms-app-stg.xxxx.us-east-1.rds.amazonaws.com
+```
+1. Введите login и пароль (или включите Windows auth) и нажмите **Connect**. Сервер, login и режим запоминаются в `%APPDATA%\MON\CheckEditor.json`, пароль не сохраняется.
+2. Вкладки:
+   - **Databases**: матрица чекбоксов, цель retention, политика хранения, notes;
+   - **Server checks**;
+   - **Settings / thresholds**;
+   - **Backup retention**: итоги и сетка, только просмотр;
+   - **Ola CommandLog**: 7 дней, только просмотр;
+   - **Change log**: аудит.
+3. Кликайте по чекбоксам. Для массовых изменений выделите ячейки мышью (Ctrl/Shift) и нажмите **Check selected** / **Uncheck selected** или пробел.
+4. Изменённые ячейки подсвечиваются **жёлтым**, счётчик показывается на кнопке **APPLY (N)**.
+5. **APPLY** или Ctrl+S: окно показывает список «было → стало», после подтверждения всё записывается **одной транзакцией**. Если строку тем временем изменил кто-то другой, не сохраняется ничего, и программа просит нажать Refresh.
+6. **Discard changes** отменяет правки, **F5** перезагружает данные, фильтр работает по имени базы.
+
+Все изменения попадают в `mon.CheckChangeLog` от имени вашего login и с именем хоста. Вступают в силу в ближайшем 5-минутном цикле.
+
 ### 3.3 Вариант B: одной командой (удобно для массовых изменений)
 ```sql
 -- одна проверка у одной базы
@@ -339,7 +359,11 @@ EXEC OPS.mon.usp_ShowBackupRetention;   -- 1) сетка по базам, 2) и�
   UPDATE OPS.mon.Setting SET setting_value = N'DBA' WHERE setting_name = 'ola_commandlog_database';
   ```
 - Строки импортируются каждые 5 минут, инкрементально, с чтением READ UNCOMMITTED, чтобы не мешать Ola. Незавершённые команды перечитываются, пока не получат EndTime. При первом запуске загружается 35 дней (`ola_initial_load_days`).
-- Любая упавшая команда создаёт issue `OLAFAIL:...`. Для BACKUP, DBCC и RESTORE это CRITICAL, для индексов, статистики и cleanup — WARNING. Проверку можно выключить галочкой **OLA_LOG** в `mon.ServerCheck`.
+- Ошибка в CommandLog **не всегда значит, что Ola упала**. Монитор различает три исхода:
+  - **CORRUPTION FOUND** — CHECKDB **выполнился до конца и нашёл повреждения** (ошибки 25xx, 79xx, 89xx, 823–825). Проверка сработала, повреждена сама база: CRITICAL, нужен restore или repair. Такой запуск не считается «last known good».
+  - **SKIPPED** — 1222 (lock timeout) или 1205 (deadlock victim). Команда не смогла получить блокировку, например REBUILD индекса. Это WARNING, в следующий запуск объект обработается снова.
+  - **FAILED** — всё остальное: упал бэкап, CHECKDB не смог запуститься и т.п. Для BACKUP, DBCC и RESTORE это CRITICAL, для остального — WARNING.
+- Каждая такая команда создаёт issue `OLAFAIL:...`. Проверку можно выключить галочкой **OLA_LOG** в `mon.ServerCheck`.
 - В digest есть раздел **Ola Hallengren maintenance** по типам команд (сколько, упало, суммарное и самое долгое время, количество файлов) и таблица упавших команд.
 ```sql
 EXEC OPS.mon.usp_ShowOlaLog;                   -- последние 24 ч
