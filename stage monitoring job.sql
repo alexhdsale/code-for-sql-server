@@ -1,4 +1,9 @@
 /*
+
+look at the changes in my file, create a new file based on it plus your changes. Create a logic do not send email if nothing has been changed. Add blocking issue with is running more then 10 minutes. Make email looks nice with all DBs status and backup info. all anomalies or errors or issues highlight . make a deep research to create a prof monitoring and email delivery. ask me any questions
+*/
+
+/*
     MS-APP-STG / Amazon RDS for SQL Server
     OPS Backup and Ola Hallengren Maintenance Monitor
     Revision 4 - complete live database inventory in every report
