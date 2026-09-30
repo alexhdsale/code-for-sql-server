@@ -121,6 +121,24 @@ IF SCHEMA_ID(N'mon') IS NULL
     EXEC(N'CREATE SCHEMA mon AUTHORIZATION dbo;');
 GO
 
+/*
+   Re-install / upgrade: stop the running engine loop first. Altering mon.usp_EngineLoop while
+   it runs makes that execution fail with error 2801 ("definition ... has changed since it was
+   compiled"). The job's every-minute schedule restarts it automatically with the new code.
+*/
+BEGIN TRY
+    IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'MON - Engine')
+    BEGIN
+        EXEC msdb.dbo.sp_stop_job @job_name = N'MON - Engine';
+        PRINT N'MON - Engine was running: stopped for the upgrade (restarts within 1 minute).';
+        WAITFOR DELAY '00:00:05';
+    END;
+END TRY
+BEGIN CATCH
+    /* job not running (error 22022) - nothing to stop */
+END CATCH;
+GO
+
 /* =============================================================================
    SECTION 1  -  CONFIGURATION
    ============================================================================= */
@@ -3288,6 +3306,9 @@ BEGIN
                        COUNT(*) OVER (PARTITION BY f.job_id) AS fails
                 FROM mon.AgentFailure AS f
                 WHERE f.run_start_utc >= DATEADD(HOUR, -@lookback, @now)
+                  /* the engine itself: cancel by the installer / error 2801 after a redeploy are expected;
+                     real engine outages are caught by the ENGINE_STALE watchdog */
+                  AND NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
             )
             INSERT #Issue(issue_key, category, severity, is_event, title, detail, event_utc)
             SELECT CONCAT(N'JOBFAIL:', F.job_id), 'AGENT', 'CRITICAL', 0,
