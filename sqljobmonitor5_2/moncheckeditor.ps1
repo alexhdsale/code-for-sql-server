@@ -225,7 +225,14 @@ function Invoke-ApplyChanges {
             return
         }
         $tx.Commit()
-        Set-Status ('Applied {0} change(s) at {1}. They take effect at the next 5-minute cycle.' -f $changes.Count, (Get-Date -Format 'HH:mm:ss'))
+        $closed = 0
+        try {
+            $cc = $c.CreateCommand()
+            $cc.CommandText = 'DECLARE @n int; EXEC mon.usp_CloseDisabledIssues @Closed = @n OUTPUT; SELECT ISNULL(@n, 0);'
+            $cc.CommandTimeout = 60
+            $closed = [int]$cc.ExecuteScalar()
+        } catch { }
+        Set-Status ('Applied {0} change(s) at {1}. {2} open issue(s) of disabled checks closed now; re-enabled checks are evaluated at the next 5-minute cycle.' -f $changes.Count, (Get-Date -Format 'HH:mm:ss'), $closed)
     } catch {
         try { $tx.Rollback() } catch { }
         [System.Windows.Forms.MessageBox]::Show(("Apply failed, nothing was saved:`r`n{0}" -f $_.Exception.Message), 'MON - error', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
