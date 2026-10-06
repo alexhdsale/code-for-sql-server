@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.6.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.6.3 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -26,6 +26,8 @@
                    issue workflow: usp_AckIssue / usp_ResolveIssue, no reminders for acknowledged issues.
              5.6.1: fix Msg 1046 in usp_ResolveIssue; no Msg 22022 when the engine job is idle.
              5.6.2: no msdb.dbo.syssessions anywhere (Msg 229 on RDS): installer engine check, JOBLONG running-job list.
+             5.6.3: object order (no "depends on the missing object" message); release gate finds its own
+                    ReleaseHistory row via SESSION_CONTEXT, so the history records COMPLETED reliably.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -169,8 +171,11 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.6.2';
+DECLARE @version varchar(20) = '5.6.3';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
+/* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
+IF @prev IS NULL
+    SET @prev = (SELECT TOP (1) CONCAT(version, N' (', status, N')') FROM mon.ReleaseHistory ORDER BY release_id DESC);
 DECLARE @prev_engine nvarchar(20) = NULL;
 
 /* Abandon an earlier install that never finished (e.g. the script was stopped half way). */
@@ -191,6 +196,9 @@ END;
 
 INSERT mon.ReleaseHistory(version, status, started_utc, started_server_time, prev_version, prev_engine_enabled)
 VALUES (@version, 'INSTALLING', SYSUTCDATETIME(), DATEADD(SECOND, -1, SYSDATETIME()), @prev, @prev_engine);
+/* [5.6.3] remember THIS install's row for the release gate at the end of the script */
+DECLARE @rid int = SCOPE_IDENTITY();
+EXEC sys.sp_set_session_context @key = N'mon_release_id', @value = @rid;
 
 PRINT CONCAT(N'MON install ', @version, N' started (previous: ', ISNULL(@prev, N'none'), N'). Engine paused until the self-test passes.');
 GO
@@ -4206,6 +4214,69 @@ END;
 GO
 
 /*
+   Everything that is checked on this server, in one call (SSMS grid friendly):
+     1) database matrix with check marks   2) server-level checks
+     3) catalog: what each check does + which setting tunes it   4) last 50 changes (audit)
+*/
+CREATE OR ALTER PROCEDURE mon.usp_ShowChecks
+    @Database sysname = N'%'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @y nchar(1) = NCHAR(10004), @na nvarchar(3) = N'n/a', @def int = ISNULL(mon.fn_SettingInt('backup_retention_target_days'), 7);
+
+    SELECT c.database_name AS [Database],
+           ISNULL(s.recovery_model, N'?') AS [Recovery],
+           CASE WHEN c.monitored = 1 THEN @y ELSE N'' END AS [Monitored],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.full_backup = 1 THEN @y ELSE N'' END AS [Full],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.diff_backup = 1 THEN @y ELSE N'' END AS [Diff],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN ISNULL(s.recovery_model, N'FULL') <> N'FULL' THEN @na
+                WHEN c.log_backup = 1 THEN @y ELSE N'' END AS [Log],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.backup_retention = 1 THEN @y ELSE N'' END AS [Retention],
+           CONCAT(ISNULL(c.retention_days, @def), N'd', CASE WHEN c.retention_days IS NULL THEN N' (default)' END) AS [Retention target],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.checkdb = 1 THEN @y ELSE N'' END AS [CHECKDB],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.log_used = 1 THEN @y ELSE N'' END AS [Log used],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.vlf_count = 1 THEN @y ELSE N'' END AS [VLF],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.file_near_max = 1 THEN @y ELSE N'' END AS [File max],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.config_drift = 1 THEN @y ELSE N'' END AS [Drift],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.config_best_practice = 1 THEN @y ELSE N'' END AS [Config],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.query_store = 1 THEN @y ELSE N'' END AS [Query Store],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.blocking = 1 THEN @y ELSE N'' END AS [Blocking],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.long_queries = 1 THEN @y ELSE N'' END AS [Long queries],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.open_trans = 1 THEN @y ELSE N'' END AS [Open trans],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.deadlocks = 1 THEN @y ELSE N'' END AS [Deadlocks],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.io_latency = 1 THEN @y ELSE N'' END AS [I/O latency],
+           CONCAT(p.full_max_age_minutes, N' / ', p.diff_max_age_minutes, N' / ', p.log_max_age_minutes, N' min') AS [SLA full/diff/log],
+           c.notes AS [Notes],
+           CASE WHEN ISNULL(s.is_present, 1) = 0 THEN N'DROPPED' ELSE N'' END AS [State],
+           c.modified_utc AS [Modified UTC], c.modified_by AS [Modified by]
+    FROM mon.DatabaseCheck AS c
+    LEFT JOIN mon.DatabaseStatus AS s ON s.database_name = c.database_name
+    LEFT JOIN mon.DatabasePolicy AS p ON p.database_name = c.database_name
+    WHERE c.database_name LIKE @Database
+    ORDER BY c.monitored DESC, c.database_name;
+
+    SELECT s.check_code AS [Code], s.display_name AS [Server-level check],
+           CASE WHEN s.is_enabled = 1 THEN @y ELSE N'' END AS [Enabled],
+           k.description AS [What it checks], k.threshold_info AS [Tuned by], s.notes AS [Notes],
+           s.modified_utc AS [Modified UTC], s.modified_by AS [Modified by]
+    FROM mon.ServerCheck AS s
+    JOIN mon.CheckCatalog AS k ON k.check_code = s.check_code
+    ORDER BY k.sort_order;
+
+    SELECT k.check_code AS [Code], k.scope AS [Scope], k.display_name AS [Check], k.column_name AS [DatabaseCheck column],
+           k.description AS [What it checks], k.threshold_info AS [Tuned by], k.key_pattern AS [Issue key pattern]
+    FROM mon.CheckCatalog AS k
+    ORDER BY k.sort_order;
+
+    SELECT TOP (50) l.changed_utc AS [Changed UTC], l.changed_by AS [By], l.host_name AS [Host], l.object_name AS [Object],
+           l.item_name AS [Item], l.property_name AS [Property], l.old_value AS [Old], l.new_value AS [New]
+    FROM mon.CheckChangeLog AS l
+    ORDER BY l.change_log_id DESC;
+END;
+GO
+
+/*
    Switch a check ON/OFF.
      @Database : exact name or LIKE pattern (N'%' = all databases). Ignored for server checks.
      @Check    : check code (FULL, LOG, LONGQ, CPU, ...), column name (long_queries), or 'ALL'
@@ -4281,69 +4352,6 @@ BEGIN
     EXEC mon.usp_CloseDisabledIssues @Closed = @closed OUTPUT;
     PRINT CONCAT(N'Updated ', @n, N' database(s). ', ISNULL(@closed, 0), N' open issue(s) of disabled checks closed now (silently); re-enabled checks are evaluated at the next 5-minute cycle.');
     EXEC mon.usp_ShowChecks @Database = @Database;
-END;
-GO
-
-/*
-   Everything that is checked on this server, in one call (SSMS grid friendly):
-     1) database matrix with check marks   2) server-level checks
-     3) catalog: what each check does + which setting tunes it   4) last 50 changes (audit)
-*/
-CREATE OR ALTER PROCEDURE mon.usp_ShowChecks
-    @Database sysname = N'%'
-AS
-BEGIN
-    SET NOCOUNT ON;
-    DECLARE @y nchar(1) = NCHAR(10004), @na nvarchar(3) = N'n/a', @def int = ISNULL(mon.fn_SettingInt('backup_retention_target_days'), 7);
-
-    SELECT c.database_name AS [Database],
-           ISNULL(s.recovery_model, N'?') AS [Recovery],
-           CASE WHEN c.monitored = 1 THEN @y ELSE N'' END AS [Monitored],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.full_backup = 1 THEN @y ELSE N'' END AS [Full],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.diff_backup = 1 THEN @y ELSE N'' END AS [Diff],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN ISNULL(s.recovery_model, N'FULL') <> N'FULL' THEN @na
-                WHEN c.log_backup = 1 THEN @y ELSE N'' END AS [Log],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.backup_retention = 1 THEN @y ELSE N'' END AS [Retention],
-           CONCAT(ISNULL(c.retention_days, @def), N'd', CASE WHEN c.retention_days IS NULL THEN N' (default)' END) AS [Retention target],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.checkdb = 1 THEN @y ELSE N'' END AS [CHECKDB],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.log_used = 1 THEN @y ELSE N'' END AS [Log used],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.vlf_count = 1 THEN @y ELSE N'' END AS [VLF],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.file_near_max = 1 THEN @y ELSE N'' END AS [File max],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.config_drift = 1 THEN @y ELSE N'' END AS [Drift],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.config_best_practice = 1 THEN @y ELSE N'' END AS [Config],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.query_store = 1 THEN @y ELSE N'' END AS [Query Store],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.blocking = 1 THEN @y ELSE N'' END AS [Blocking],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.long_queries = 1 THEN @y ELSE N'' END AS [Long queries],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.open_trans = 1 THEN @y ELSE N'' END AS [Open trans],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.deadlocks = 1 THEN @y ELSE N'' END AS [Deadlocks],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.io_latency = 1 THEN @y ELSE N'' END AS [I/O latency],
-           CONCAT(p.full_max_age_minutes, N' / ', p.diff_max_age_minutes, N' / ', p.log_max_age_minutes, N' min') AS [SLA full/diff/log],
-           c.notes AS [Notes],
-           CASE WHEN ISNULL(s.is_present, 1) = 0 THEN N'DROPPED' ELSE N'' END AS [State],
-           c.modified_utc AS [Modified UTC], c.modified_by AS [Modified by]
-    FROM mon.DatabaseCheck AS c
-    LEFT JOIN mon.DatabaseStatus AS s ON s.database_name = c.database_name
-    LEFT JOIN mon.DatabasePolicy AS p ON p.database_name = c.database_name
-    WHERE c.database_name LIKE @Database
-    ORDER BY c.monitored DESC, c.database_name;
-
-    SELECT s.check_code AS [Code], s.display_name AS [Server-level check],
-           CASE WHEN s.is_enabled = 1 THEN @y ELSE N'' END AS [Enabled],
-           k.description AS [What it checks], k.threshold_info AS [Tuned by], s.notes AS [Notes],
-           s.modified_utc AS [Modified UTC], s.modified_by AS [Modified by]
-    FROM mon.ServerCheck AS s
-    JOIN mon.CheckCatalog AS k ON k.check_code = s.check_code
-    ORDER BY k.sort_order;
-
-    SELECT k.check_code AS [Code], k.scope AS [Scope], k.display_name AS [Check], k.column_name AS [DatabaseCheck column],
-           k.description AS [What it checks], k.threshold_info AS [Tuned by], k.key_pattern AS [Issue key pattern]
-    FROM mon.CheckCatalog AS k
-    ORDER BY k.sort_order;
-
-    SELECT TOP (50) l.changed_utc AS [Changed UTC], l.changed_by AS [By], l.host_name AS [Host], l.object_name AS [Object],
-           l.item_name AS [Item], l.property_name AS [Property], l.old_value AS [Old], l.new_value AS [New]
-    FROM mon.CheckChangeLog AS l
-    ORDER BY l.change_log_id DESC;
 END;
 GO
 
@@ -6952,8 +6960,12 @@ GO
    RELEASE GATE: self-test, then resume the engine only if everything is valid.
    ============================================================================= */
 DECLARE @rid int, @since datetime2(0), @prev_engine nvarchar(20), @version varchar(20), @e int, @w int;
-SELECT TOP (1) @rid = release_id, @since = started_server_time, @prev_engine = prev_engine_enabled, @version = version
-FROM mon.ReleaseHistory WHERE status = 'INSTALLING' ORDER BY release_id DESC;
+/* [5.6.3] this install's own row (set at the start of the script); fallback: newest INSTALLING row */
+SET @rid = TRY_CONVERT(int, SESSION_CONTEXT(N'mon_release_id'));
+IF @rid IS NULL OR NOT EXISTS (SELECT 1 FROM mon.ReleaseHistory WHERE release_id = @rid)
+    SELECT TOP (1) @rid = release_id FROM mon.ReleaseHistory WHERE status = 'INSTALLING' ORDER BY release_id DESC;
+SELECT @since = started_server_time, @prev_engine = prev_engine_enabled, @version = version
+FROM mon.ReleaseHistory WHERE release_id = @rid;
 
 EXEC mon.usp_SelfTest @Deep = 1, @Since = @since, @Quiet = 1, @Errors = @e OUTPUT, @Warnings = @w OUTPUT;
 
