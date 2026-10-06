@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.6.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.6.3 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -26,6 +26,8 @@
                    issue workflow: usp_AckIssue / usp_ResolveIssue, no reminders for acknowledged issues.
              5.6.1: fix Msg 1046 in usp_ResolveIssue; no Msg 22022 when the engine job is idle.
              5.6.2: no msdb.dbo.syssessions anywhere (Msg 229 on RDS): installer engine check, JOBLONG running-job list.
+             5.6.3: object order (no "depends on the missing object" message); release gate finds its own
+                    ReleaseHistory row via SESSION_CONTEXT, so the history records COMPLETED reliably.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -169,8 +171,11 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.6.2';
+DECLARE @version varchar(20) = '5.6.3';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
+/* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
+IF @prev IS NULL
+    SET @prev = (SELECT TOP (1) CONCAT(version, N' (', status, N')') FROM mon.ReleaseHistory ORDER BY release_id DESC);
 DECLARE @prev_engine nvarchar(20) = NULL;
 
 /* Abandon an earlier install that never finished (e.g. the script was stopped half way). */
@@ -191,6 +196,9 @@ END;
 
 INSERT mon.ReleaseHistory(version, status, started_utc, started_server_time, prev_version, prev_engine_enabled)
 VALUES (@version, 'INSTALLING', SYSUTCDATETIME(), DATEADD(SECOND, -1, SYSDATETIME()), @prev, @prev_engine);
+/* [5.6.3] remember THIS install's row for the release gate at the end of the script */
+DECLARE @rid int = SCOPE_IDENTITY();
+EXEC sys.sp_set_session_context @key = N'mon_release_id', @value = @rid;
 
 PRINT CONCAT(N'MON install ', @version, N' started (previous: ', ISNULL(@prev, N'none'), N'). Engine paused until the self-test passes.');
 GO
