@@ -2,6 +2,10 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.6.3 — 2026-10-06
+- `usp_ShowChecks` is created before `usp_SetCheck` — no more "depends on the missing object" message during install.
+- Release gate finds this install's `ReleaseHistory` row through `SESSION_CONTEXT` (the previous run was reported as "previous: none"); the start message shows the last version even if it was not recorded as COMPLETED.
+
 ## 5.6.2 — 2026-10-06
 - Fix: `msdb.dbo.syssessions` is no longer used (not readable by the RDS master user — Msg 229): the installer's engine-running check and the JOBLONG running-job list now use sysjobactivity (last 2 days) and Agent job-step sessions.
 
