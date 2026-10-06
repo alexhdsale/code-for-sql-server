@@ -130,7 +130,8 @@ BEGIN
     END CATCH;
     EXEC sys.sp_releaseapplock @Resource = N'mon_IssueMerge', @LockOwner = 'Session';
 
-    PRINT CONCAT((SELECT COUNT(*) FROM @c), N' issue(s) resolved manually. If the condition still exists they re-open within 5 minutes.');
+    DECLARE @n int = (SELECT COUNT(*) FROM @c);      /* PRINT does not accept a subquery (Msg 1046) */
+    PRINT CONCAT(@n, N' issue(s) resolved manually. If the condition still exists they re-open within 5 minutes.');
     SELECT i.issue_id, i.severity, i.title, i.issue_key, i.resolved_by, i.resolved_utc, i.resolve_note
     FROM mon.Issue AS i JOIN @c AS c ON c.issue_id = i.issue_id;
 END;

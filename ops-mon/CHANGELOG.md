@@ -2,6 +2,10 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.6.1 — 2026-10-06
+- Fix: `usp_ResolveIssue` failed to compile (Msg 1046 — subquery inside PRINT), which made the 5.6 self-test fail and left the engine paused.
+- Fix: installer no longer prints Msg 22022 when `MON - Engine` is not running (stops the job only if it is active).
+
 ## 5.6 — 2026-10-06
 - **Three kinds of email:** issue alerts (immediate, change-only — nothing changed = no email), a scheduled **short summary** (`mon.usp_SendSummary`: KPI tiles + every open issue with NEEDS ACTION / ACK / MUTED) and a scheduled **full report** (everything monitored). Scheduler `mon.usp_RunScheduledEmails` in the hourly job; settings `summary_email_hours_local`, `summary_email_weekdays`, `summary_recipients`, `summary_max_issues`, `summary_skip_when_full`, `full_report_hours_local`, `full_report_weekdays`, `full_report_change_only`. Defaults: summary daily 08:00, full report Monday + Thursday 08:00. Empty `full_report_hours_local` = old behaviour.
 - **Issue workflow:** `mon.usp_AckIssue` (owner + note, no reminders while acknowledged), `mon.usp_ResolveIssue` (manual close with a note, re-opens if the condition persists); `vw_ActiveIssues.workflow_state`.
