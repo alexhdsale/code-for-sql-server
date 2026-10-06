@@ -1,4 +1,4 @@
-# OPS.mon — SQL Server Monitoring & Change-Only Alerting (rev 5.4)
+# OPS.mon — SQL Server Monitoring & Change-Only Alerting (rev 5.6)
 
 **Server:** MS-APP-STG (Amazon RDS for SQL Server) · **Database:** OPS · **Schema:** mon
 **Owner:** DBA team · **Runs alongside:** legacy OPS.monitor rev 4 (untouched)
@@ -459,5 +459,7 @@ Uninstall rev 5.x:
 | 5.0 | New `mon` schema; issue lifecycle; change-only alerts and digest; Monday heartbeat; 30-s blocking sampler with 10-minute alert; long queries, open transactions, job duration anomalies, config drift, performance snapshot |
 | 5.1 | Check matrix (`DatabaseCheck` / `ServerCheck`) with audit; backup retention & inventory grid; `usp_SetCheck` / `usp_ShowChecks` / `usp_ShowBackupRetention`; SSMS custom report |
 | 5.2 | Backup files made vs on storage, storage-retention policy; CHECKDB from three sources; Ola CommandLog collector with correct outcome interpretation (corruption found ≠ Ola failure); job failures stay open while the last run failed; PowerShell Check Editor |
+| 5.6 | Issue alerts (change-only) + scheduled short summary + scheduled full report; issue workflow `usp_AckIssue` / `usp_ResolveIssue`; per-area data retention and `usp_ShowDataRetention`. Details: `MON_Operations_Guide.md` |
+| 5.5 | Performance: `vw_BackupRetention` single-pass rewrite (retention report ~36 s → seconds), no per-row UDF on msdb history, bounded msdb scans, new covering/purge indexes (`01c_performance_indexes.sql`) |
 | 5.4 | Release guard: `mon.ReleaseHistory`, engine paused during install, `mon.usp_SelfTest` gate (engine resumes only when it passes), watchdog `MON_RELEASE`; email statistics `mon.usp_ShowEmailStats` + Emails tab; `MON_Uninstall.sql` |
 | 5.3 | Switching a check off closes its issues immediately (APPLY, `usp_SetCheck`, digest, alerts — `usp_CloseDisabledIssues`); DIFF alerts show FULL/DIFF source; CHECKDB CRITICAL after SLA × `checkdb_crit_factor`; dates older than 300 days show the year; Check Editor with green/red/grey states, click-to-toggle, Last good CHECKDB column and a 30-day Ola tab |

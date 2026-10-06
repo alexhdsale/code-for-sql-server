@@ -242,6 +242,7 @@ BEGIN
             SELECT NULL, i.issue_id, 'REMINDER', i.severity, @now
             FROM mon.Issue AS i
             WHERE i.is_active = 1 AND i.is_muted = 0 AND i.is_event = 0 AND i.severity = 'CRITICAL'
+              AND i.ack_utc IS NULL                     /* [5.6] acknowledged = someone is on it: no reminders */
               AND i.alert_sent_utc IS NOT NULL
               AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@reminder, @now)
               AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);

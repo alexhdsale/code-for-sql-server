@@ -146,32 +146,42 @@ BEGIN
 
     DECLARE @days int = ISNULL(mon.fn_SettingInt('history_retention_days'), 90),
             @bdays int = ISNULL(mon.fn_SettingInt('blocking_sample_retention_days'), 30);
+    /* [5.6] per-area retention; empty setting = history_retention_days */
+    DECLARE @perf_days  int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_perf_days'), N'')), @days),
+            @bk_days    int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_backup_days'), N'')), @days),
+            @iss_days   int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_issue_days'), N'')), @days),
+            @mail_days  int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_email_days'), N'')), @days),
+            @audit_days int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_audit_days'), N'')), 4 * @days);
     DECLARE @cut datetime2(0) = DATEADD(DAY, -@days, SYSUTCDATETIME()),
             @bcut datetime2(0) = DATEADD(DAY, -@bdays, SYSUTCDATETIME()),
+            @pcut datetime2(0) = DATEADD(DAY, -@perf_days, SYSUTCDATETIME()),
+            @kcut datetime2(0) = DATEADD(DAY, -@bk_days, SYSUTCDATETIME()),
+            @icut datetime2(0) = DATEADD(DAY, -@iss_days, SYSUTCDATETIME()),
+            @mcut datetime2(0) = DATEADD(DAY, -@mail_days, SYSUTCDATETIME()),
             @n int, @started datetime2(3) = SYSUTCDATETIME();
 
     BEGIN TRY
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.BlockingSample    WHERE sample_utc < @bcut;       SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.BlockingEpisode   WHERE is_open = 0 AND last_seen_utc < @cut; SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.PerfSample        WHERE sample_utc < @cut;        SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.CpuSample         WHERE sample_utc < @cut;        SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.StorageSample     WHERE sample_utc < @cut;        SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.WaitStatsSnapshot WHERE snapshot_utc < @cut;      SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.FileStatsSnapshot WHERE snapshot_utc < @cut;      SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.PerfSample        WHERE sample_utc < @pcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.CpuSample         WHERE sample_utc < @pcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.StorageSample     WHERE sample_utc < @pcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.WaitStatsSnapshot WHERE snapshot_utc < @pcut;      SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.FileStatsSnapshot WHERE snapshot_utc < @pcut;      SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.AgentJobRun       WHERE run_start_utc < @cut;     SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.AgentFailure      WHERE run_start_utc < @cut;     SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (1000) FROM mon.Deadlock          WHERE event_utc < @cut;         SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.ErrorLogEvent     WHERE log_utc < @cut;           SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.LoginFailure      WHERE hour_utc < @cut;          SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.RdsTask           WHERE last_collected_utc < @cut; SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TlogBackup        WHERE backup_file_time_utc < @cut; SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.Notification      WHERE created_utc < @cut;       SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.EngineRun         WHERE started_utc < @cut;       SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.RdsTask           WHERE last_collected_utc < @kcut; SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TlogBackup        WHERE backup_file_time_utc < @kcut; SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.Notification      WHERE created_utc < @mcut;       SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.EngineRun         WHERE started_utc < @mcut;       SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.IssueMute         WHERE until_utc < @cut;         SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.OlaCommand        WHERE start_utc < @cut;         SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.BackupInventoryDaily WHERE snapshot_date < CONVERT(date, @cut); SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.OlaCommand        WHERE start_utc < @kcut;         SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.BackupInventoryDaily WHERE snapshot_date < CONVERT(date, @kcut); SET @n = @@ROWCOUNT; END;
         /* audit of monitoring changes is kept 4x longer than operational history */
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.CheckChangeLog    WHERE changed_utc < DATEADD(DAY, -4 * @days, SYSUTCDATETIME()); SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.CheckChangeLog    WHERE changed_utc < DATEADD(DAY, -@audit_days, SYSUTCDATETIME()); SET @n = @@ROWCOUNT; END;
 
         /* Closed issues and their change history. */
         SET @n = 1;
@@ -180,10 +190,10 @@ BEGIN
             DELETE TOP (5000) c
             FROM mon.IssueChange AS c
             JOIN mon.Issue AS i ON i.issue_id = c.issue_id
-            WHERE i.is_active = 0 AND i.resolved_utc < @cut;
+            WHERE i.is_active = 0 AND i.resolved_utc < @icut;
             SET @n = @@ROWCOUNT;
         END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.Issue WHERE is_active = 0 AND resolved_utc < @cut; SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.Issue WHERE is_active = 0 AND resolved_utc < @icut; SET @n = @@ROWCOUNT; END;
 
         EXEC mon.usp_SetComponentStatus 'PURGE', 1, @started;
     END TRY
@@ -202,7 +212,7 @@ BEGIN
     BEGIN TRY EXEC mon.usp_SnapshotBackupInventory;            END TRY BEGIN CATCH END CATCH;
     BEGIN TRY EXEC mon.usp_EvaluateIssues @Scope = 'WATCHDOG'; END TRY BEGIN CATCH END CATCH;
     BEGIN TRY EXEC mon.usp_SendAlerts;                         END TRY BEGIN CATCH END CATCH;
-    BEGIN TRY EXEC mon.usp_SendDailyDigest;                    END TRY BEGIN CATCH END CATCH;
+    BEGIN TRY EXEC mon.usp_RunScheduledEmails;                 END TRY BEGIN CATCH END CATCH;   /* [5.6] summary + full report schedule */
     IF DATEPART(HOUR, SYSUTCDATETIME()) % 6 = 0
     BEGIN
         BEGIN TRY EXEC mon.usp_Purge; END TRY BEGIN CATCH END CATCH;
@@ -297,7 +307,7 @@ DECLARE @owner sysname = SUSER_SNAME(),
         @cmd nvarchar(max) = N'SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
 SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
 EXEC mon.usp_RunHourly;',
-        @desc nvarchar(512) = N'OPS.mon hourly: engine watchdog (alerts if MON - Engine stops), change-only daily digest at 08:00 America/New_York with Monday heartbeat, history purge.';
+        @desc nvarchar(512) = N'OPS.mon hourly: engine watchdog (alerts if MON - Engine stops), scheduled summary and full report emails (mon.Setting summary_* / full_report_*), history purge every 6 h.';
 
 IF NOT EXISTS (SELECT 1 FROM dbo.sysjobs WHERE name = @job)
 BEGIN

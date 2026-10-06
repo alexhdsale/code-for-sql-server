@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.4   (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.6   (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -18,6 +18,12 @@
              5.4 : release guard (mon.ReleaseHistory, engine paused during install,
                    mon.usp_SelfTest gate), email statistics (mon.usp_ShowEmailStats),
                    separate uninstall script (MON_Uninstall.sql).
+             5.5 : performance - vw_BackupRetention evaluated in one pass (was ~36 s),
+                   no per-row scalar UDF on msdb history, date-bounded msdb scans,
+                   covering / purge indexes on mon tables (01c_performance_indexes).
+             5.6 : three email types - issue alerts (change-only), scheduled SHORT summary,
+                   scheduled FULL report (summary_* / full_report_* settings, usp_RunScheduledEmails);
+                   issue workflow: usp_AckIssue / usp_ResolveIssue, no reminders for acknowledged issues.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -161,7 +167,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.4';
+DECLARE @version varchar(20) = '5.6';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 DECLARE @prev_engine nvarchar(20) = NULL;
 
@@ -828,6 +834,11 @@ GO
 
 IF COL_LENGTH(N'mon.Notification', N'last_change_id') IS NULL
     ALTER TABLE mon.Notification ADD last_change_id bigint NULL;
+GO
+/* [rev 5.6] issue workflow: acknowledge (who is working on it) and manual resolution notes */
+IF COL_LENGTH(N'mon.Issue', N'ack_utc') IS NULL
+    ALTER TABLE mon.Issue ADD ack_utc datetime2(0) NULL, ack_by sysname NULL, ack_note nvarchar(1000) NULL,
+                              resolve_note nvarchar(1000) NULL, resolved_by sysname NULL;
 GO
 
 IF OBJECT_ID(N'mon.ComponentStatus', N'U') IS NULL

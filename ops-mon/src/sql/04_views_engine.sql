@@ -134,7 +134,9 @@ AS
 SELECT i.issue_id, i.severity, i.category, i.database_name, i.title, i.detail, i.issue_key,
        i.is_event, i.is_muted, i.first_seen_utc, i.last_seen_utc,
        DATEDIFF(MINUTE, i.first_seen_utc, SYSUTCDATETIME()) AS open_minutes,
-       i.alert_sent_utc, i.alert_severity
+       i.alert_sent_utc, i.alert_severity,
+       i.ack_utc, i.ack_by, i.ack_note,
+       CASE WHEN i.is_muted = 1 THEN 'MUTED' WHEN i.ack_utc IS NOT NULL THEN 'ACKNOWLEDGED' ELSE 'NEW' END AS workflow_state
 FROM mon.Issue AS i
 WHERE i.is_active = 1;
 GO

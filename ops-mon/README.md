@@ -2,7 +2,7 @@
 
 Self-contained monitoring for SQL Server / Amazon RDS for SQL Server. Everything lives in **one schema (`mon`) of the OPS database**; the only objects outside it are two SQL Agent jobs (`MON - Engine`, `MON - Digest & Watchdog`). Easy to upgrade, move or remove as one unit.
 
-**Current version: 5.4** — see [CHANGELOG.md](CHANGELOG.md).
+**Current version: 5.6** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 1. Open [`install/MON_Install.sql`](install/MON_Install.sql) in SSMS (RDS master login) and run the whole file. It is idempotent: re-running upgrades in place and keeps settings, check matrix and history.
@@ -19,6 +19,7 @@ Self-contained monitoring for SQL Server / Amazon RDS for SQL Server. Everything
 | `src/sql/*.sql` | Source, one file per area; build with `python build/build_install.py` |
 | `tools/MON-CheckEditor.ps1` | Windows GUI: check matrix (green/red/grey), retention, Ola log, email statistics |
 | `reports/MON_Checks_and_Retention.rdl` | SSMS custom report |
+| `docs/MON_Operations_Guide.md` | **Operations:** deploy, SQL Agent jobs, data retention, email schedule (alerts / summary / full report), issue resolution |
 | `docs/MON_User_Guide_EN.md` | User guide (English); `MON_User_Guide_RU.md` — Russian |
 | `docs/images` | Sample alert / digest emails and screenshots |
 
@@ -26,6 +27,8 @@ Self-contained monitoring for SQL Server / Amazon RDS for SQL Server. Everything
 ```sql
 EXEC OPS.mon.usp_ShowChecks;            -- what is checked, per database
 EXEC OPS.mon.usp_ShowEmailStats;        -- how many emails, per day / type / sender
+EXEC OPS.mon.usp_SendSummary;           -- short status email now
+EXEC OPS.mon.usp_AckIssue @KeyPattern = N'<key>', @Note = N'on it';
 EXEC OPS.mon.usp_ShowBackupRetention;   -- backup history, files, retention
 EXEC OPS.mon.usp_ShowOlaLog;            -- Ola Hallengren CommandLog
 SELECT * FROM OPS.mon.vw_ActiveIssues;  -- open issues now

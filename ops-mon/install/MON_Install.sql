@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.4   (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.6   (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -18,6 +18,12 @@
              5.4 : release guard (mon.ReleaseHistory, engine paused during install,
                    mon.usp_SelfTest gate), email statistics (mon.usp_ShowEmailStats),
                    separate uninstall script (MON_Uninstall.sql).
+             5.5 : performance - vw_BackupRetention evaluated in one pass (was ~36 s),
+                   no per-row scalar UDF on msdb history, date-bounded msdb scans,
+                   covering / purge indexes on mon tables (01c_performance_indexes).
+             5.6 : three email types - issue alerts (change-only), scheduled SHORT summary,
+                   scheduled FULL report (summary_* / full_report_* settings, usp_RunScheduledEmails);
+                   issue workflow: usp_AckIssue / usp_ResolveIssue, no reminders for acknowledged issues.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -161,7 +167,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.4';
+DECLARE @version varchar(20) = '5.6';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 DECLARE @prev_engine nvarchar(20) = NULL;
 
@@ -829,6 +835,11 @@ GO
 IF COL_LENGTH(N'mon.Notification', N'last_change_id') IS NULL
     ALTER TABLE mon.Notification ADD last_change_id bigint NULL;
 GO
+/* [rev 5.6] issue workflow: acknowledge (who is working on it) and manual resolution notes */
+IF COL_LENGTH(N'mon.Issue', N'ack_utc') IS NULL
+    ALTER TABLE mon.Issue ADD ack_utc datetime2(0) NULL, ack_by sysname NULL, ack_note nvarchar(1000) NULL,
+                              resolve_note nvarchar(1000) NULL, resolved_by sysname NULL;
+GO
 
 IF OBJECT_ID(N'mon.ComponentStatus', N'U') IS NULL
 BEGIN
@@ -1288,6 +1299,60 @@ BEGIN
     CREATE INDEX IX_mon_OlaCommand_Type ON mon.OlaCommand(command_type, start_utc DESC) INCLUDE (database_name, error_number, end_utc);
     CREATE INDEX IX_mon_OlaCommand_Db   ON mon.OlaCommand(database_name, command_type, end_utc DESC) INCLUDE (error_number);
 END;
+GO
+
+/* =============================================================================
+   SECTION 3d  -  PERFORMANCE INDEXES   [rev 5.5]
+   Idempotent: each index is created only if missing (or rebuilt with DROP_EXISTING
+   when its definition changed). All indexes live on mon.* tables only.
+   ============================================================================= */
+
+/* Retention view + backup collector: per-database latest log backup and the 35-day window,
+   covering so no key lookups on ~50k rows. Replaces IX_mon_TlogBackup_Time (same keys, now with INCLUDE). */
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.TlogBackup') AND name = N'IX_mon_TlogBackup_Time')
+   AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS ic JOIN sys.indexes AS i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                   WHERE i.object_id = OBJECT_ID(N'mon.TlogBackup') AND i.name = N'IX_mon_TlogBackup_Time' AND ic.is_included_column = 1)
+    CREATE INDEX IX_mon_TlogBackup_Time ON mon.TlogBackup(database_name, backup_file_time_utc DESC)
+        INCLUDE (file_size_bytes, is_log_chain_broken, last_seen_utc) WITH (DROP_EXISTING = ON);
+GO
+/* Purge (DELETE ... WHERE backup_file_time_utc < @cut) and the cross-database 35-day filter */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.TlogBackup') AND name = N'IX_mon_TlogBackup_FileTime')
+    CREATE INDEX IX_mon_TlogBackup_FileTime ON mon.TlogBackup(backup_file_time_utc)
+        INCLUDE (database_name, file_size_bytes, last_seen_utc);
+GO
+/* Retention view: successful RDS native backups */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.RdsTask') AND name = N'IX_mon_RdsTask_Lifecycle')
+    CREATE INDEX IX_mon_RdsTask_Lifecycle ON mon.RdsTask(lifecycle, task_type)
+        INCLUDE (database_name, last_updated_utc, created_utc);
+GO
+/* Retention view: Ola backups only (filtered) */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.OlaCommand') AND name = N'IX_mon_OlaCommand_Backup')
+    CREATE INDEX IX_mon_OlaCommand_Backup ON mon.OlaCommand(database_name, backup_type, end_utc)
+        INCLUDE (error_number, file_count) WHERE backup_type IS NOT NULL;
+GO
+/* Purge by time */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.OlaCommand') AND name = N'IX_mon_OlaCommand_Start')
+    CREATE INDEX IX_mon_OlaCommand_Start ON mon.OlaCommand(start_utc);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.AgentJobRun') AND name = N'IX_mon_AgentJobRun_Time')
+    CREATE INDEX IX_mon_AgentJobRun_Time ON mon.AgentJobRun(run_start_utc);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.EngineRun') AND name = N'IX_mon_EngineRun_Started')
+    CREATE INDEX IX_mon_EngineRun_Started ON mon.EngineRun(started_utc);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.RdsTask') AND name = N'IX_mon_RdsTask_Collected')
+    CREATE INDEX IX_mon_RdsTask_Collected ON mon.RdsTask(last_collected_utc);
+GO
+/* Issue history joins (digest "what changed", purge DELETE ... JOIN Issue) */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.IssueChange') AND name = N'IX_mon_IssueChange_Issue')
+    CREATE INDEX IX_mon_IssueChange_Issue ON mon.IssueChange(issue_id, change_id);
+GO
+/* Email statistics: MON vs other senders (EXISTS by mailitem_id) */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.Notification') AND name = N'IX_mon_Notification_Mailitem')
+    CREATE INDEX IX_mon_Notification_Mailitem ON mon.Notification(mailitem_id) WHERE mailitem_id IS NOT NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'mon.Notification') AND name = N'IX_mon_Notification_Created')
+    CREATE INDEX IX_mon_Notification_Created ON mon.Notification(created_utc) INCLUDE (notification_type, send_ok, body_kb);
 GO
 
 /* =============================================================================
@@ -1978,6 +2043,7 @@ BEGIN
                    ROW_NUMBER() OVER (PARTITION BY b.database_name, b.type ORDER BY b.backup_finish_date DESC) AS rn
             FROM msdb.dbo.backupset AS b
             WHERE b.type IN ('D', 'I', 'L')
+              AND b.backup_finish_date >= DATEADD(DAY, -400, GETDATE())   /* [5.5] sargable on msdb backupset date index; no full-history scan */
               AND EXISTS (SELECT 1 FROM mon.DatabasePolicy AS p WHERE p.database_name = b.database_name)
         )
         INSERT #Cand
@@ -2001,10 +2067,13 @@ BEGIN
           AND r.database_name IS NOT NULL;
 
         INSERT #Cand
-        SELECT t.database_name, 'L', t.backup_file_time_utc, NULL, t.file_size_bytes, 'RDS_TLOG', NULL, t.is_log_chain_broken
-        FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY t.database_name ORDER BY t.backup_file_time_utc DESC) AS rn
-              FROM mon.TlogBackup AS t) AS t
-        WHERE t.rn = 1;
+        /* [5.5] latest file per database: one index seek each (was ROW_NUMBER over the whole table) */
+        SELECT p.database_name, 'L', t.backup_file_time_utc, NULL, t.file_size_bytes, 'RDS_TLOG', NULL, t.is_log_chain_broken
+        FROM mon.DatabasePolicy AS p
+        CROSS APPLY (SELECT TOP (1) x.backup_file_time_utc, x.file_size_bytes, x.is_log_chain_broken
+                     FROM mon.TlogBackup AS x
+                     WHERE x.database_name = p.database_name
+                     ORDER BY x.backup_file_time_utc DESC) AS t;
 
         INSERT #Cand
         SELECT s.database_name, 'L', s.dmv_log_backup_utc, NULL, NULL, 'DMV_LOG_STATS', NULL, NULL
@@ -3058,7 +3127,9 @@ AS
 SELECT i.issue_id, i.severity, i.category, i.database_name, i.title, i.detail, i.issue_key,
        i.is_event, i.is_muted, i.first_seen_utc, i.last_seen_utc,
        DATEDIFF(MINUTE, i.first_seen_utc, SYSUTCDATETIME()) AS open_minutes,
-       i.alert_sent_utc, i.alert_severity
+       i.alert_sent_utc, i.alert_severity,
+       i.ack_utc, i.ack_by, i.ack_note,
+       CASE WHEN i.is_muted = 1 THEN 'MUTED' WHEN i.ack_utc IS NOT NULL THEN 'ACKNOWLEDGED' ELSE 'NEW' END AS workflow_state
 FROM mon.Issue AS i
 WHERE i.is_active = 1;
 GO
@@ -3952,15 +4023,26 @@ GO
 */
 CREATE OR ALTER VIEW mon.vw_BackupRetention
 AS
-WITH Cfg AS
+/* [rev 5.5] performance rewrite: every source is read ONCE.
+   - was: OUTER APPLY per database x type re-evaluated the whole CTE chain (36 x msdb scan)
+   - was: scalar UDF mon.fn_ServerToUtc per msdb row (not inlineable) -> offset computed once
+   - was: the source-selection CTE re-read all sources -> chosen with window functions in one pass */
+WITH Z AS
+(
+    SELECT DATEPART(TZOFFSET, SYSDATETIMEOFFSET()) AS tz_off_min,
+           CONVERT(datetime2(0), SYSUTCDATETIME()) AS now_utc,
+           ISNULL((SELECT TRY_CONVERT(int, setting_value) FROM mon.Setting WHERE setting_name = 'backup_retention_target_days'), 7) AS def_target,
+           (SELECT TRY_CONVERT(int, NULLIF(setting_value, N'')) FROM mon.Setting WHERE setting_name = 'backup_storage_retention_days') AS def_storage
+), Cfg AS
 (
     SELECT c.database_name, c.monitored, c.full_backup, c.diff_backup, c.log_backup, c.backup_retention,
-           ISNULL(c.retention_days, ISNULL(mon.fn_SettingInt('backup_retention_target_days'), 7)) AS target_days,
+           ISNULL(c.retention_days, Z.def_target) AS target_days,
            /* declared lifecycle of files on storage (S3 rule / Ola @CleanupTime); NULL = not declared */
-           COALESCE(c.storage_retention_days, TRY_CONVERT(int, NULLIF(mon.fn_Setting('backup_storage_retention_days'), N''))) AS storage_days,
+           COALESCE(c.storage_retention_days, Z.def_storage) AS storage_days,
            ISNULL(p.full_max_age_minutes, 1440) AS full_sla, ISNULL(p.log_max_age_minutes, 30) AS log_sla,
            s.recovery_model, ISNULL(s.is_present, 0) AS is_present, s.create_date_utc
     FROM mon.DatabaseCheck AS c
+    CROSS JOIN Z
     LEFT JOIN mon.DatabasePolicy AS p ON p.database_name = c.database_name
     LEFT JOIN mon.DatabaseStatus AS s ON s.database_name = c.database_name
 ), Ev AS
@@ -3969,10 +4051,11 @@ WITH Cfg AS
     SELECT b.database_name COLLATE DATABASE_DEFAULT AS database_name,
            CONVERT(varchar(4), CASE b.type WHEN 'D' THEN 'FULL' WHEN 'I' THEN 'DIFF' ELSE 'LOG' END) AS btype,
            CONVERT(varchar(20), 'MSDB') AS src,
-           CONVERT(datetime2(0), mon.fn_ServerToUtc(b.backup_finish_date)) AS t,
+           CONVERT(datetime2(0), DATEADD(MINUTE, -Z.tz_off_min, b.backup_finish_date)) AS t,
            CONVERT(bigint, COALESCE(b.compressed_backup_size, b.backup_size)) AS bytes,
            ISNULL(mf.n, 1) AS files, CONVERT(int, NULL) AS on_storage
     FROM msdb.dbo.backupset AS b
+    CROSS JOIN Z
     LEFT JOIN (SELECT media_set_id, COUNT(*) AS n FROM msdb.dbo.backupmediafamily GROUP BY media_set_id) AS mf
            ON mf.media_set_id = b.media_set_id
     WHERE b.type IN ('D', 'I', 'L')
@@ -3987,43 +4070,66 @@ WITH Cfg AS
     UNION ALL
     /* RDS automated log backups: on_storage = RDS still lists the file (daily full scan) */
     SELECT t.database_name, 'LOG', 'RDS_TLOG', t.backup_file_time_utc, t.file_size_bytes, 1,
-           CASE WHEN t.last_seen_utc >= DATEADD(HOUR, -26, SYSUTCDATETIME()) THEN 1 ELSE 0 END
+           CASE WHEN t.last_seen_utc >= DATEADD(HOUR, -26, Z.now_utc) THEN 1 ELSE 0 END
     FROM mon.TlogBackup AS t
-    WHERE t.backup_file_time_utc >= DATEADD(DAY, -35, SYSUTCDATETIME())
+    CROSS JOIN Z
+    WHERE t.backup_file_time_utc >= DATEADD(DAY, -35, Z.now_utc)
     UNION ALL
     /* Ola Hallengren DatabaseBackup (dbo.CommandLog) */
     SELECT o.database_name, o.backup_type, 'OLA', o.end_utc, CONVERT(bigint, NULL), ISNULL(o.file_count, 1), CONVERT(int, NULL)
     FROM mon.OlaCommand AS o
     WHERE o.backup_type IS NOT NULL AND ISNULL(o.error_number, 0) = 0 AND o.end_utc IS NOT NULL AND o.database_name IS NOT NULL
-), Src AS
+), Ranked AS
 (
-    SELECT Ev.database_name, Ev.btype, Ev.src,
-           ROW_NUMBER() OVER (PARTITION BY Ev.database_name, Ev.btype ORDER BY COUNT(*) DESC, Ev.src) AS rn
+    /* per database/type keep only the source with the most rows (no double counting) - one pass */
+    SELECT Ev.*, COUNT(*) OVER (PARTITION BY Ev.database_name, Ev.btype, Ev.src) AS n_src
     FROM Ev
-    GROUP BY Ev.database_name, Ev.btype, Ev.src
+), Picked AS
+(
+    SELECT R.*, DENSE_RANK() OVER (PARTITION BY R.database_name, R.btype ORDER BY R.n_src DESC, R.src) AS src_rank
+    FROM Ranked AS R
 ), E0 AS
 (
-    SELECT Ev.database_name, Ev.btype, Ev.src, Ev.t, Ev.bytes, Ev.files, Ev.on_storage,
-           LAG(Ev.t) OVER (PARTITION BY Ev.database_name, Ev.btype ORDER BY Ev.t) AS prev_t
-    FROM Ev
-    JOIN Src ON Src.database_name = Ev.database_name AND Src.btype = Ev.btype AND Src.src = Ev.src AND Src.rn = 1
+    SELECT P.database_name, P.btype, P.src, P.t, P.bytes, P.files, P.on_storage,
+           LAG(P.t) OVER (PARTITION BY P.database_name, P.btype ORDER BY P.t) AS prev_t
+    FROM Picked AS P
+    WHERE P.src_rank = 1
 ), E AS
 (
     /* per-row flags computed here, so the aggregates below reference inner columns only (Msg 8124) */
     SELECT E0.*,
-           CASE WHEN k.storage_days IS NOT NULL AND E0.t >= DATEADD(DAY, -k.storage_days, SYSUTCDATETIME())
+           CASE WHEN k.storage_days IS NOT NULL AND E0.t >= DATEADD(DAY, -k.storage_days, Z.now_utc)
                 THEN E0.files ELSE 0 END AS files_in_policy_row,
            CASE WHEN E0.btype <> 'DIFF' AND E0.prev_t IS NOT NULL
-                 AND E0.t >= DATEADD(DAY, -k.target_days, SYSUTCDATETIME())
+                 AND E0.t >= DATEADD(DAY, -k.target_days, Z.now_utc)
                  AND DATEDIFF(MINUTE, E0.prev_t, E0.t) > 1.25 * CASE E0.btype WHEN 'FULL' THEN k.full_sla ELSE k.log_sla END
-                THEN 1 ELSE 0 END AS is_gap
+                THEN 1 ELSE 0 END AS is_gap,
+           CASE WHEN E0.t >= DATEADD(HOUR, -24, Z.now_utc) THEN E0.files ELSE 0 END AS files_24h_row
     FROM E0
     JOIN Cfg AS k ON k.database_name = E0.database_name
+    CROSS JOIN Z
+), A AS
+(
+    /* aggregated ONCE for all databases and types */
+    SELECT E.database_name, E.btype,
+           MAX(E.src) AS source_name, COUNT(*) AS backup_count, MIN(E.t) AS oldest_utc, MAX(E.t) AS newest_utc,
+           AVG(CONVERT(bigint, DATEDIFF(MINUTE, E.prev_t, E.t))) AS avg_interval_min,
+           AVG(E.bytes) AS avg_bytes, SUM(E.bytes) AS total_bytes,
+           SUM(E.files) AS files_total,
+           SUM(E.files_24h_row) AS files_24h,
+           SUM(CASE WHEN E.on_storage = 1 THEN E.files ELSE 0 END) AS files_listed,
+           SUM(E.files_in_policy_row) AS files_in_policy,
+           SUM(E.is_gap) AS gaps_raw
+    FROM E
+    GROUP BY E.database_name, E.btype
 )
 SELECT c.database_name, bt.btype AS backup_type,
        a.source_name, ISNULL(a.backup_count, 0) AS backup_count, a.oldest_utc, a.newest_utc,
-       CONVERT(decimal(9,1), DATEDIFF(MINUTE, a.oldest_utc, SYSUTCDATETIME()) / 1440.0) AS retention_days,
-       c.target_days, a.gaps, a.avg_interval_min, a.avg_bytes, a.total_bytes,
+       CONVERT(decimal(9,1), DATEDIFF(MINUTE, a.oldest_utc, Z.now_utc) / 1440.0) AS retention_days,
+       c.target_days,
+       /* gaps inside the target window: interval longer than 1.25 x SLA (FULL and LOG only) */
+       CASE WHEN bt.btype = 'DIFF' THEN NULL ELSE a.gaps_raw END AS gaps,
+       a.avg_interval_min, a.avg_bytes, a.total_bytes,
        ISNULL(a.files_total, 0) AS files_total, ISNULL(a.files_24h, 0) AS files_24h,
        CASE WHEN a.source_name = 'RDS_TLOG' THEN NULL ELSE c.storage_days END AS storage_days,   /* RDS log files follow RDS retention */
        CASE WHEN a.source_name = 'RDS_TLOG' THEN a.files_listed
@@ -4039,29 +4145,17 @@ SELECT c.database_name, bt.btype AS backup_type,
            /* no DIFF rows at all = the database uses FULL (+LOG) only; DIFF age is covered by the DIFF check */
            WHEN bt.btype = 'DIFF' AND ISNULL(a.backup_count, 0) = 0 THEN 'N/A'
            WHEN ISNULL(a.backup_count, 0) = 0 THEN 'NONE'
-           WHEN a.oldest_utc > DATEADD(DAY, -c.target_days, SYSUTCDATETIME())
-                AND ISNULL(c.create_date_utc, '19000101') < DATEADD(DAY, -c.target_days, SYSUTCDATETIME()) THEN 'SHORT'
+           WHEN a.oldest_utc > DATEADD(DAY, -c.target_days, Z.now_utc)
+                AND ISNULL(c.create_date_utc, '19000101') < DATEADD(DAY, -c.target_days, Z.now_utc) THEN 'SHORT'
            /* declared storage lifecycle deletes files before the required retention */
            WHEN c.storage_days IS NOT NULL AND c.storage_days < c.target_days AND ISNULL(a.source_name, '') <> 'RDS_TLOG' THEN 'POLICY'
-           WHEN a.gaps > 0 THEN 'GAPS'
+           WHEN bt.btype <> 'DIFF' AND a.gaps_raw > 0 THEN 'GAPS'
            ELSE 'OK'
        END AS status
 FROM Cfg AS c
+CROSS JOIN Z
 CROSS JOIN (VALUES ('FULL'), ('DIFF'), ('LOG')) AS bt(btype)
-OUTER APPLY
-(
-    SELECT MAX(E.src) AS source_name, COUNT(*) AS backup_count, MIN(E.t) AS oldest_utc, MAX(E.t) AS newest_utc,
-           AVG(CONVERT(bigint, DATEDIFF(MINUTE, E.prev_t, E.t))) AS avg_interval_min,
-           AVG(E.bytes) AS avg_bytes, SUM(E.bytes) AS total_bytes,
-           SUM(E.files) AS files_total,
-           SUM(CASE WHEN E.t >= DATEADD(HOUR, -24, SYSUTCDATETIME()) THEN E.files ELSE 0 END) AS files_24h,
-           SUM(CASE WHEN E.on_storage = 1 THEN E.files ELSE 0 END) AS files_listed,
-           SUM(E.files_in_policy_row) AS files_in_policy,
-           /* gaps inside the target window: interval longer than 1.25 x SLA (FULL and LOG only) */
-           CASE WHEN bt.btype = 'DIFF' THEN NULL ELSE SUM(E.is_gap) END AS gaps
-    FROM E
-    WHERE E.database_name = c.database_name AND E.btype = bt.btype
-) AS a;
+LEFT JOIN A AS a ON a.database_name = c.database_name AND a.btype = bt.btype;
 GO
 
 /* Daily snapshot (called by the hourly job; idempotent per day). Also feeds RETENTION issues. */
@@ -4607,6 +4701,7 @@ BEGIN
             SELECT NULL, i.issue_id, 'REMINDER', i.severity, @now
             FROM mon.Issue AS i
             WHERE i.is_active = 1 AND i.is_muted = 0 AND i.is_event = 0 AND i.severity = 'CRITICAL'
+              AND i.ack_utc IS NULL                     /* [5.6] acknowledged = someone is on it: no reminders */
               AND i.alert_sent_utc IS NOT NULL
               AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@reminder, @now)
               AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
@@ -4792,7 +4887,8 @@ GO
    ============================================================================= */
 CREATE OR ALTER PROCEDURE mon.usp_SendDailyDigest
     @Force       bit = 0,
-    @PreviewOnly bit = 0
+    @PreviewOnly bit = 0,
+    @Scheduled   bit = 0      /* [5.6] called by usp_RunScheduledEmails at a scheduled hour: skip the once-a-day gate, keep change-only */
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -4839,7 +4935,7 @@ BEGIN
 
     BEGIN TRY
         /* ---------------- due / change-only decision ---------------- */
-        IF @Force = 0 AND @PreviewOnly = 0
+        IF @Force = 0 AND @PreviewOnly = 0 AND @Scheduled = 0
         BEGIN
             IF @enabled = 0 RETURN;
             IF DATEPART(HOUR, @local_now) < @hour RETURN;
@@ -5641,9 +5737,12 @@ BEGIN
                  ELSE CONCAT(N'Daily digest - ', @overall) END,
             @subtitle,
             @body,
-            CONCAT(N'<b>Change-only delivery:</b> this digest is sent only when an issue opened, resolved or changed severity since the previous one, ',
-                   N'plus a weekly heartbeat (ISO weekday ', @hb_day, N') so silence never hides a dead monitor. ',
-                   N'Immediate alerts are sent separately, also change-only.<br>',
+            CONCAT(N'<b>Delivery:</b> ',
+                   CASE WHEN NULLIF(mon.fn_Setting('full_report_hours_local'), N'') IS NULL
+                        THEN CONCAT(N'this digest is sent once a day only when an issue opened, resolved or changed severity, plus a weekly heartbeat (ISO weekday ', @hb_day, N'). ')
+                        ELSE CONCAT(N'this full report is scheduled at ', mon.fn_Setting('full_report_hours_local'), N':00 on ISO weekdays ',
+                                    mon.fn_Setting('full_report_weekdays'), N'; a short summary goes out at ', ISNULL(NULLIF(mon.fn_Setting('summary_email_hours_local'), N''), N'-'), N':00. ') END,
+                   N'Issue alerts are sent immediately and only when something changes.<br>',
                    N'<b>Default SLAs:</b> FULL ', mon.fn_Setting('full_max_age_minutes'), N'm, DIFF ', mon.fn_Setting('diff_max_age_minutes'),
                    N'm, LOG ', mon.fn_Setting('log_max_age_minutes'), N'm, CHECKDB ', mon.fn_Setting('checkdb_max_age_days'),
                    N'd (per-database overrides: OPS.mon.DatabasePolicy). Blocking alert ', @blk_min, N'm. All settings: OPS.mon.Setting.<br>',
@@ -5686,6 +5785,389 @@ BEGIN
         EXEC mon.usp_SetComponentStatus 'DIGEST_MAIL', 0, @started, @en2, @em2;
         IF @PreviewOnly = 1 OR @Force = 1 THROW;
     END CATCH;
+END;
+GO
+
+/* =============================================================================
+   SECTION 12b  -  EMAIL SCHEDULE (SUMMARY / FULL REPORT) + ISSUE WORKFLOW   [rev 5.6]
+
+   Three kinds of email:
+     1. ISSUE ALERT   (mon.usp_SendAlerts, every engine cycle)   - change-only: sent ONLY when an issue
+                      opens / escalates / resolves at or above alert_min_severity. Nothing changed = no email.
+     2. SUMMARY       (mon.usp_SendSummary, scheduled)           - short: health KPIs + open issues list.
+                      Hours: summary_email_hours_local, days: summary_email_weekdays.
+     3. FULL REPORT   (mon.usp_SendDailyDigest, scheduled)       - everything that is monitored.
+                      Hours: full_report_hours_local, days: full_report_weekdays,
+                      full_report_change_only = 1 sends it only when something changed.
+                      Empty full_report_hours_local = legacy mode (one change-only digest per day at report_hour_local).
+
+   Issue workflow: OPEN -> ACKNOWLEDGED (usp_AckIssue: someone is on it, no more reminders)
+                        -> RESOLVED automatically when the condition clears (or usp_ResolveIssue, manual;
+                           re-opens at the next cycle if the condition still exists).
+   ============================================================================= */
+
+INSERT mon.Setting(setting_name, setting_value, value_type, category, description)
+SELECT v.n, v.v, v.t, v.c, v.d
+FROM (VALUES
+    ('summary_email_hours_local', N'8', 'text', 'email',
+     N'Local hours (comma list, 0-23) when the SHORT summary email is sent. Empty = no summary emails.'),
+    ('summary_email_weekdays', N'1,2,3,4,5,6,7', 'text', 'email',
+     N'ISO weekdays for the summary (1 = Monday ... 7 = Sunday).'),
+    ('summary_recipients', N'', 'text', 'email',
+     N'Recipients of the summary email. Empty = report_recipients.'),
+    ('summary_max_issues', N'20', 'int', 'email',
+     N'Maximum open issues listed in the summary email (most severe / oldest first).'),
+    ('summary_skip_when_full', N'1', 'bit', 'email',
+     N'1 = do not send the summary in an hour when the full report is sent anyway.'),
+    ('full_report_hours_local', N'8', 'text', 'email',
+     N'Local hours (comma list, 0-23) when the FULL report (every monitored item) is sent. Empty = legacy: one change-only digest per day at report_hour_local.'),
+    ('full_report_weekdays', N'1,4', 'text', 'email',
+     N'ISO weekdays for the full report (1 = Monday ... 7 = Sunday). Default Monday and Thursday.'),
+    ('full_report_change_only', N'0', 'bit', 'email',
+     N'1 = the scheduled full report is skipped when nothing changed since the previous one; 0 = always sent.'),
+    ('retention_perf_days', N'', 'text', 'issues',
+     N'Days kept for performance samples (PerfSample, CpuSample, StorageSample, WaitStatsSnapshot, FileStatsSnapshot). Empty = history_retention_days.'),
+    ('retention_backup_days', N'', 'text', 'issues',
+     N'Days kept for backup evidence (TlogBackup, RdsTask, OlaCommand, BackupInventoryDaily). Empty = history_retention_days.'),
+    ('retention_issue_days', N'', 'text', 'issues',
+     N'Days kept for RESOLVED issues and their change history (open issues are never purged). Empty = history_retention_days.'),
+    ('retention_email_days', N'', 'text', 'issues',
+     N'Days kept for the email log (Notification) and engine runs. Empty = history_retention_days.'),
+    ('retention_audit_days', N'', 'text', 'issues',
+     N'Days kept for the monitoring-change audit (CheckChangeLog). Empty = 4 x history_retention_days.')
+) AS v(n, v, t, c, d)
+WHERE NOT EXISTS (SELECT 1 FROM mon.Setting AS s WHERE s.setting_name = v.n);
+GO
+
+/* Is @value in a comma separated list of integers? ('8, 17' contains 8; '08' = 8; empty list = false) */
+CREATE OR ALTER FUNCTION mon.fn_InIntList(@list nvarchar(400), @value int)
+RETURNS bit
+AS
+BEGIN
+    DECLARE @s nvarchar(402) = REPLACE(REPLACE(ISNULL(@list, N''), N' ', N''), N';', N',') + N',',
+            @p int, @tok nvarchar(20);
+    WHILE LEN(@s) > 0
+    BEGIN
+        SET @p = CHARINDEX(N',', @s);
+        SET @tok = LEFT(@s, @p - 1);
+        SET @s = SUBSTRING(@s, @p + 1, 400);
+        IF @tok <> N'' AND TRY_CONVERT(int, @tok) = @value RETURN 1;
+    END;
+    RETURN 0;
+END;
+GO
+
+/* -----------------------------------------------------------------------------
+   Issue workflow
+   ----------------------------------------------------------------------------- */
+
+/* "I am on it": marks open issues as acknowledged (shown in summary / full report, no reminders). */
+CREATE OR ALTER PROCEDURE mon.usp_AckIssue
+    @KeyPattern nvarchar(400),            /* issue_key or LIKE pattern, e.g. N'BACKUP:LOG:ops' or N'CHECKDB:%' */
+    @Note       nvarchar(1000) = NULL,
+    @Unack      bit = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE mon.Issue
+       SET ack_utc  = CASE WHEN @Unack = 1 THEN NULL ELSE SYSUTCDATETIME() END,
+           ack_by   = CASE WHEN @Unack = 1 THEN NULL ELSE ORIGINAL_LOGIN() END,
+           ack_note = CASE WHEN @Unack = 1 THEN NULL ELSE @Note END
+     WHERE is_active = 1 AND issue_key LIKE @KeyPattern;
+    PRINT CONCAT(@@ROWCOUNT, N' open issue(s) ', CASE WHEN @Unack = 1 THEN N'un-acknowledged.' ELSE N'acknowledged.' END);
+    SELECT issue_id, severity, title, issue_key, workflow_state, ack_by, ack_utc, ack_note
+    FROM mon.vw_ActiveIssues WHERE issue_key LIKE @KeyPattern;
+END;
+GO
+
+/*
+   Close open issues by hand after you fixed the cause (e.g. you took the FULL backup that restarts a
+   broken log chain and do not want to wait for the next cycle). The engine re-checks every 5 minutes:
+   if the condition still exists the issue RE-OPENS (and alerts again). To silence a condition you accept,
+   use mon.usp_MuteIssue or switch the check off; to say "I am working on it", use mon.usp_AckIssue.
+*/
+CREATE OR ALTER PROCEDURE mon.usp_ResolveIssue
+    @KeyPattern nvarchar(400),
+    @Note       nvarchar(1000)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NULLIF(LTRIM(@Note), N'') IS NULL
+    BEGIN
+        RAISERROR(N'@Note is required: say what was done to resolve the issue.', 16, 1);
+        RETURN;
+    END;
+    DECLARE @now datetime2(0) = SYSUTCDATETIME(), @lock int;
+    DECLARE @c TABLE(issue_id bigint, old_sev varchar(10));
+
+    EXEC @lock = sys.sp_getapplock @Resource = N'mon_IssueMerge', @LockMode = 'Exclusive',
+                                   @LockOwner = 'Session', @LockTimeout = 30000;
+    IF @lock < 0 BEGIN RAISERROR(N'Engine is busy, try again in a few seconds.', 16, 1); RETURN; END;
+    BEGIN TRY
+        UPDATE mon.Issue
+           SET is_active = 0, resolved_utc = @now, close_type = 'MANUAL',
+               resolved_by = ORIGINAL_LOGIN(), resolve_note = @Note
+        OUTPUT inserted.issue_id, deleted.severity INTO @c(issue_id, old_sev)
+        WHERE is_active = 1 AND issue_key LIKE @KeyPattern;
+
+        INSERT mon.IssueChange(issue_id, change_type, old_severity, new_severity, change_utc, alert_status, alert_utc)
+        SELECT issue_id, 'RESOLVED', old_sev, NULL, @now, 'SKIPPED', @now FROM @c;
+    END TRY
+    BEGIN CATCH
+        EXEC sys.sp_releaseapplock @Resource = N'mon_IssueMerge', @LockOwner = 'Session';
+        THROW;
+    END CATCH;
+    EXEC sys.sp_releaseapplock @Resource = N'mon_IssueMerge', @LockOwner = 'Session';
+
+    PRINT CONCAT((SELECT COUNT(*) FROM @c), N' issue(s) resolved manually. If the condition still exists they re-open within 5 minutes.');
+    SELECT i.issue_id, i.severity, i.title, i.issue_key, i.resolved_by, i.resolved_utc, i.resolve_note
+    FROM mon.Issue AS i JOIN @c AS c ON c.issue_id = i.issue_id;
+END;
+GO
+
+/* KPI tile for the summary email */
+CREATE OR ALTER FUNCTION mon.fn_SummaryTile(@label nvarchar(100), @value nvarchar(50), @level varchar(4))
+RETURNS nvarchar(max)
+AS
+BEGIN
+    DECLARE @fg varchar(7) = CASE @level WHEN 'CRIT' THEN '#DC2626' WHEN 'WARN' THEN '#D97706' ELSE '#16A34A' END;
+    RETURN CONCAT(N'<td width="25%" style="padding:8px;border:1px solid #E5E7EB;text-align:center">',
+                  N'<div style="font-size:22px;font-weight:700;color:', @fg, N'">', mon.fn_HtmlEncode(@value), N'</div>',
+                  N'<div style="font-size:11px;color:#6B7280">', mon.fn_HtmlEncode(@label), N'</div></td>');
+END;
+GO
+
+/* -----------------------------------------------------------------------------
+   SUMMARY email: short, phone friendly. Health KPIs + every open issue that needs action.
+     EXEC OPS.mon.usp_SendSummary @PreviewOnly = 1;   -- returns subject + html, sends nothing
+     EXEC OPS.mon.usp_SendSummary;                    -- send now
+   ----------------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE mon.usp_SendSummary
+    @PreviewOnly bit = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT OFF;
+    BEGIN TRY EXEC mon.usp_CloseDisabledIssues; END TRY BEGIN CATCH END CATCH;
+
+    DECLARE @now datetime2(0) = SYSUTCDATETIME(), @started datetime2(3) = SYSUTCDATETIME();
+    DECLARE @profile sysname = mon.fn_Setting('mail_profile'),
+            @recipients nvarchar(4000) = COALESCE(NULLIF(mon.fn_Setting('summary_recipients'), N''), mon.fn_Setting('report_recipients')),
+            @server nvarchar(128) = ISNULL(mon.fn_Setting('server_label'), @@SERVERNAME),
+            @tz nvarchar(100) = ISNULL(mon.fn_Setting('display_time_zone'), N'Eastern Standard Time'),
+            @tzl nvarchar(20) = ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET'),
+            @max int = ISNULL(mon.fn_SettingInt('summary_max_issues'), 20);
+    DECLARE @local_now datetime2(0) = mon.fn_UtcToLocal(@now, @tz);
+
+    DECLARE @db_total int, @db_online int, @bk_total int, @bk_ok int,
+            @crit int, @warn int, @muted int, @acked int, @new_crit int,
+            @opened24 int, @resolved24 int, @mails24 int, @last_cycle datetime2(3), @overall varchar(10);
+
+    SELECT @db_total = COUNT(*), @db_online = SUM(CASE WHEN state_desc = N'ONLINE' THEN 1 ELSE 0 END)
+    FROM mon.DatabaseStatus WHERE is_present = 1;
+
+    SELECT @bk_total = COUNT(*),
+           @bk_ok = SUM(CASE WHEN full_status IN ('OK', 'NOT_REQUIRED', 'PENDING')
+                              AND diff_status IN ('OK', 'NOT_REQUIRED', 'PENDING')
+                              AND log_status  IN ('OK', 'NOT_REQUIRED', 'PENDING') THEN 1 ELSE 0 END)
+    FROM mon.vw_BackupHealth WHERE is_monitored = 1 AND is_present = 1;
+
+    SELECT @crit     = SUM(CASE WHEN severity = 'CRITICAL' AND is_muted = 0 THEN 1 ELSE 0 END),
+           @warn     = SUM(CASE WHEN severity = 'WARNING'  AND is_muted = 0 THEN 1 ELSE 0 END),
+           @muted    = SUM(CASE WHEN is_muted = 1 THEN 1 ELSE 0 END),
+           @acked    = SUM(CASE WHEN is_muted = 0 AND ack_utc IS NOT NULL THEN 1 ELSE 0 END),
+           @new_crit = SUM(CASE WHEN severity = 'CRITICAL' AND is_muted = 0 AND ack_utc IS NULL THEN 1 ELSE 0 END)
+    FROM mon.Issue WHERE is_active = 1;
+
+    SELECT @opened24   = SUM(CASE WHEN change_type = 'OPENED' THEN 1 ELSE 0 END),
+           @resolved24 = SUM(CASE WHEN change_type = 'RESOLVED' THEN 1 ELSE 0 END)
+    FROM mon.IssueChange WHERE change_utc >= DATEADD(HOUR, -24, @now);
+
+    SELECT @mails24 = COUNT(*) FROM mon.Notification WHERE created_utc >= DATEADD(HOUR, -24, @now) AND send_ok = 1;
+    SELECT @last_cycle = last_success_utc FROM mon.ComponentStatus WHERE component_name = 'ENGINE_CYCLE';
+
+    SELECT @crit = ISNULL(@crit, 0), @warn = ISNULL(@warn, 0), @muted = ISNULL(@muted, 0), @acked = ISNULL(@acked, 0),
+           @new_crit = ISNULL(@new_crit, 0), @opened24 = ISNULL(@opened24, 0), @resolved24 = ISNULL(@resolved24, 0),
+           @bk_ok = ISNULL(@bk_ok, 0), @db_online = ISNULL(@db_online, 0);
+    SET @overall = CASE WHEN @crit > 0 THEN 'CRITICAL' WHEN @warn > 0 THEN 'WARNING' ELSE 'OK' END;
+
+    DECLARE @color varchar(7) = CASE @overall WHEN 'CRITICAL' THEN '#DC2626' WHEN 'WARNING' THEN '#D97706' ELSE '#16A34A' END;
+    DECLARE @subject nvarchar(255) = CONCAT(N'[', @server, N'] Summary ', CONVERT(nvarchar(10), @local_now, 120), N' | ',
+            CASE WHEN @overall = 'OK' THEN N'all clear'
+                 ELSE CONCAT(@crit, N' critical, ', @warn, N' warning', CASE WHEN @new_crit > 0 THEN CONCAT(N' (', @new_crit, N' critical not acknowledged)') END) END);
+
+    DECLARE @kpi nvarchar(max) = CONCAT(
+        N'<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;margin:10px 0">',
+        N'<tr>',
+        mon.fn_SummaryTile(N'Critical', CONVERT(nvarchar(20), @crit), CASE WHEN @crit > 0 THEN 'CRIT' ELSE 'OK' END),
+        mon.fn_SummaryTile(N'Warning', CONVERT(nvarchar(20), @warn), CASE WHEN @warn > 0 THEN 'WARN' ELSE 'OK' END),
+        mon.fn_SummaryTile(N'Databases online', CONCAT(@db_online, N'/', @db_total), CASE WHEN @db_online < @db_total THEN 'CRIT' ELSE 'OK' END),
+        mon.fn_SummaryTile(N'Backups OK', CONCAT(@bk_ok, N'/', @bk_total), CASE WHEN @bk_ok < @bk_total THEN 'WARN' ELSE 'OK' END),
+        N'</tr></table>',
+        N'<div style="font-size:12px;color:#374151;margin:4px 0 12px">',
+        N'Last 24 h: <b>', @opened24, N'</b> opened &middot; <b>', @resolved24, N'</b> resolved &middot; ',
+        @acked, N' acknowledged &middot; ', @muted, N' muted &middot; ', ISNULL(@mails24, 0), N' emails sent &middot; engine last cycle ',
+        CASE WHEN @last_cycle IS NULL THEN N'<b style="color:#DC2626">never</b>'
+             WHEN @last_cycle < DATEADD(MINUTE, -15, @now) THEN CONCAT(N'<b style="color:#DC2626">', mon.fn_Duration(DATEDIFF(SECOND, @last_cycle, @now)), N' ago</b>')
+             ELSE CONCAT(mon.fn_Duration(DATEDIFF(SECOND, @last_cycle, @now)), N' ago') END,
+        N'</div>');
+
+    DECLARE @rows nvarchar(max) = N'';
+    SELECT @rows = @rows + CONCAT(
+        N'<tr style="border-bottom:1px solid #E5E7EB">',
+        N'<td style="padding:6px 6px;vertical-align:top;white-space:nowrap">', mon.fn_Pill(i.severity, mon.fn_SevLevel(i.severity)), N'</td>',
+        N'<td style="padding:6px 6px;vertical-align:top;font-size:12px"><b>', mon.fn_HtmlEncode(i.title), N'</b>',
+        CASE WHEN i.detail IS NOT NULL THEN CONCAT(N'<br><span style="color:#6B7280">', mon.fn_OneLine(i.detail, 220), N'</span>') END,
+        N'<br><span style="color:#9CA3AF;font-size:11px">key: ', mon.fn_HtmlEncode(i.issue_key), N'</span></td>',
+        N'<td style="padding:6px 6px;vertical-align:top;font-size:12px;white-space:nowrap">', mon.fn_Duration(DATEDIFF(SECOND, i.first_seen_utc, @now)), N'</td>',
+        N'<td style="padding:6px 6px;vertical-align:top;font-size:11px">',
+        CASE WHEN i.is_muted = 1 THEN mon.fn_Pill(N'MUTED', 'MUTE')
+             WHEN i.ack_utc IS NOT NULL THEN CONCAT(mon.fn_Pill(N'ACK', 'INFO'), N'<br>', mon.fn_HtmlEncode(i.ack_by),
+                                                    CASE WHEN i.ack_note IS NOT NULL THEN CONCAT(N': ', mon.fn_OneLine(i.ack_note, 80)) END)
+             ELSE mon.fn_Pill(N'NEEDS ACTION', CASE WHEN i.severity = 'CRITICAL' THEN 'CRIT' ELSE 'WARN' END) END,
+        N'</td></tr>')
+    FROM (SELECT TOP (@max) * FROM mon.Issue
+          WHERE is_active = 1
+          ORDER BY is_muted, CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END, CASE WHEN ack_utc IS NULL THEN 0 ELSE 1 END, first_seen_utc) AS i
+    ORDER BY i.is_muted, CASE i.severity WHEN 'CRITICAL' THEN 0 ELSE 1 END, CASE WHEN i.ack_utc IS NULL THEN 0 ELSE 1 END, i.first_seen_utc;
+
+    DECLARE @n_open int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1);
+    DECLARE @issues nvarchar(max) = CASE
+        WHEN @n_open = 0 THEN N'<div style="padding:14px;background:#F0FDF4;border:1px solid #BBF7D0;border-radius:6px;font-size:13px;color:#166534"><b>All clear.</b> Nothing needs attention.</div>'
+        ELSE CONCAT(N'<div style="font-size:13px;font-weight:700;margin:6px 0">Open issues (', @n_open,
+                    CASE WHEN @n_open > @max THEN CONCAT(N', first ', @max) END, N')</div>',
+                    N'<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse">',
+                    N'<tr style="background:#F3F4F6;font-size:11px;color:#374151"><td style="padding:5px 6px">Severity</td><td style="padding:5px 6px">Issue</td><td style="padding:5px 6px">Open for</td><td style="padding:5px 6px">State</td></tr>',
+                    @rows, N'</table>') END;
+
+    DECLARE @html nvarchar(max) = CONCAT(
+        N'<!DOCTYPE html><html><body style="margin:0;padding:0;background:#F9FAFB;font-family:Segoe UI,Arial,sans-serif">',
+        N'<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="max-width:760px;margin:0 auto;background:#FFFFFF">',
+        N'<tr><td style="background:', @color, N';color:#FFFFFF;padding:14px 16px">',
+        N'<div style="font-size:18px;font-weight:700">', mon.fn_HtmlEncode(@server), N' &middot; ',
+        CASE @overall WHEN 'OK' THEN N'All clear' ELSE @overall END, N'</div>',
+        N'<div style="font-size:12px;opacity:.9">Summary &middot; ', CONVERT(nvarchar(16), @local_now, 120), N' ', @tzl, N'</div></td></tr>',
+        N'<tr><td style="padding:10px 16px">', @kpi, @issues,
+        N'<div style="margin-top:14px;font-size:11px;color:#6B7280;line-height:1.5">',
+        N'<b>Work an issue:</b> <code>EXEC OPS.mon.usp_AckIssue @KeyPattern = N''&lt;key&gt;'', @Note = N''on it'';</code> &middot; ',
+        N'after the fix it resolves automatically within 5 minutes (or <code>EXEC OPS.mon.usp_ResolveIssue @KeyPattern = N''&lt;key&gt;'', @Note = N''what was done'';</code>) &middot; ',
+        N'known condition: <code>EXEC OPS.mon.usp_MuteIssue</code>.<br>',
+        N'Issue alerts are sent only when something changes. Full report: hours ', ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'(daily digest)'),
+        N', weekdays ', ISNULL(mon.fn_Setting('full_report_weekdays'), N'-'), N'. Run now: <code>EXEC OPS.mon.usp_SendDailyDigest @Force = 1;</code>',
+        N'</div></td></tr></table></body></html>');
+
+    IF @PreviewOnly = 1
+    BEGIN
+        SELECT @subject AS subject, @html AS html_body, DATALENGTH(@html) / 2048 AS body_kb;
+        RETURN;
+    END;
+
+    DECLARE @mailitem_id int, @importance varchar(6) = CASE WHEN @new_crit > 0 THEN 'High' ELSE 'Normal' END;
+    BEGIN TRY
+        EXEC msdb.dbo.sp_send_dbmail
+             @profile_name = @profile, @recipients = @recipients,
+             @subject = @subject, @body = @html, @body_format = 'HTML',
+             @importance = @importance, @mailitem_id = @mailitem_id OUTPUT;
+        INSERT mon.Notification(notification_type, created_utc, report_date_local, subject, recipients, mailitem_id,
+                                send_ok, active_critical, active_warning, body_kb)
+        VALUES ('SUMMARY', @now, CONVERT(date, @local_now), @subject, @recipients, @mailitem_id, 1, @crit, @warn, DATALENGTH(@html) / 2048);
+        EXEC mon.usp_SetComponentStatus 'SUMMARY_MAIL', 1, @started;
+    END TRY
+    BEGIN CATCH
+        DECLARE @em nvarchar(2000) = ERROR_MESSAGE(), @en int = ERROR_NUMBER();
+        INSERT mon.Notification(notification_type, created_utc, report_date_local, subject, recipients, send_ok, error_message)
+        VALUES ('SUMMARY', @now, CONVERT(date, @local_now), @subject, @recipients, 0, @em);
+        EXEC mon.usp_SetComponentStatus 'SUMMARY_MAIL', 0, @started, @en, @em;
+    END CATCH;
+END;
+GO
+
+
+/* -----------------------------------------------------------------------------
+   Scheduler (called by the hourly job "MON - Digest & Watchdog" at :02).
+   ----------------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE mon.usp_RunScheduledEmails
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @now datetime2(0) = SYSUTCDATETIME(),
+            @tz nvarchar(100) = ISNULL(mon.fn_Setting('display_time_zone'), N'Eastern Standard Time');
+    DECLARE @local_now datetime2(0) = mon.fn_UtcToLocal(@now, @tz);
+    DECLARE @hour int = DATEPART(HOUR, @local_now),
+            @iso_wd int = (DATEPART(WEEKDAY, @local_now) + @@DATEFIRST - 2) % 7 + 1;   /* 1 = Monday */
+    DECLARE @full_hours nvarchar(400) = mon.fn_Setting('full_report_hours_local'),
+            @full_due bit = 0, @full_sent bit = 0;
+
+    /* FULL REPORT */
+    IF NULLIF(LTRIM(@full_hours), N'') IS NULL
+    BEGIN
+        EXEC mon.usp_SendDailyDigest;                 /* legacy: once a day at report_hour_local, change-only */
+    END
+    ELSE IF mon.fn_InIntList(@full_hours, @hour) = 1
+        AND mon.fn_InIntList(ISNULL(mon.fn_Setting('full_report_weekdays'), N'1,2,3,4,5,6,7'), @iso_wd) = 1
+        AND NOT EXISTS (SELECT 1 FROM mon.Notification
+                        WHERE notification_type IN ('DIGEST', 'HEARTBEAT', 'DIGEST_SKIPPED')
+                          AND created_utc >= DATEADD(MINUTE, -50, @now))
+    BEGIN
+        SET @full_due = 1;
+        IF ISNULL(mon.fn_SettingInt('full_report_change_only'), 0) = 1
+            EXEC mon.usp_SendDailyDigest @Scheduled = 1;    /* skipped (DIGEST_SKIPPED) when nothing changed */
+        ELSE
+            EXEC mon.usp_SendDailyDigest @Force = 1;
+        IF EXISTS (SELECT 1 FROM mon.Notification WHERE notification_type IN ('DIGEST', 'HEARTBEAT')
+                   AND send_ok = 1 AND created_utc >= DATEADD(MINUTE, -50, @now))
+            SET @full_sent = 1;
+    END;
+
+    /* SUMMARY */
+    IF mon.fn_InIntList(mon.fn_Setting('summary_email_hours_local'), @hour) = 1
+       AND mon.fn_InIntList(ISNULL(mon.fn_Setting('summary_email_weekdays'), N'1,2,3,4,5,6,7'), @iso_wd) = 1
+       AND NOT (@full_sent = 1 AND ISNULL(mon.fn_SettingInt('summary_skip_when_full'), 1) = 1)
+       AND NOT EXISTS (SELECT 1 FROM mon.Notification
+                       WHERE notification_type = 'SUMMARY' AND send_ok = 1 AND created_utc >= DATEADD(MINUTE, -50, @now))
+        EXEC mon.usp_SendSummary;
+END;
+GO
+
+/*
+   How much data does the monitor keep, and for how long?
+     EXEC OPS.mon.usp_ShowDataRetention;
+*/
+CREATE OR ALTER PROCEDURE mon.usp_ShowDataRetention
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @days int = ISNULL(mon.fn_SettingInt('history_retention_days'), 90);
+    SELECT t.name AS [Table],
+           r.area AS [Area],
+           CASE WHEN r.setting_name IS NULL THEN N'kept (configuration / current state)'
+                ELSE CONCAT(COALESCE(TRY_CONVERT(int, NULLIF(s.setting_value, N'')),
+                                     CASE r.setting_name WHEN 'retention_audit_days' THEN 4 * @days
+                                                         WHEN 'blocking_sample_retention_days' THEN 30 ELSE @days END), N' days (', r.setting_name,
+                            CASE WHEN NULLIF(s.setting_value, N'') IS NULL AND r.setting_name NOT IN ('history_retention_days', 'blocking_sample_retention_days')
+                                 THEN N' = default' ELSE N'' END, N')') END AS [Retention],
+           SUM(CASE WHEN p.index_id IN (0, 1) THEN p.row_count ELSE 0 END) AS [Rows],
+           CONVERT(decimal(19,1), SUM(p.reserved_page_count) * 8 / 1024.0) AS [Reserved MB]
+    FROM sys.tables AS t
+    JOIN sys.dm_db_partition_stats AS p ON p.object_id = t.object_id
+    LEFT JOIN (VALUES
+        (N'PerfSample', 'retention_perf_days', N'performance'), (N'CpuSample', 'retention_perf_days', N'performance'),
+        (N'StorageSample', 'retention_perf_days', N'performance'), (N'WaitStatsSnapshot', 'retention_perf_days', N'performance'),
+        (N'FileStatsSnapshot', 'retention_perf_days', N'performance'),
+        (N'TlogBackup', 'retention_backup_days', N'backups'), (N'RdsTask', 'retention_backup_days', N'backups'),
+        (N'OlaCommand', 'retention_backup_days', N'backups'), (N'BackupInventoryDaily', 'retention_backup_days', N'backups'),
+        (N'Issue', 'retention_issue_days', N'issues (resolved only)'), (N'IssueChange', 'retention_issue_days', N'issues (resolved only)'),
+        (N'Notification', 'retention_email_days', N'email log'), (N'EngineRun', 'retention_email_days', N'engine runs'),
+        (N'CheckChangeLog', 'retention_audit_days', N'audit'),
+        (N'BlockingSample', 'blocking_sample_retention_days', N'blocking'), (N'BlockingEpisode', 'history_retention_days', N'blocking'),
+        (N'AgentJobRun', 'history_retention_days', N'agent'), (N'AgentFailure', 'history_retention_days', N'agent'),
+        (N'Deadlock', 'history_retention_days', N'events'), (N'ErrorLogEvent', 'history_retention_days', N'events'),
+        (N'LoginFailure', 'history_retention_days', N'events'), (N'IssueMute', 'history_retention_days', N'mutes (expired)')
+    ) AS r(table_name, setting_name, area) ON r.table_name = t.name
+    LEFT JOIN mon.Setting AS s ON s.setting_name = r.setting_name
+    WHERE SCHEMA_NAME(t.schema_id) = N'mon'
+    GROUP BY t.name, r.area, r.setting_name, s.setting_value
+    ORDER BY [Reserved MB] DESC, t.name;
 END;
 GO
 
@@ -5836,32 +6318,42 @@ BEGIN
 
     DECLARE @days int = ISNULL(mon.fn_SettingInt('history_retention_days'), 90),
             @bdays int = ISNULL(mon.fn_SettingInt('blocking_sample_retention_days'), 30);
+    /* [5.6] per-area retention; empty setting = history_retention_days */
+    DECLARE @perf_days  int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_perf_days'), N'')), @days),
+            @bk_days    int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_backup_days'), N'')), @days),
+            @iss_days   int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_issue_days'), N'')), @days),
+            @mail_days  int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_email_days'), N'')), @days),
+            @audit_days int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_audit_days'), N'')), 4 * @days);
     DECLARE @cut datetime2(0) = DATEADD(DAY, -@days, SYSUTCDATETIME()),
             @bcut datetime2(0) = DATEADD(DAY, -@bdays, SYSUTCDATETIME()),
+            @pcut datetime2(0) = DATEADD(DAY, -@perf_days, SYSUTCDATETIME()),
+            @kcut datetime2(0) = DATEADD(DAY, -@bk_days, SYSUTCDATETIME()),
+            @icut datetime2(0) = DATEADD(DAY, -@iss_days, SYSUTCDATETIME()),
+            @mcut datetime2(0) = DATEADD(DAY, -@mail_days, SYSUTCDATETIME()),
             @n int, @started datetime2(3) = SYSUTCDATETIME();
 
     BEGIN TRY
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.BlockingSample    WHERE sample_utc < @bcut;       SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.BlockingEpisode   WHERE is_open = 0 AND last_seen_utc < @cut; SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.PerfSample        WHERE sample_utc < @cut;        SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.CpuSample         WHERE sample_utc < @cut;        SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.StorageSample     WHERE sample_utc < @cut;        SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.WaitStatsSnapshot WHERE snapshot_utc < @cut;      SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.FileStatsSnapshot WHERE snapshot_utc < @cut;      SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.PerfSample        WHERE sample_utc < @pcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.CpuSample         WHERE sample_utc < @pcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.StorageSample     WHERE sample_utc < @pcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.WaitStatsSnapshot WHERE snapshot_utc < @pcut;      SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.FileStatsSnapshot WHERE snapshot_utc < @pcut;      SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.AgentJobRun       WHERE run_start_utc < @cut;     SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.AgentFailure      WHERE run_start_utc < @cut;     SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (1000) FROM mon.Deadlock          WHERE event_utc < @cut;         SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.ErrorLogEvent     WHERE log_utc < @cut;           SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.LoginFailure      WHERE hour_utc < @cut;          SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.RdsTask           WHERE last_collected_utc < @cut; SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TlogBackup        WHERE backup_file_time_utc < @cut; SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.Notification      WHERE created_utc < @cut;       SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.EngineRun         WHERE started_utc < @cut;       SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.RdsTask           WHERE last_collected_utc < @kcut; SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TlogBackup        WHERE backup_file_time_utc < @kcut; SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.Notification      WHERE created_utc < @mcut;       SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.EngineRun         WHERE started_utc < @mcut;       SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.IssueMute         WHERE until_utc < @cut;         SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.OlaCommand        WHERE start_utc < @cut;         SET @n = @@ROWCOUNT; END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.BackupInventoryDaily WHERE snapshot_date < CONVERT(date, @cut); SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.OlaCommand        WHERE start_utc < @kcut;         SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.BackupInventoryDaily WHERE snapshot_date < CONVERT(date, @kcut); SET @n = @@ROWCOUNT; END;
         /* audit of monitoring changes is kept 4x longer than operational history */
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.CheckChangeLog    WHERE changed_utc < DATEADD(DAY, -4 * @days, SYSUTCDATETIME()); SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.CheckChangeLog    WHERE changed_utc < DATEADD(DAY, -@audit_days, SYSUTCDATETIME()); SET @n = @@ROWCOUNT; END;
 
         /* Closed issues and their change history. */
         SET @n = 1;
@@ -5870,10 +6362,10 @@ BEGIN
             DELETE TOP (5000) c
             FROM mon.IssueChange AS c
             JOIN mon.Issue AS i ON i.issue_id = c.issue_id
-            WHERE i.is_active = 0 AND i.resolved_utc < @cut;
+            WHERE i.is_active = 0 AND i.resolved_utc < @icut;
             SET @n = @@ROWCOUNT;
         END;
-        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.Issue WHERE is_active = 0 AND resolved_utc < @cut; SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.Issue WHERE is_active = 0 AND resolved_utc < @icut; SET @n = @@ROWCOUNT; END;
 
         EXEC mon.usp_SetComponentStatus 'PURGE', 1, @started;
     END TRY
@@ -5892,7 +6384,7 @@ BEGIN
     BEGIN TRY EXEC mon.usp_SnapshotBackupInventory;            END TRY BEGIN CATCH END CATCH;
     BEGIN TRY EXEC mon.usp_EvaluateIssues @Scope = 'WATCHDOG'; END TRY BEGIN CATCH END CATCH;
     BEGIN TRY EXEC mon.usp_SendAlerts;                         END TRY BEGIN CATCH END CATCH;
-    BEGIN TRY EXEC mon.usp_SendDailyDigest;                    END TRY BEGIN CATCH END CATCH;
+    BEGIN TRY EXEC mon.usp_RunScheduledEmails;                 END TRY BEGIN CATCH END CATCH;   /* [5.6] summary + full report schedule */
     IF DATEPART(HOUR, SYSUTCDATETIME()) % 6 = 0
     BEGIN
         BEGIN TRY EXEC mon.usp_Purge; END TRY BEGIN CATCH END CATCH;
@@ -5987,7 +6479,7 @@ DECLARE @owner sysname = SUSER_SNAME(),
         @cmd nvarchar(max) = N'SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
 SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
 EXEC mon.usp_RunHourly;',
-        @desc nvarchar(512) = N'OPS.mon hourly: engine watchdog (alerts if MON - Engine stops), change-only daily digest at 08:00 America/New_York with Monday heartbeat, history purge.';
+        @desc nvarchar(512) = N'OPS.mon hourly: engine watchdog (alerts if MON - Engine stops), scheduled summary and full report emails (mon.Setting summary_* / full_report_*), history purge every 6 h.';
 
 IF NOT EXISTS (SELECT 1 FROM dbo.sysjobs WHERE name = @job)
 BEGIN
@@ -6287,7 +6779,8 @@ BEGIN
                  (N'mon.usp_EngineLoop'), (N'mon.usp_RunHourly'), (N'mon.usp_EvaluateIssues'), (N'mon.usp_SendAlerts'),
                  (N'mon.usp_SendAlertsCore'), (N'mon.usp_SendDailyDigest'), (N'mon.usp_CloseDisabledIssues'),
                  (N'mon.usp_SetCheck'), (N'mon.usp_ShowChecks'), (N'mon.usp_ShowBackupRetention'),
-                 (N'mon.usp_ShowOlaLog'), (N'mon.usp_ShowEmailStats')) AS r(n);
+                 (N'mon.usp_ShowOlaLog'), (N'mon.usp_ShowEmailStats'),
+                 (N'mon.usp_SendSummary'), (N'mon.usp_RunScheduledEmails'), (N'mon.usp_AckIssue'), (N'mon.usp_ResolveIssue'), (N'mon.usp_ShowDataRetention')) AS r(n);
 
     /* 2. Every view in [mon] binds (cheap, no side effects) */
     DECLARE v CURSOR LOCAL FAST_FORWARD FOR

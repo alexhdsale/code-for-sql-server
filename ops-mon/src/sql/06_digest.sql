@@ -8,7 +8,8 @@
    ============================================================================= */
 CREATE OR ALTER PROCEDURE mon.usp_SendDailyDigest
     @Force       bit = 0,
-    @PreviewOnly bit = 0
+    @PreviewOnly bit = 0,
+    @Scheduled   bit = 0      /* [5.6] called by usp_RunScheduledEmails at a scheduled hour: skip the once-a-day gate, keep change-only */
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -55,7 +56,7 @@ BEGIN
 
     BEGIN TRY
         /* ---------------- due / change-only decision ---------------- */
-        IF @Force = 0 AND @PreviewOnly = 0
+        IF @Force = 0 AND @PreviewOnly = 0 AND @Scheduled = 0
         BEGIN
             IF @enabled = 0 RETURN;
             IF DATEPART(HOUR, @local_now) < @hour RETURN;
@@ -857,9 +858,12 @@ BEGIN
                  ELSE CONCAT(N'Daily digest - ', @overall) END,
             @subtitle,
             @body,
-            CONCAT(N'<b>Change-only delivery:</b> this digest is sent only when an issue opened, resolved or changed severity since the previous one, ',
-                   N'plus a weekly heartbeat (ISO weekday ', @hb_day, N') so silence never hides a dead monitor. ',
-                   N'Immediate alerts are sent separately, also change-only.<br>',
+            CONCAT(N'<b>Delivery:</b> ',
+                   CASE WHEN NULLIF(mon.fn_Setting('full_report_hours_local'), N'') IS NULL
+                        THEN CONCAT(N'this digest is sent once a day only when an issue opened, resolved or changed severity, plus a weekly heartbeat (ISO weekday ', @hb_day, N'). ')
+                        ELSE CONCAT(N'this full report is scheduled at ', mon.fn_Setting('full_report_hours_local'), N':00 on ISO weekdays ',
+                                    mon.fn_Setting('full_report_weekdays'), N'; a short summary goes out at ', ISNULL(NULLIF(mon.fn_Setting('summary_email_hours_local'), N''), N'-'), N':00. ') END,
+                   N'Issue alerts are sent immediately and only when something changes.<br>',
                    N'<b>Default SLAs:</b> FULL ', mon.fn_Setting('full_max_age_minutes'), N'm, DIFF ', mon.fn_Setting('diff_max_age_minutes'),
                    N'm, LOG ', mon.fn_Setting('log_max_age_minutes'), N'm, CHECKDB ', mon.fn_Setting('checkdb_max_age_days'),
                    N'd (per-database overrides: OPS.mon.DatabasePolicy). Blocking alert ', @blk_min, N'm. All settings: OPS.mon.Setting.<br>',

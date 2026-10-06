@@ -13,15 +13,26 @@
 */
 CREATE OR ALTER VIEW mon.vw_BackupRetention
 AS
-WITH Cfg AS
+/* [rev 5.5] performance rewrite: every source is read ONCE.
+   - was: OUTER APPLY per database x type re-evaluated the whole CTE chain (36 x msdb scan)
+   - was: scalar UDF mon.fn_ServerToUtc per msdb row (not inlineable) -> offset computed once
+   - was: the source-selection CTE re-read all sources -> chosen with window functions in one pass */
+WITH Z AS
+(
+    SELECT DATEPART(TZOFFSET, SYSDATETIMEOFFSET()) AS tz_off_min,
+           CONVERT(datetime2(0), SYSUTCDATETIME()) AS now_utc,
+           ISNULL((SELECT TRY_CONVERT(int, setting_value) FROM mon.Setting WHERE setting_name = 'backup_retention_target_days'), 7) AS def_target,
+           (SELECT TRY_CONVERT(int, NULLIF(setting_value, N'')) FROM mon.Setting WHERE setting_name = 'backup_storage_retention_days') AS def_storage
+), Cfg AS
 (
     SELECT c.database_name, c.monitored, c.full_backup, c.diff_backup, c.log_backup, c.backup_retention,
-           ISNULL(c.retention_days, ISNULL(mon.fn_SettingInt('backup_retention_target_days'), 7)) AS target_days,
+           ISNULL(c.retention_days, Z.def_target) AS target_days,
            /* declared lifecycle of files on storage (S3 rule / Ola @CleanupTime); NULL = not declared */
-           COALESCE(c.storage_retention_days, TRY_CONVERT(int, NULLIF(mon.fn_Setting('backup_storage_retention_days'), N''))) AS storage_days,
+           COALESCE(c.storage_retention_days, Z.def_storage) AS storage_days,
            ISNULL(p.full_max_age_minutes, 1440) AS full_sla, ISNULL(p.log_max_age_minutes, 30) AS log_sla,
            s.recovery_model, ISNULL(s.is_present, 0) AS is_present, s.create_date_utc
     FROM mon.DatabaseCheck AS c
+    CROSS JOIN Z
     LEFT JOIN mon.DatabasePolicy AS p ON p.database_name = c.database_name
     LEFT JOIN mon.DatabaseStatus AS s ON s.database_name = c.database_name
 ), Ev AS
@@ -30,10 +41,11 @@ WITH Cfg AS
     SELECT b.database_name COLLATE DATABASE_DEFAULT AS database_name,
            CONVERT(varchar(4), CASE b.type WHEN 'D' THEN 'FULL' WHEN 'I' THEN 'DIFF' ELSE 'LOG' END) AS btype,
            CONVERT(varchar(20), 'MSDB') AS src,
-           CONVERT(datetime2(0), mon.fn_ServerToUtc(b.backup_finish_date)) AS t,
+           CONVERT(datetime2(0), DATEADD(MINUTE, -Z.tz_off_min, b.backup_finish_date)) AS t,
            CONVERT(bigint, COALESCE(b.compressed_backup_size, b.backup_size)) AS bytes,
            ISNULL(mf.n, 1) AS files, CONVERT(int, NULL) AS on_storage
     FROM msdb.dbo.backupset AS b
+    CROSS JOIN Z
     LEFT JOIN (SELECT media_set_id, COUNT(*) AS n FROM msdb.dbo.backupmediafamily GROUP BY media_set_id) AS mf
            ON mf.media_set_id = b.media_set_id
     WHERE b.type IN ('D', 'I', 'L')
@@ -48,43 +60,66 @@ WITH Cfg AS
     UNION ALL
     /* RDS automated log backups: on_storage = RDS still lists the file (daily full scan) */
     SELECT t.database_name, 'LOG', 'RDS_TLOG', t.backup_file_time_utc, t.file_size_bytes, 1,
-           CASE WHEN t.last_seen_utc >= DATEADD(HOUR, -26, SYSUTCDATETIME()) THEN 1 ELSE 0 END
+           CASE WHEN t.last_seen_utc >= DATEADD(HOUR, -26, Z.now_utc) THEN 1 ELSE 0 END
     FROM mon.TlogBackup AS t
-    WHERE t.backup_file_time_utc >= DATEADD(DAY, -35, SYSUTCDATETIME())
+    CROSS JOIN Z
+    WHERE t.backup_file_time_utc >= DATEADD(DAY, -35, Z.now_utc)
     UNION ALL
     /* Ola Hallengren DatabaseBackup (dbo.CommandLog) */
     SELECT o.database_name, o.backup_type, 'OLA', o.end_utc, CONVERT(bigint, NULL), ISNULL(o.file_count, 1), CONVERT(int, NULL)
     FROM mon.OlaCommand AS o
     WHERE o.backup_type IS NOT NULL AND ISNULL(o.error_number, 0) = 0 AND o.end_utc IS NOT NULL AND o.database_name IS NOT NULL
-), Src AS
+), Ranked AS
 (
-    SELECT Ev.database_name, Ev.btype, Ev.src,
-           ROW_NUMBER() OVER (PARTITION BY Ev.database_name, Ev.btype ORDER BY COUNT(*) DESC, Ev.src) AS rn
+    /* per database/type keep only the source with the most rows (no double counting) - one pass */
+    SELECT Ev.*, COUNT(*) OVER (PARTITION BY Ev.database_name, Ev.btype, Ev.src) AS n_src
     FROM Ev
-    GROUP BY Ev.database_name, Ev.btype, Ev.src
+), Picked AS
+(
+    SELECT R.*, DENSE_RANK() OVER (PARTITION BY R.database_name, R.btype ORDER BY R.n_src DESC, R.src) AS src_rank
+    FROM Ranked AS R
 ), E0 AS
 (
-    SELECT Ev.database_name, Ev.btype, Ev.src, Ev.t, Ev.bytes, Ev.files, Ev.on_storage,
-           LAG(Ev.t) OVER (PARTITION BY Ev.database_name, Ev.btype ORDER BY Ev.t) AS prev_t
-    FROM Ev
-    JOIN Src ON Src.database_name = Ev.database_name AND Src.btype = Ev.btype AND Src.src = Ev.src AND Src.rn = 1
+    SELECT P.database_name, P.btype, P.src, P.t, P.bytes, P.files, P.on_storage,
+           LAG(P.t) OVER (PARTITION BY P.database_name, P.btype ORDER BY P.t) AS prev_t
+    FROM Picked AS P
+    WHERE P.src_rank = 1
 ), E AS
 (
     /* per-row flags computed here, so the aggregates below reference inner columns only (Msg 8124) */
     SELECT E0.*,
-           CASE WHEN k.storage_days IS NOT NULL AND E0.t >= DATEADD(DAY, -k.storage_days, SYSUTCDATETIME())
+           CASE WHEN k.storage_days IS NOT NULL AND E0.t >= DATEADD(DAY, -k.storage_days, Z.now_utc)
                 THEN E0.files ELSE 0 END AS files_in_policy_row,
            CASE WHEN E0.btype <> 'DIFF' AND E0.prev_t IS NOT NULL
-                 AND E0.t >= DATEADD(DAY, -k.target_days, SYSUTCDATETIME())
+                 AND E0.t >= DATEADD(DAY, -k.target_days, Z.now_utc)
                  AND DATEDIFF(MINUTE, E0.prev_t, E0.t) > 1.25 * CASE E0.btype WHEN 'FULL' THEN k.full_sla ELSE k.log_sla END
-                THEN 1 ELSE 0 END AS is_gap
+                THEN 1 ELSE 0 END AS is_gap,
+           CASE WHEN E0.t >= DATEADD(HOUR, -24, Z.now_utc) THEN E0.files ELSE 0 END AS files_24h_row
     FROM E0
     JOIN Cfg AS k ON k.database_name = E0.database_name
+    CROSS JOIN Z
+), A AS
+(
+    /* aggregated ONCE for all databases and types */
+    SELECT E.database_name, E.btype,
+           MAX(E.src) AS source_name, COUNT(*) AS backup_count, MIN(E.t) AS oldest_utc, MAX(E.t) AS newest_utc,
+           AVG(CONVERT(bigint, DATEDIFF(MINUTE, E.prev_t, E.t))) AS avg_interval_min,
+           AVG(E.bytes) AS avg_bytes, SUM(E.bytes) AS total_bytes,
+           SUM(E.files) AS files_total,
+           SUM(E.files_24h_row) AS files_24h,
+           SUM(CASE WHEN E.on_storage = 1 THEN E.files ELSE 0 END) AS files_listed,
+           SUM(E.files_in_policy_row) AS files_in_policy,
+           SUM(E.is_gap) AS gaps_raw
+    FROM E
+    GROUP BY E.database_name, E.btype
 )
 SELECT c.database_name, bt.btype AS backup_type,
        a.source_name, ISNULL(a.backup_count, 0) AS backup_count, a.oldest_utc, a.newest_utc,
-       CONVERT(decimal(9,1), DATEDIFF(MINUTE, a.oldest_utc, SYSUTCDATETIME()) / 1440.0) AS retention_days,
-       c.target_days, a.gaps, a.avg_interval_min, a.avg_bytes, a.total_bytes,
+       CONVERT(decimal(9,1), DATEDIFF(MINUTE, a.oldest_utc, Z.now_utc) / 1440.0) AS retention_days,
+       c.target_days,
+       /* gaps inside the target window: interval longer than 1.25 x SLA (FULL and LOG only) */
+       CASE WHEN bt.btype = 'DIFF' THEN NULL ELSE a.gaps_raw END AS gaps,
+       a.avg_interval_min, a.avg_bytes, a.total_bytes,
        ISNULL(a.files_total, 0) AS files_total, ISNULL(a.files_24h, 0) AS files_24h,
        CASE WHEN a.source_name = 'RDS_TLOG' THEN NULL ELSE c.storage_days END AS storage_days,   /* RDS log files follow RDS retention */
        CASE WHEN a.source_name = 'RDS_TLOG' THEN a.files_listed
@@ -100,29 +135,17 @@ SELECT c.database_name, bt.btype AS backup_type,
            /* no DIFF rows at all = the database uses FULL (+LOG) only; DIFF age is covered by the DIFF check */
            WHEN bt.btype = 'DIFF' AND ISNULL(a.backup_count, 0) = 0 THEN 'N/A'
            WHEN ISNULL(a.backup_count, 0) = 0 THEN 'NONE'
-           WHEN a.oldest_utc > DATEADD(DAY, -c.target_days, SYSUTCDATETIME())
-                AND ISNULL(c.create_date_utc, '19000101') < DATEADD(DAY, -c.target_days, SYSUTCDATETIME()) THEN 'SHORT'
+           WHEN a.oldest_utc > DATEADD(DAY, -c.target_days, Z.now_utc)
+                AND ISNULL(c.create_date_utc, '19000101') < DATEADD(DAY, -c.target_days, Z.now_utc) THEN 'SHORT'
            /* declared storage lifecycle deletes files before the required retention */
            WHEN c.storage_days IS NOT NULL AND c.storage_days < c.target_days AND ISNULL(a.source_name, '') <> 'RDS_TLOG' THEN 'POLICY'
-           WHEN a.gaps > 0 THEN 'GAPS'
+           WHEN bt.btype <> 'DIFF' AND a.gaps_raw > 0 THEN 'GAPS'
            ELSE 'OK'
        END AS status
 FROM Cfg AS c
+CROSS JOIN Z
 CROSS JOIN (VALUES ('FULL'), ('DIFF'), ('LOG')) AS bt(btype)
-OUTER APPLY
-(
-    SELECT MAX(E.src) AS source_name, COUNT(*) AS backup_count, MIN(E.t) AS oldest_utc, MAX(E.t) AS newest_utc,
-           AVG(CONVERT(bigint, DATEDIFF(MINUTE, E.prev_t, E.t))) AS avg_interval_min,
-           AVG(E.bytes) AS avg_bytes, SUM(E.bytes) AS total_bytes,
-           SUM(E.files) AS files_total,
-           SUM(CASE WHEN E.t >= DATEADD(HOUR, -24, SYSUTCDATETIME()) THEN E.files ELSE 0 END) AS files_24h,
-           SUM(CASE WHEN E.on_storage = 1 THEN E.files ELSE 0 END) AS files_listed,
-           SUM(E.files_in_policy_row) AS files_in_policy,
-           /* gaps inside the target window: interval longer than 1.25 x SLA (FULL and LOG only) */
-           CASE WHEN bt.btype = 'DIFF' THEN NULL ELSE SUM(E.is_gap) END AS gaps
-    FROM E
-    WHERE E.database_name = c.database_name AND E.btype = bt.btype
-) AS a;
+LEFT JOIN A AS a ON a.database_name = c.database_name AND a.btype = bt.btype;
 GO
 
 /* Daily snapshot (called by the hourly job; idempotent per day). Also feeds RETENTION issues. */

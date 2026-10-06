@@ -687,6 +687,7 @@ BEGIN
                    ROW_NUMBER() OVER (PARTITION BY b.database_name, b.type ORDER BY b.backup_finish_date DESC) AS rn
             FROM msdb.dbo.backupset AS b
             WHERE b.type IN ('D', 'I', 'L')
+              AND b.backup_finish_date >= DATEADD(DAY, -400, GETDATE())   /* [5.5] sargable on msdb backupset date index; no full-history scan */
               AND EXISTS (SELECT 1 FROM mon.DatabasePolicy AS p WHERE p.database_name = b.database_name)
         )
         INSERT #Cand
@@ -710,10 +711,13 @@ BEGIN
           AND r.database_name IS NOT NULL;
 
         INSERT #Cand
-        SELECT t.database_name, 'L', t.backup_file_time_utc, NULL, t.file_size_bytes, 'RDS_TLOG', NULL, t.is_log_chain_broken
-        FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY t.database_name ORDER BY t.backup_file_time_utc DESC) AS rn
-              FROM mon.TlogBackup AS t) AS t
-        WHERE t.rn = 1;
+        /* [5.5] latest file per database: one index seek each (was ROW_NUMBER over the whole table) */
+        SELECT p.database_name, 'L', t.backup_file_time_utc, NULL, t.file_size_bytes, 'RDS_TLOG', NULL, t.is_log_chain_broken
+        FROM mon.DatabasePolicy AS p
+        CROSS APPLY (SELECT TOP (1) x.backup_file_time_utc, x.file_size_bytes, x.is_log_chain_broken
+                     FROM mon.TlogBackup AS x
+                     WHERE x.database_name = p.database_name
+                     ORDER BY x.backup_file_time_utc DESC) AS t;
 
         INSERT #Cand
         SELECT s.database_name, 'L', s.dmv_log_backup_utc, NULL, NULL, 'DMV_LOG_STATS', NULL, NULL

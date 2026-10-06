@@ -147,7 +147,8 @@ BEGIN
                  (N'mon.usp_EngineLoop'), (N'mon.usp_RunHourly'), (N'mon.usp_EvaluateIssues'), (N'mon.usp_SendAlerts'),
                  (N'mon.usp_SendAlertsCore'), (N'mon.usp_SendDailyDigest'), (N'mon.usp_CloseDisabledIssues'),
                  (N'mon.usp_SetCheck'), (N'mon.usp_ShowChecks'), (N'mon.usp_ShowBackupRetention'),
-                 (N'mon.usp_ShowOlaLog'), (N'mon.usp_ShowEmailStats')) AS r(n);
+                 (N'mon.usp_ShowOlaLog'), (N'mon.usp_ShowEmailStats'),
+                 (N'mon.usp_SendSummary'), (N'mon.usp_RunScheduledEmails'), (N'mon.usp_AckIssue'), (N'mon.usp_ResolveIssue'), (N'mon.usp_ShowDataRetention')) AS r(n);
 
     /* 2. Every view in [mon] binds (cheap, no side effects) */
     DECLARE v CURSOR LOCAL FAST_FORWARD FOR

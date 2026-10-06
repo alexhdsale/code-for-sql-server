@@ -2,6 +2,17 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.6 — 2026-10-06
+- **Three kinds of email:** issue alerts (immediate, change-only — nothing changed = no email), a scheduled **short summary** (`mon.usp_SendSummary`: KPI tiles + every open issue with NEEDS ACTION / ACK / MUTED) and a scheduled **full report** (everything monitored). Scheduler `mon.usp_RunScheduledEmails` in the hourly job; settings `summary_email_hours_local`, `summary_email_weekdays`, `summary_recipients`, `summary_max_issues`, `summary_skip_when_full`, `full_report_hours_local`, `full_report_weekdays`, `full_report_change_only`. Defaults: summary daily 08:00, full report Monday + Thursday 08:00. Empty `full_report_hours_local` = old behaviour.
+- **Issue workflow:** `mon.usp_AckIssue` (owner + note, no reminders while acknowledged), `mon.usp_ResolveIssue` (manual close with a note, re-opens if the condition persists); `vw_ActiveIssues.workflow_state`.
+- **Retention per area:** `retention_perf_days`, `retention_backup_days`, `retention_issue_days`, `retention_email_days`, `retention_audit_days`; `mon.usp_ShowDataRetention` shows rows / MB / retention per table.
+- New `docs/MON_Operations_Guide.md`: deployment, Agent jobs, retention, email schedule, issue resolution.
+
+## 5.5 — 2026-10-06
+- **Performance:** `mon.vw_BackupRetention` rewritten to read every source once and aggregate once (was re-evaluated per database × backup type through OUTER APPLY — `usp_ShowBackupRetention` took ~36 s). Server-time → UTC offset computed once instead of a per-row scalar UDF on msdb history; settings read inline.
+- Backup collector: msdb history scan bounded to 400 days (sargable); latest RDS log backup per database via index seek instead of ROW_NUMBER over the whole table.
+- New `src/sql/01c_performance_indexes.sql`: covering index on `mon.TlogBackup`, purge/time indexes on `TlogBackup`, `OlaCommand`, `AgentJobRun`, `EngineRun`, `RdsTask`; `IssueChange(issue_id)`, `Notification(mailitem_id)` / `(created_utc)`. All idempotent, all in schema `mon`.
+
 ## 5.4 — 2026-10-06
 - **Release guard:** every install is recorded in `mon.ReleaseHistory`; the engine is paused (`engine_enabled = 0`) during the install; `mon.usp_SelfTest @Deep = 1` runs at the end (required objects, views bind, modules compile, no broken references, nothing created outside schema `mon`, jobs, settings, mail profile, check catalog). The engine resumes only with 0 errors; otherwise the release is `FAILED` and the watchdog raises CRITICAL `MON_RELEASE`.
 - **Email statistics:** `mon.usp_ShowEmailStats @Days` — MON emails per day / type, last 100, all Database Mail on the server split MON vs others; Check Editor tab *Emails (30 days)*.
