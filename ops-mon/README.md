@@ -2,7 +2,7 @@
 
 Self-contained monitoring for SQL Server / Amazon RDS for SQL Server. Everything lives in **one schema (`mon`) of the OPS database**; the only objects outside it are two SQL Agent jobs (`MON - Engine`, `MON - Digest & Watchdog`). Easy to upgrade, move or remove as one unit.
 
-**Current version: 5.6.1** — see [CHANGELOG.md](CHANGELOG.md).
+**Current version: 5.6.2** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 1. Open [`install/MON_Install.sql`](install/MON_Install.sql) in SSMS (RDS master login) and run the whole file. It is idempotent: re-running upgrades in place and keeps settings, check matrix and history.

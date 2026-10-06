@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.6.1 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.6.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -25,6 +25,7 @@
                    scheduled FULL report (summary_* / full_report_* settings, usp_RunScheduledEmails);
                    issue workflow: usp_AckIssue / usp_ResolveIssue, no reminders for acknowledged issues.
              5.6.1: fix Msg 1046 in usp_ResolveIssue; no Msg 22022 when the engine job is idle.
+             5.6.2: no msdb.dbo.syssessions anywhere (Msg 229 on RDS): installer engine check, JOBLONG running-job list.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -168,7 +169,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.6.1';
+DECLARE @version varchar(20) = '5.6.2';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 DECLARE @prev_engine nvarchar(20) = NULL;
 
@@ -199,13 +200,14 @@ GO
    it runs makes that execution fail with error 2801 ("definition ... has changed since it was
    compiled"). The job's every-minute schedule restarts it automatically with the new code.
 */
-/* [5.6.1] stop only when it is really running (sp_stop_job on an idle job prints Msg 22022 even inside TRY) */
+/* [5.6.2] stop only when it is really running (sp_stop_job on an idle job prints Msg 22022 even inside TRY).
+   msdb.dbo.syssessions is not readable by the RDS master user (Msg 229), so "running" = an activity row
+   started within the last 2 hours (one engine run lasts ~55 min) that has not stopped. */
 IF EXISTS (SELECT 1
            FROM msdb.dbo.sysjobs AS j
            JOIN msdb.dbo.sysjobactivity AS a ON a.job_id = j.job_id
            WHERE j.name = N'MON - Engine'
-             AND a.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)
-             AND a.start_execution_date IS NOT NULL
+             AND a.start_execution_date >= DATEADD(HOUR, -2, GETDATE())
              AND a.stop_execution_date IS NULL)
 BEGIN
     BEGIN TRY
@@ -3551,25 +3553,32 @@ BEGIN
             WHERE j.is_monitored = 1
               AND j.health_status IN ('OVERDUE', 'NEVER_SUCCEEDED', 'DISABLED', 'NOT_FOUND');
 
-            /* Running jobs vs 30-day median. sysjobactivity first, session parsing as fallback. */
+            /* Running jobs vs 30-day median. [5.6.2] RDS: msdb.dbo.syssessions is not readable (Msg 229), so the
+               running list comes from the Agent job-step sessions (VIEW SERVER STATE), plus sysjobactivity rows
+               started in the last 2 days and not stopped (covers non-T-SQL steps). */
             CREATE TABLE #Running(job_id uniqueidentifier, start_utc datetime2(0));
+            INSERT #Running
+            SELECT j.job_id, MIN(j.start_utc)
+            FROM (SELECT TRY_CONVERT(uniqueidentifier, TRY_CONVERT(binary(16),
+                             SUBSTRING(s.program_name, CHARINDEX(N'(Job 0x', s.program_name) + 5, 34), 1)) AS job_id,
+                         mon.fn_ServerToUtc(s.login_time) AS start_utc
+                  FROM sys.dm_exec_sessions AS s
+                  WHERE s.program_name LIKE N'SQLAgent - TSQL JobStep (Job 0x%') AS j
+            WHERE j.job_id IS NOT NULL
+            GROUP BY j.job_id;
             BEGIN TRY
                 INSERT #Running
                 EXEC sys.sp_executesql N'
-                    SELECT ja.job_id, mon.fn_ServerToUtc(ja.start_execution_date)
+                    SELECT ja.job_id, MIN(mon.fn_ServerToUtc(ja.start_execution_date))
                     FROM msdb.dbo.sysjobactivity AS ja
-                    WHERE ja.session_id = (SELECT MAX(s.session_id) FROM msdb.dbo.syssessions AS s)
-                      AND ja.start_execution_date IS NOT NULL
-                      AND ja.stop_execution_date IS NULL;';
+                    WHERE ja.start_execution_date >= DATEADD(DAY, -2, GETDATE())
+                      AND ja.stop_execution_date IS NULL
+                    GROUP BY ja.job_id;';
+                /* keep one row per job (earliest start) */
+                ;WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY start_utc) AS rn FROM #Running)
+                DELETE FROM d WHERE rn > 1;
             END TRY
             BEGIN CATCH
-                INSERT #Running
-                SELECT TRY_CONVERT(uniqueidentifier, TRY_CONVERT(binary(16),
-                           SUBSTRING(s.program_name, CHARINDEX(N'(Job 0x', s.program_name) + 5, 34), 1)),
-                       mon.fn_ServerToUtc(MIN(s.login_time))
-                FROM sys.dm_exec_sessions AS s
-                WHERE s.program_name LIKE N'SQLAgent - TSQL JobStep (Job 0x%'
-                GROUP BY SUBSTRING(s.program_name, CHARINDEX(N'(Job 0x', s.program_name) + 5, 34);
             END CATCH;
 
             INSERT #Issue(issue_key, category, severity, is_event, title, detail)

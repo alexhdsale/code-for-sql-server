@@ -2,6 +2,9 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.6.2 — 2026-10-06
+- Fix: `msdb.dbo.syssessions` is no longer used (not readable by the RDS master user — Msg 229): the installer's engine-running check and the JOBLONG running-job list now use sysjobactivity (last 2 days) and Agent job-step sessions.
+
 ## 5.6.1 — 2026-10-06
 - Fix: `usp_ResolveIssue` failed to compile (Msg 1046 — subquery inside PRINT), which made the 5.6 self-test fail and left the engine paused.
 - Fix: installer no longer prints Msg 22022 when `MON - Engine` is not running (stops the job only if it is active).
