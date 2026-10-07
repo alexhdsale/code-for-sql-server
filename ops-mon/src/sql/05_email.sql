@@ -166,7 +166,8 @@ BEGIN
             @min_rank int      = mon.fn_SevRank(ISNULL(mon.fn_Setting('alert_min_severity'), N'CRITICAL')),
             @on_resolve bit    = ISNULL(mon.fn_SettingInt('alert_on_resolve'), 1),
             @reminder int      = ISNULL(mon.fn_SettingInt('reminder_minutes'), 0),
-            @suppress int      = ISNULL(mon.fn_SettingInt('realert_suppress_minutes'), 60);
+            @suppress int      = ISNULL(mon.fn_SettingInt('realert_suppress_minutes'), 60),
+            @brief bit         = CASE WHEN ISNULL(mon.fn_Setting('alert_style'), N'BRIEF') = N'FULL' THEN 0 ELSE 1 END;   /* [5.7.1] */
 
     /* High-water mark: only changes committed before this point are handled in this pass,
        so a change merged concurrently by another session is never marked SKIPPED unseen. */
@@ -289,8 +290,8 @@ BEGIN
                    mon.fn_Td(mon.fn_Pill(CASE a.kind WHEN 'OPENED' THEN N'NEW' ELSE a.kind END, 'INFO'), NULL),
                    mon.fn_Td(mon.fn_HtmlEncode(i.category), NULL),
                    mon.fn_Td(CONCAT(N'<b>', mon.fn_HtmlEncode(i.title), N'</b><br>',
-                                    mon.fn_Small(REPLACE(mon.fn_OneLine(i.detail, 1200), N' | ', N'<br>')),
-                                    N'<br>', mon.fn_Small(CONCAT(N'key: ', mon.fn_HtmlEncode(i.issue_key)))), mon.fn_SevLevel(a.severity)),
+                                    mon.fn_Small(REPLACE(mon.fn_OneLine(i.detail, CASE WHEN @brief = 1 THEN 400 ELSE 1200 END), N' | ', N'<br>')),
+                                    CASE WHEN @brief = 0 THEN CONCAT(N'<br>', mon.fn_Small(CONCAT(N'key: ', mon.fn_HtmlEncode(i.issue_key)))) END), mon.fn_SevLevel(a.severity)),
                    mon.fn_Td(mon.fn_HtmlEncode(ISNULL(i.database_name, N'-')), NULL),
                    mon.fn_Td(CONCAT(mon.fn_Nw(mon.fn_FmtLocal(i.first_seen_utc, @tz)), N'<br>',
                                     mon.fn_Small(CONCAT(N'open ', mon.fn_Duration(DATEDIFF(SECOND, i.first_seen_utc, @now))))), NULL),
@@ -324,6 +325,7 @@ BEGIN
             FOR XML PATH(''), TYPE
         ).value('(./text())[1]', 'nvarchar(max)');
 
+        IF @brief = 0
         SET @rows_ctx =
         (
             SELECT TOP (15) CONCAT(N'<tr>',
@@ -353,15 +355,21 @@ BEGIN
             CASE @worst WHEN 'CRITICAL' THEN '#B91C1C' WHEN 'WARNING' THEN '#B45309' ELSE '#15803D' END,
             CONCAT(@server, N' - SQL Server alert'),
             CASE @worst WHEN 'RESOLVED' THEN N'Resolved' ELSE CONCAT(@worst, N' alert') END,
-            CONCAT(@n_new, N' new &middot; ', @n_esc, N' escalated &middot; ', @n_res, N' resolved',
+            CASE WHEN @brief = 1
+                 THEN CONCAT(mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET'),
+                             CASE WHEN @total > 1 THEN CONCAT(N' &nbsp;|&nbsp; ', @total, N' changes') END)
+                 ELSE CONCAT(@n_new, N' new &middot; ', @n_esc, N' escalated &middot; ', @n_res, N' resolved',
                    CASE WHEN @n_rem > 0 THEN CONCAT(N' &middot; ', @n_rem, N' reminder') END,
                    N' &nbsp;|&nbsp; now active: ', @active_crit, N' critical, ', @active_warn, N' warning',
-                   N' &nbsp;|&nbsp; ', mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET')),
+                   N' &nbsp;|&nbsp; ', mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET')) END,
             @body_rows,
-            CONCAT(N'<b>Change-only alerting.</b> You get mail only when an issue opens, escalates or resolves. ',
+            CASE WHEN @brief = 1
+                 THEN CONCAT(N'Sent only when something changes. Details and all open issues: the daily report, or <code>SELECT * FROM OPS.mon.vw_ActiveIssues;</code> ',
+                             N'&middot; OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.')
+                 ELSE CONCAT(N'<b>Change-only alerting.</b> You get mail only when an issue opens, escalates or resolves. ',
                    N'Mute a known issue: <code>EXEC OPS.mon.usp_MuteIssue @KeyPattern = N''&lt;key&gt;'', @Hours = 8, @Reason = N''...'';</code><br>',
                    N'Live view: <code>SELECT * FROM OPS.mon.vw_ActiveIssues;</code> &middot; blocking chains: <code>OPS.mon.vw_BlockingNow</code><br>',
-                   N'Generated ', CONVERT(nvarchar(19), @now, 120), N' UTC by OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.'));
+                   N'Generated ', CONVERT(nvarchar(19), @now, 120), N' UTC by OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.') END);
 
         IF @PreviewOnly = 1
         BEGIN
