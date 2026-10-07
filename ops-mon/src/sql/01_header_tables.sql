@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.6.3 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.6.4 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -28,6 +28,7 @@
              5.6.2: no msdb.dbo.syssessions anywhere (Msg 229 on RDS): installer engine check, JOBLONG running-job list.
              5.6.3: object order (no "depends on the missing object" message); release gate finds its own
                     ReleaseHistory row via SESSION_CONTEXT, so the history records COMPLETED reliably.
+             5.6.4: CHECKDB issues are category INTEGRITY (were BACKUP).
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -171,7 +172,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.6.3';
+DECLARE @version varchar(20) = '5.6.4';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
