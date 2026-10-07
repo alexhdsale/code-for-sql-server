@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.7.0 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.7.1 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -33,6 +33,7 @@
                     none when nothing changed); WARNING+CRITICAL alerts when they happen, no reminders.
                     Failed Agent job stays open until it succeeds (no 7-day auto-resolve).
                     RDS task times: UTC auto-detected (fixes backups shown "0s ago" / in the future).
+             5.7.1: alert_style BRIEF (default) - the alert mail contains only the failure / resolution itself.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -176,7 +177,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.7.0';
+DECLARE @version varchar(20) = '5.7.1';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
@@ -280,6 +281,7 @@ GO
     ,('report_hour_local',             N'8',                              'int',    'email',      0, N'Digest hour in display_time_zone. If missed (outage) it is sent later the same day.')
     ,('heartbeat_weekday',             N'1',                              'int',    'email',      0, N'ISO weekday (1=Mon..7=Sun) on which a digest is sent even with no changes. 0 = never.')
     ,('alert_min_severity',            N'CRITICAL',                       'text',   'email',      0, N'CRITICAL or WARNING. Changes below this go to the digest only.')
+    ,('alert_style',                   N'BRIEF',                          'text',   'email',      0, N'BRIEF = alert mail shows only what changed (the failure / the resolution), one line per issue. FULL = also the "still active" context table and the active counts.')
     ,('alert_on_resolve',              N'1',                              'bit',    'email',      0, N'Send a RESOLVED mail for issues that were alerted.')
     ,('reminder_minutes',              N'0',                              'int',    'email',      0, N'Re-send still-active CRITICAL issues after N minutes. 0 = off (pure change-only).')
     ,('realert_suppress_minutes',      N'60',                             'int',    'email',      0, N'Do not re-alert an escalation of an issue that was alerted CRITICAL within N minutes.')
