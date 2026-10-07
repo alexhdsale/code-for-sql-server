@@ -12,14 +12,41 @@
                       full_report_change_only = 1 sends it only when something changed.
                       Empty full_report_hours_local = legacy mode (one change-only digest per day at report_hour_local).
 
+   [5.7] daily_email_mode = AUTO (default since 5.7): ONE scheduled email per day at full_report_hours_local:
+                      everything good (no open, unmuted issue) -> the SHORT summary ("all clear");
+                      anything open                            -> the FULL report.
+                      Nothing changed since the previous daily email -> no email at all (DIGEST_SKIPPED),
+                      except a weekly proof-of-life on heartbeat_weekday (0 = never).
+                      Failures / anomalies are never held for the daily email: usp_SendAlerts mails them
+                      at the next 5-minute cycle (alert_min_severity), once per change.
+                      daily_email_mode = SCHEDULE keeps the separate summary_* / full_report_* schedules.
+
    Issue workflow: OPEN -> ACKNOWLEDGED (usp_AckIssue: someone is on it, no more reminders)
                         -> RESOLVED automatically when the condition clears (or usp_ResolveIssue, manual;
                            re-opens at the next cycle if the condition still exists).
    ============================================================================= */
 
+/* [5.7] one-time switch to the AUTO email policy (first install of 5.7 = daily_email_mode not there yet):
+         daily email every day, brief when all good / full when not, nothing when nothing changed;
+         WARNING and CRITICAL alerts mailed when they happen; no reminders for unchanged issues. */
+IF OBJECT_ID(N'mon.Setting', N'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM mon.Setting WHERE setting_name = 'daily_email_mode')
+BEGIN
+    UPDATE mon.Setting SET setting_value = N'1,2,3,4,5,6,7' WHERE setting_name = 'full_report_weekdays';
+    UPDATE mon.Setting SET setting_value = N'8' WHERE setting_name = 'full_report_hours_local' AND NULLIF(LTRIM(setting_value), N'') IS NULL;
+    UPDATE mon.Setting SET setting_value = N'WARNING' WHERE setting_name = 'alert_min_severity';
+    UPDATE mon.Setting SET setting_value = N'0' WHERE setting_name = 'reminder_minutes';
+    UPDATE mon.Setting SET setting_value = N'0' WHERE setting_name = 'job_failure_max_age_days' AND setting_value = N'7';  /* failed job stays open until it succeeds */
+    PRINT N'5.7 email policy applied: one daily email (brief if all good, full if not, none if nothing changed); WARNING+CRITICAL alerts when they happen; no reminders.';
+END;
+
 INSERT mon.Setting(setting_name, setting_value, value_type, category, description)
 SELECT v.n, v.v, v.t, v.c, v.d
 FROM (VALUES
+    ('daily_email_mode', N'AUTO', 'text', 'email',
+     N'AUTO = one email a day at full_report_hours_local: short summary when everything is good, full report when an issue is open, nothing when nothing changed (weekly heartbeat_weekday still sends). SCHEDULE = separate summary_* and full_report_* schedules.'),
+    ('rds_task_times_utc', N'AUTO', 'text', 'backup',
+     N'Time zone of msdb.dbo.rds_task_status created_at / last_updated. AUTO = detected (a value ahead of the server clock means UTC); 1 = UTC; 0 = server local time.'),
     ('summary_email_hours_local', N'8', 'text', 'email',
      N'Local hours (comma list, 0-23) when the SHORT summary email is sent. Empty = no summary emails.'),
     ('summary_email_weekdays', N'1,2,3,4,5,6,7', 'text', 'email',
@@ -31,9 +58,9 @@ FROM (VALUES
     ('summary_skip_when_full', N'1', 'bit', 'email',
      N'1 = do not send the summary in an hour when the full report is sent anyway.'),
     ('full_report_hours_local', N'8', 'text', 'email',
-     N'Local hours (comma list, 0-23) when the FULL report (every monitored item) is sent. Empty = legacy: one change-only digest per day at report_hour_local.'),
-    ('full_report_weekdays', N'1,4', 'text', 'email',
-     N'ISO weekdays for the full report (1 = Monday ... 7 = Sunday). Default Monday and Thursday.'),
+     N'Local hours (comma list, 0-23) when the FULL report (every monitored item) is sent; in AUTO mode the hour of the one daily email. Empty = legacy: one change-only digest per day at report_hour_local.'),
+    ('full_report_weekdays', N'1,2,3,4,5,6,7', 'text', 'email',
+     N'ISO weekdays for the full report / AUTO daily email (1 = Monday ... 7 = Sunday). Default every day.'),
     ('full_report_change_only', N'0', 'bit', 'email',
      N'1 = the scheduled full report is skipped when nothing changed since the previous one; 0 = always sent.'),
     ('retention_perf_days', N'', 'text', 'issues',
@@ -264,8 +291,13 @@ BEGIN
         N'<b>Work an issue:</b> <code>EXEC OPS.mon.usp_AckIssue @KeyPattern = N''&lt;key&gt;'', @Note = N''on it'';</code> &middot; ',
         N'after the fix it resolves automatically within 5 minutes (or <code>EXEC OPS.mon.usp_ResolveIssue @KeyPattern = N''&lt;key&gt;'', @Note = N''what was done'';</code>) &middot; ',
         N'known condition: <code>EXEC OPS.mon.usp_MuteIssue</code>.<br>',
-        N'Issue alerts are sent only when something changes. Full report: hours ', ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'(daily digest)'),
-        N', weekdays ', ISNULL(mon.fn_Setting('full_report_weekdays'), N'-'), N'. Run now: <code>EXEC OPS.mon.usp_SendDailyDigest @Force = 1;</code>',
+        CASE WHEN ISNULL(mon.fn_Setting('daily_email_mode'), N'AUTO') = N'AUTO'
+             THEN CONCAT(N'Failures and anomalies are emailed when they happen (once per change). One daily email at ',
+                         ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'8'),
+                         N':00 - this short one when everything is good, the full report when something is open, none when nothing changed. ')
+             ELSE CONCAT(N'Issue alerts are sent only when something changes. Full report: hours ', ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'(daily digest)'),
+                         N', weekdays ', ISNULL(mon.fn_Setting('full_report_weekdays'), N'-'), N'. ') END,
+        N'Full report now: <code>EXEC OPS.mon.usp_SendDailyDigest @Force = 1;</code>',
         N'</div></td></tr></table></body></html>');
 
     IF @PreviewOnly = 1
@@ -309,6 +341,38 @@ BEGIN
             @iso_wd int = (DATEPART(WEEKDAY, @local_now) + @@DATEFIRST - 2) % 7 + 1;   /* 1 = Monday */
     DECLARE @full_hours nvarchar(400) = mon.fn_Setting('full_report_hours_local'),
             @full_due bit = 0, @full_sent bit = 0;
+
+    /* [5.7] AUTO: one email per day - brief when all good, full when something is open, none when nothing changed */
+    IF ISNULL(mon.fn_Setting('daily_email_mode'), N'AUTO') = N'AUTO'
+    BEGIN
+        IF mon.fn_InIntList(ISNULL(NULLIF(LTRIM(@full_hours), N''), N'8'), @hour) = 0
+           OR mon.fn_InIntList(ISNULL(mon.fn_Setting('full_report_weekdays'), N'1,2,3,4,5,6,7'), @iso_wd) = 0
+           OR EXISTS (SELECT 1 FROM mon.Notification
+                      WHERE notification_type IN ('DIGEST', 'HEARTBEAT', 'DIGEST_SKIPPED', 'SUMMARY')
+                        AND created_utc >= DATEADD(MINUTE, -50, @now))
+            RETURN;
+
+        DECLARE @last_daily datetime2(0) = (SELECT MAX(created_utc) FROM mon.Notification
+                                            WHERE notification_type IN ('DIGEST', 'HEARTBEAT', 'SUMMARY') AND send_ok = 1);
+        DECLARE @changes int =
+              (SELECT COUNT(*) FROM mon.IssueChange WHERE change_utc > ISNULL(@last_daily, '19000101') AND change_type <> 'EXPIRED')
+            + (SELECT COUNT(*) FROM mon.CheckChangeLog WHERE changed_utc > ISNULL(@last_daily, '19000101'));
+        DECLARE @open int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND is_muted = 0);
+        DECLARE @hb bit = CASE WHEN @iso_wd = ISNULL(mon.fn_SettingInt('heartbeat_weekday'), 1) THEN 1 ELSE 0 END;
+
+        IF @changes = 0 AND @last_daily IS NOT NULL AND @hb = 0
+        BEGIN
+            INSERT mon.Notification(notification_type, created_utc, report_date_local, change_count)
+            VALUES ('DIGEST_SKIPPED', @now, CONVERT(date, @local_now), 0);      /* nothing changed: no email */
+            RETURN;
+        END;
+
+        IF @open = 0
+            EXEC mon.usp_SendSummary;                       /* everything good: brief */
+        ELSE
+            EXEC mon.usp_SendDailyDigest @Force = 1;        /* something open: full report */
+        RETURN;
+    END;
 
     /* FULL REPORT */
     IF NULLIF(LTRIM(@full_hours), N'') IS NULL
