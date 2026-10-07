@@ -349,8 +349,8 @@ SELECT v.n, v.v, v.t, v.c, v.d
 FROM (VALUES
     ('ola_commandlog_database', N'', 'text', 'ola',
      N'Database that holds Ola Hallengren dbo.CommandLog. Empty = auto-discover (every online database + master, re-checked hourly).'),
-    ('job_failure_max_age_days', N'7', 'int', 'jobs',
-     N'A job whose LAST run failed stays an open issue (and is listed in the digest) until it succeeds or the failure is older than N days - also for unscheduled / manually started jobs.'),
+    ('job_failure_max_age_days', N'0', 'int', 'jobs',
+     N'A job whose LAST run failed stays an open issue (and is listed in the digest) until it succeeds, is disabled/deleted, or the issue is muted. N > 0 = also stop after N days. 0 (default since 5.7) = no age limit - also for unscheduled / manually started jobs.'),
     ('checkdb_crit_factor', N'4', 'int', 'backup',
      N'CHECKDB issue becomes CRITICAL when the last clean CHECKDB is older than checkdb_max_age_days x this factor (WARNING before that).'),
     ('ola_initial_load_days', N'35', 'int', 'ola',
