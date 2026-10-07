@@ -1,4 +1,4 @@
-# OPS.mon — Operations Guide (rev 5.6)
+# OPS.mon — Operations Guide (rev 5.7)
 
 How to **deploy** the monitor, how its **SQL Agent jobs** work, how long **data** is kept, how the **three kinds of email** are scheduled, and how **issues get resolved**.
 
@@ -155,11 +155,14 @@ Note: the backup retention report can only look back as far as `retention_backup
 | **Summary** (short) | scheduled hours (`summary_email_hours_local`) | 4 KPI tiles, last-24 h counts, **every open issue** with age and state (NEEDS ACTION / ACK / MUTED) | Yes — that is its purpose (shows "All clear") |
 | **Full report** | scheduled hours and weekdays (`full_report_hours_local`, `full_report_weekdays`) | **everything monitored**: all databases and backups, retention, CHECKDB, Agent jobs, Ola, blocking, deadlocks, error log, performance, storage, coverage, configuration changes, self-health | Yes, unless `full_report_change_only = 1` |
 
-Default schedule after installing 5.6:
+Email policy since 5.7 (`daily_email_mode = AUTO`, applied automatically on upgrade):
 
-- **Issue alerts:** CRITICAL changes only (`alert_min_severity = CRITICAL`).
-- **Summary:** every day at **08:00** (`display_time_zone`).
-- **Full report:** **Monday and Thursday at 08:00**. On those days the summary is skipped (`summary_skip_when_full = 1`), because the full report already contains it.
+- **Failures and anomalies:** emailed **when they happen** — WARNING and CRITICAL (`alert_min_severity = WARNING`), once per change (opened / escalated / resolved). No reminders for an unchanged issue (`reminder_minutes = 0`).
+- **One daily email at 08:00** (`full_report_hours_local`, every day):
+  - everything good (no open, unmuted issue) → the **short summary** ("All clear");
+  - something open → the **full report**;
+  - **nothing changed** since the previous daily email → **no email** (logged as DIGEST_SKIPPED), except a weekly proof-of-life on `heartbeat_weekday` (Monday; `0` = never).
+- `daily_email_mode = SCHEDULE` restores the separate summary / full-report schedules described by the settings below.
 
 ### 4.2 Settings
 
@@ -168,7 +171,8 @@ Default schedule after installing 5.6:
 | `alert_recipients` | — | issue alerts |
 | `report_recipients` | — | full report (and summary when `summary_recipients` is empty) |
 | `summary_recipients` | (empty) | summary only |
-| `alert_min_severity` | `CRITICAL` | `WARNING` = also alert immediately on warnings |
+| `daily_email_mode` | `AUTO` | AUTO = one daily email: short when all good, full when something is open, none when nothing changed. SCHEDULE = separate summary / full schedules |
+| `alert_min_severity` | `WARNING` (5.7) | `CRITICAL` = alert only on critical; warnings then wait for the daily email |
 | `alert_on_resolve` | 1 | send a RESOLVED email for issues that were alerted |
 | `reminder_minutes` | 0 | re-send still-open, **not acknowledged** CRITICAL issues every N minutes (0 = off) |
 | `summary_email_hours_local` | `8` | comma list of hours 0–23; empty = no summary |
@@ -176,7 +180,9 @@ Default schedule after installing 5.6:
 | `summary_max_issues` | 20 | issues listed in the summary |
 | `summary_skip_when_full` | 1 | no summary in an hour when the full report is sent |
 | `full_report_hours_local` | `8` | comma list of hours; **empty = legacy** (one change-only digest per day at `report_hour_local`) |
-| `full_report_weekdays` | `1,4` | ISO weekdays |
+| `full_report_weekdays` | `1,2,3,4,5,6,7` | ISO weekdays |
+| `heartbeat_weekday` | 1 | AUTO: weekday on which the daily email is sent even if nothing changed (0 = never) |
+| `job_failure_max_age_days` | 0 | 0 = a failed Agent job stays open until it succeeds (or is disabled / deleted); N = also close after N days |
 | `full_report_change_only` | 0 | 1 = skip the scheduled full report when nothing changed |
 | `display_time_zone` | Eastern Standard Time | Windows time-zone name for all local hours |
 
