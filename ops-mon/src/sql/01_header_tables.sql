@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.6.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.7.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -26,6 +26,15 @@
                    issue workflow: usp_AckIssue / usp_ResolveIssue, no reminders for acknowledged issues.
              5.6.1: fix Msg 1046 in usp_ResolveIssue; no Msg 22022 when the engine job is idle.
              5.6.2: no msdb.dbo.syssessions anywhere (Msg 229 on RDS): installer engine check, JOBLONG running-job list.
+             5.6.3: object order (no "depends on the missing object" message); release gate finds its own
+                    ReleaseHistory row via SESSION_CONTEXT, so the history records COMPLETED reliably.
+             5.6.4: CHECKDB issues are category INTEGRITY (were BACKUP).
+             5.7.0: email policy AUTO - one daily email (short when all good, full when something is open,
+                    none when nothing changed); WARNING+CRITICAL alerts when they happen, no reminders.
+                    Failed Agent job stays open until it succeeds (no 7-day auto-resolve).
+                    RDS task times: UTC auto-detected (fixes backups shown "0s ago" / in the future).
+             5.7.1: alert_style BRIEF (default) - the alert mail contains only the failure / resolution itself.
+             5.7.2: failed Agent jobs are re-mailed daily (jobfail_reminder_minutes) until fixed / acknowledged / muted.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -169,8 +178,11 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.6.2';
+DECLARE @version varchar(20) = '5.7.2';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
+/* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
+IF @prev IS NULL
+    SET @prev = (SELECT TOP (1) CONCAT(version, N' (', status, N')') FROM mon.ReleaseHistory ORDER BY release_id DESC);
 DECLARE @prev_engine nvarchar(20) = NULL;
 
 /* Abandon an earlier install that never finished (e.g. the script was stopped half way). */
@@ -191,6 +203,9 @@ END;
 
 INSERT mon.ReleaseHistory(version, status, started_utc, started_server_time, prev_version, prev_engine_enabled)
 VALUES (@version, 'INSTALLING', SYSUTCDATETIME(), DATEADD(SECOND, -1, SYSDATETIME()), @prev, @prev_engine);
+/* [5.6.3] remember THIS install's row for the release gate at the end of the script */
+DECLARE @rid int = SCOPE_IDENTITY();
+EXEC sys.sp_set_session_context @key = N'mon_release_id', @value = @rid;
 
 PRINT CONCAT(N'MON install ', @version, N' started (previous: ', ISNULL(@prev, N'none'), N'). Engine paused until the self-test passes.');
 GO
@@ -267,8 +282,10 @@ GO
     ,('report_hour_local',             N'8',                              'int',    'email',      0, N'Digest hour in display_time_zone. If missed (outage) it is sent later the same day.')
     ,('heartbeat_weekday',             N'1',                              'int',    'email',      0, N'ISO weekday (1=Mon..7=Sun) on which a digest is sent even with no changes. 0 = never.')
     ,('alert_min_severity',            N'CRITICAL',                       'text',   'email',      0, N'CRITICAL or WARNING. Changes below this go to the digest only.')
+    ,('alert_style',                   N'BRIEF',                          'text',   'email',      0, N'BRIEF = alert mail shows only what changed (the failure / the resolution), one line per issue. FULL = also the "still active" context table and the active counts.')
     ,('alert_on_resolve',              N'1',                              'bit',    'email',      0, N'Send a RESOLVED mail for issues that were alerted.')
     ,('reminder_minutes',              N'0',                              'int',    'email',      0, N'Re-send still-active CRITICAL issues after N minutes. 0 = off (pure change-only).')
+    ,('jobfail_reminder_minutes',      N'1440',                           'int',    'email',      0, N'[5.7.2] A failed SQL Agent job is re-mailed every N minutes until the job succeeds, is disabled/deleted, or the issue is acknowledged (usp_AckIssue) or muted. Default daily. 0 = mail once only.')
     ,('realert_suppress_minutes',      N'60',                             'int',    'email',      0, N'Do not re-alert an escalation of an issue that was alerted CRITICAL within N minutes.')
     ,('email_max_rows_per_section',    N'40',                             'int',    'email',      0, N'Row cap per digest section (keeps mail under Gmail 102 KB clipping).')
     ,('resolve_grace_minutes',         N'10',                             'int',    'issues',     0, N'A state issue must be absent this long before it is RESOLVED (anti-flap).')

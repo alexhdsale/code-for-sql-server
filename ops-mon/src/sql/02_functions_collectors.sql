@@ -592,13 +592,32 @@ BEGIN
             SET @task_error = 1;
         END CATCH;
 
+        /* [5.7] Are rds_task_status times UTC or server-local? On an instance with a non-UTC time zone
+           a UTC value of a fresh task is ahead of the server clock -> UTC (remembered in rds_task_times_utc).
+           Wrong guess = backups shown in the future ("0s ago"). */
+        DECLARE @rds_utc_setting nvarchar(10) = ISNULL(mon.fn_Setting('rds_task_times_utc'), N'AUTO'),
+                @tz_off int = DATEPART(TZOFFSET, SYSDATETIMEOFFSET()), @rds_utc bit = 0;
+        IF @rds_utc_setting = N'1' OR @tz_off = 0
+            SET @rds_utc = 1;
+        ELSE IF @rds_utc_setting = N'AUTO'
+             AND EXISTS (SELECT 1 FROM #RdsTasks
+                         WHERE last_updated > DATEADD(MINUTE, 10, GETDATE()) OR created_at > DATEADD(MINUTE, 10, GETDATE()))
+        BEGIN
+            SET @rds_utc = 1;
+            UPDATE mon.Setting SET setting_value = N'1', modified_utc = SYSUTCDATETIME()
+            WHERE setting_name = 'rds_task_times_utc';
+            /* rows stored earlier were shifted by the server offset: put them back */
+            UPDATE mon.RdsTask SET last_updated_utc = DATEADD(MINUTE, @tz_off, last_updated_utc),
+                                   created_utc      = DATEADD(MINUTE, @tz_off, created_utc);
+        END;
+
         MERGE mon.RdsTask AS t
         USING (SELECT task_id, task_type, database_name,
                       TRY_CONVERT(decimal(9,2), REPLACE(percent_complete_text, N'%', N'')) AS pct,
                       TRY_CONVERT(int, duration_minutes_text) AS dur,
                       lifecycle, task_info,
-                      mon.fn_ServerToUtc(last_updated) AS last_updated_utc,
-                      mon.fn_ServerToUtc(created_at) AS created_utc,
+                      CASE WHEN @rds_utc = 1 THEN CONVERT(datetime2(3), last_updated) ELSE mon.fn_ServerToUtc(last_updated) END AS last_updated_utc,
+                      CASE WHEN @rds_utc = 1 THEN CONVERT(datetime2(3), created_at)   ELSE mon.fn_ServerToUtc(created_at)   END AS created_utc,
                       LEFT(s3_object_arn, 4000) AS arn
                FROM #RdsTasks) AS s
         ON t.task_id = s.task_id

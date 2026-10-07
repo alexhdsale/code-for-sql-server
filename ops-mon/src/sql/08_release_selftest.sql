@@ -302,8 +302,12 @@ GO
    RELEASE GATE: self-test, then resume the engine only if everything is valid.
    ============================================================================= */
 DECLARE @rid int, @since datetime2(0), @prev_engine nvarchar(20), @version varchar(20), @e int, @w int;
-SELECT TOP (1) @rid = release_id, @since = started_server_time, @prev_engine = prev_engine_enabled, @version = version
-FROM mon.ReleaseHistory WHERE status = 'INSTALLING' ORDER BY release_id DESC;
+/* [5.6.3] this install's own row (set at the start of the script); fallback: newest INSTALLING row */
+SET @rid = TRY_CONVERT(int, SESSION_CONTEXT(N'mon_release_id'));
+IF @rid IS NULL OR NOT EXISTS (SELECT 1 FROM mon.ReleaseHistory WHERE release_id = @rid)
+    SELECT TOP (1) @rid = release_id FROM mon.ReleaseHistory WHERE status = 'INSTALLING' ORDER BY release_id DESC;
+SELECT @since = started_server_time, @prev_engine = prev_engine_enabled, @version = version
+FROM mon.ReleaseHistory WHERE release_id = @rid;
 
 EXEC mon.usp_SelfTest @Deep = 1, @Since = @since, @Quiet = 1, @Errors = @e OUTPUT, @Warnings = @w OUTPUT;
 

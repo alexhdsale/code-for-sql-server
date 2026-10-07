@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.6.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.7.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -26,6 +26,15 @@
                    issue workflow: usp_AckIssue / usp_ResolveIssue, no reminders for acknowledged issues.
              5.6.1: fix Msg 1046 in usp_ResolveIssue; no Msg 22022 when the engine job is idle.
              5.6.2: no msdb.dbo.syssessions anywhere (Msg 229 on RDS): installer engine check, JOBLONG running-job list.
+             5.6.3: object order (no "depends on the missing object" message); release gate finds its own
+                    ReleaseHistory row via SESSION_CONTEXT, so the history records COMPLETED reliably.
+             5.6.4: CHECKDB issues are category INTEGRITY (were BACKUP).
+             5.7.0: email policy AUTO - one daily email (short when all good, full when something is open,
+                    none when nothing changed); WARNING+CRITICAL alerts when they happen, no reminders.
+                    Failed Agent job stays open until it succeeds (no 7-day auto-resolve).
+                    RDS task times: UTC auto-detected (fixes backups shown "0s ago" / in the future).
+             5.7.1: alert_style BRIEF (default) - the alert mail contains only the failure / resolution itself.
+             5.7.2: failed Agent jobs are re-mailed daily (jobfail_reminder_minutes) until fixed / acknowledged / muted.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -169,8 +178,11 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.6.2';
+DECLARE @version varchar(20) = '5.7.2';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
+/* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
+IF @prev IS NULL
+    SET @prev = (SELECT TOP (1) CONCAT(version, N' (', status, N')') FROM mon.ReleaseHistory ORDER BY release_id DESC);
 DECLARE @prev_engine nvarchar(20) = NULL;
 
 /* Abandon an earlier install that never finished (e.g. the script was stopped half way). */
@@ -191,6 +203,9 @@ END;
 
 INSERT mon.ReleaseHistory(version, status, started_utc, started_server_time, prev_version, prev_engine_enabled)
 VALUES (@version, 'INSTALLING', SYSUTCDATETIME(), DATEADD(SECOND, -1, SYSDATETIME()), @prev, @prev_engine);
+/* [5.6.3] remember THIS install's row for the release gate at the end of the script */
+DECLARE @rid int = SCOPE_IDENTITY();
+EXEC sys.sp_set_session_context @key = N'mon_release_id', @value = @rid;
 
 PRINT CONCAT(N'MON install ', @version, N' started (previous: ', ISNULL(@prev, N'none'), N'). Engine paused until the self-test passes.');
 GO
@@ -267,8 +282,10 @@ GO
     ,('report_hour_local',             N'8',                              'int',    'email',      0, N'Digest hour in display_time_zone. If missed (outage) it is sent later the same day.')
     ,('heartbeat_weekday',             N'1',                              'int',    'email',      0, N'ISO weekday (1=Mon..7=Sun) on which a digest is sent even with no changes. 0 = never.')
     ,('alert_min_severity',            N'CRITICAL',                       'text',   'email',      0, N'CRITICAL or WARNING. Changes below this go to the digest only.')
+    ,('alert_style',                   N'BRIEF',                          'text',   'email',      0, N'BRIEF = alert mail shows only what changed (the failure / the resolution), one line per issue. FULL = also the "still active" context table and the active counts.')
     ,('alert_on_resolve',              N'1',                              'bit',    'email',      0, N'Send a RESOLVED mail for issues that were alerted.')
     ,('reminder_minutes',              N'0',                              'int',    'email',      0, N'Re-send still-active CRITICAL issues after N minutes. 0 = off (pure change-only).')
+    ,('jobfail_reminder_minutes',      N'1440',                           'int',    'email',      0, N'[5.7.2] A failed SQL Agent job is re-mailed every N minutes until the job succeeds, is disabled/deleted, or the issue is acknowledged (usp_AckIssue) or muted. Default daily. 0 = mail once only.')
     ,('realert_suppress_minutes',      N'60',                             'int',    'email',      0, N'Do not re-alert an escalation of an issue that was alerted CRITICAL within N minutes.')
     ,('email_max_rows_per_section',    N'40',                             'int',    'email',      0, N'Row cap per digest section (keeps mail under Gmail 102 KB clipping).')
     ,('resolve_grace_minutes',         N'10',                             'int',    'issues',     0, N'A state issue must be absent this long before it is RESOLVED (anti-flap).')
@@ -1232,8 +1249,8 @@ SELECT v.n, v.v, v.t, v.c, v.d
 FROM (VALUES
     ('ola_commandlog_database', N'', 'text', 'ola',
      N'Database that holds Ola Hallengren dbo.CommandLog. Empty = auto-discover (every online database + master, re-checked hourly).'),
-    ('job_failure_max_age_days', N'7', 'int', 'jobs',
-     N'A job whose LAST run failed stays an open issue (and is listed in the digest) until it succeeds or the failure is older than N days - also for unscheduled / manually started jobs.'),
+    ('job_failure_max_age_days', N'0', 'int', 'jobs',
+     N'A job whose LAST run failed stays an open issue (and is listed in the digest) until it succeeds, is disabled/deleted, or the issue is muted. N > 0 = also stop after N days. 0 (default since 5.7) = no age limit - also for unscheduled / manually started jobs.'),
     ('checkdb_crit_factor', N'4', 'int', 'backup',
      N'CHECKDB issue becomes CRITICAL when the last clean CHECKDB is older than checkdb_max_age_days x this factor (WARNING before that).'),
     ('ola_initial_load_days', N'35', 'int', 'ola',
@@ -1958,13 +1975,32 @@ BEGIN
             SET @task_error = 1;
         END CATCH;
 
+        /* [5.7] Are rds_task_status times UTC or server-local? On an instance with a non-UTC time zone
+           a UTC value of a fresh task is ahead of the server clock -> UTC (remembered in rds_task_times_utc).
+           Wrong guess = backups shown in the future ("0s ago"). */
+        DECLARE @rds_utc_setting nvarchar(10) = ISNULL(mon.fn_Setting('rds_task_times_utc'), N'AUTO'),
+                @tz_off int = DATEPART(TZOFFSET, SYSDATETIMEOFFSET()), @rds_utc bit = 0;
+        IF @rds_utc_setting = N'1' OR @tz_off = 0
+            SET @rds_utc = 1;
+        ELSE IF @rds_utc_setting = N'AUTO'
+             AND EXISTS (SELECT 1 FROM #RdsTasks
+                         WHERE last_updated > DATEADD(MINUTE, 10, GETDATE()) OR created_at > DATEADD(MINUTE, 10, GETDATE()))
+        BEGIN
+            SET @rds_utc = 1;
+            UPDATE mon.Setting SET setting_value = N'1', modified_utc = SYSUTCDATETIME()
+            WHERE setting_name = 'rds_task_times_utc';
+            /* rows stored earlier were shifted by the server offset: put them back */
+            UPDATE mon.RdsTask SET last_updated_utc = DATEADD(MINUTE, @tz_off, last_updated_utc),
+                                   created_utc      = DATEADD(MINUTE, @tz_off, created_utc);
+        END;
+
         MERGE mon.RdsTask AS t
         USING (SELECT task_id, task_type, database_name,
                       TRY_CONVERT(decimal(9,2), REPLACE(percent_complete_text, N'%', N'')) AS pct,
                       TRY_CONVERT(int, duration_minutes_text) AS dur,
                       lifecycle, task_info,
-                      mon.fn_ServerToUtc(last_updated) AS last_updated_utc,
-                      mon.fn_ServerToUtc(created_at) AS created_utc,
+                      CASE WHEN @rds_utc = 1 THEN CONVERT(datetime2(3), last_updated) ELSE mon.fn_ServerToUtc(last_updated) END AS last_updated_utc,
+                      CASE WHEN @rds_utc = 1 THEN CONVERT(datetime2(3), created_at)   ELSE mon.fn_ServerToUtc(created_at)   END AS created_utc,
                       LEFT(s3_object_arn, 4000) AS arn
                FROM #RdsTasks) AS s
         ON t.task_id = s.task_id
@@ -3455,7 +3491,7 @@ BEGIN
             WHERE v.sev IS NOT NULL;
 
             INSERT #Issue(issue_key, category, severity, is_event, database_name, title, detail)
-            SELECT CONCAT(N'CHECKDB:', h.database_name), 'BACKUP',
+            SELECT CONCAT(N'CHECKDB:', h.database_name), 'INTEGRITY',   /* [5.6.4] database integrity, not a backup */
                    CASE WHEN h.checkdb_age_hours > h.checkdb_max_age_days * 24 * ISNULL(mon.fn_SettingInt('checkdb_crit_factor'), 4)
                         THEN 'CRITICAL' ELSE 'WARNING' END, 0, h.database_name,
                    CONCAT(N'No clean CHECKDB ', CASE WHEN h.checkdb_status = 'NEVER' THEN N'ever recorded'
@@ -3505,7 +3541,7 @@ BEGIN
 
             IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'BACKUPS')
                AND EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'DATABASE_STATE')
-                INSERT #Scope VALUES ('BACKUP');
+                INSERT #Scope VALUES ('BACKUP'), ('INTEGRITY');
         END TRY
         BEGIN CATCH
             INSERT #EvalError VALUES ('BACKUP', ERROR_MESSAGE());
@@ -3522,7 +3558,8 @@ BEGIN
                        SUM(CASE WHEN f.run_start_utc >= DATEADD(HOUR, -@lookback, @now) THEN 1 ELSE 0 END) OVER (PARTITION BY f.job_id) AS fails
                 FROM mon.AgentFailure AS f
                 /* not only the event window: a job whose LAST run failed stays open until it succeeds (max N days) */
-                WHERE f.run_start_utc >= DATEADD(DAY, -ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 7), @now)
+                /* [5.7] default 0 = no age limit: an unscheduled job that failed 7+ days ago is still failed */
+                WHERE f.run_start_utc >= DATEADD(DAY, -ISNULL(NULLIF(mon.fn_SettingInt('job_failure_max_age_days'), 0), 36500), @now)
                   /* the engine itself: cancel by the installer / error 2801 after a redeploy are expected;
                      real engine outages are caught by the ENGINE_STALE watchdog */
                   AND NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
@@ -3540,7 +3577,9 @@ BEGIN
             OUTER APPLY (SELECT TOP (1) r.run_status FROM mon.AgentJobRun AS r
                          WHERE r.job_id = F.job_id ORDER BY r.run_start_utc DESC, r.instance_id DESC) AS last_run
             WHERE F.rn = 1
-              AND (last_run.run_status IN (0, 3) OR F.run_start_utc >= DATEADD(MINUTE, -30, @now));
+              AND (last_run.run_status IN (0, 3) OR F.run_start_utc >= DATEADD(MINUTE, -30, @now))
+              /* [5.7] deleted or disabled job: nothing left to fix -> resolves */
+              AND EXISTS (SELECT 1 FROM msdb.dbo.sysjobs AS sj WHERE sj.job_id = F.job_id AND sj.enabled = 1);
 
             INSERT #Issue(issue_key, category, severity, is_event, title, detail)
             SELECT CONCAT(N'JOBSLA:', j.job_id), 'AGENT',
@@ -3942,6 +3981,7 @@ BEGIN
                t.detail            = s.detail,
                t.ref_id            = s.ref_id,
                t.database_name     = s.database_name,
+               t.category          = s.category,      /* [5.6.4] re-categorised checks move over (CHECKDB -> INTEGRITY) */
                t.is_muted          = s.is_muted,
                t.last_critical_utc = CASE WHEN s.severity = 'CRITICAL' THEN @now ELSE t.last_critical_utc END
         FROM mon.Issue AS t
@@ -4206,6 +4246,69 @@ END;
 GO
 
 /*
+   Everything that is checked on this server, in one call (SSMS grid friendly):
+     1) database matrix with check marks   2) server-level checks
+     3) catalog: what each check does + which setting tunes it   4) last 50 changes (audit)
+*/
+CREATE OR ALTER PROCEDURE mon.usp_ShowChecks
+    @Database sysname = N'%'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @y nchar(1) = NCHAR(10004), @na nvarchar(3) = N'n/a', @def int = ISNULL(mon.fn_SettingInt('backup_retention_target_days'), 7);
+
+    SELECT c.database_name AS [Database],
+           ISNULL(s.recovery_model, N'?') AS [Recovery],
+           CASE WHEN c.monitored = 1 THEN @y ELSE N'' END AS [Monitored],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.full_backup = 1 THEN @y ELSE N'' END AS [Full],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.diff_backup = 1 THEN @y ELSE N'' END AS [Diff],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN ISNULL(s.recovery_model, N'FULL') <> N'FULL' THEN @na
+                WHEN c.log_backup = 1 THEN @y ELSE N'' END AS [Log],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.backup_retention = 1 THEN @y ELSE N'' END AS [Retention],
+           CONCAT(ISNULL(c.retention_days, @def), N'd', CASE WHEN c.retention_days IS NULL THEN N' (default)' END) AS [Retention target],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.checkdb = 1 THEN @y ELSE N'' END AS [CHECKDB],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.log_used = 1 THEN @y ELSE N'' END AS [Log used],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.vlf_count = 1 THEN @y ELSE N'' END AS [VLF],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.file_near_max = 1 THEN @y ELSE N'' END AS [File max],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.config_drift = 1 THEN @y ELSE N'' END AS [Drift],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.config_best_practice = 1 THEN @y ELSE N'' END AS [Config],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.query_store = 1 THEN @y ELSE N'' END AS [Query Store],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.blocking = 1 THEN @y ELSE N'' END AS [Blocking],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.long_queries = 1 THEN @y ELSE N'' END AS [Long queries],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.open_trans = 1 THEN @y ELSE N'' END AS [Open trans],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.deadlocks = 1 THEN @y ELSE N'' END AS [Deadlocks],
+           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.io_latency = 1 THEN @y ELSE N'' END AS [I/O latency],
+           CONCAT(p.full_max_age_minutes, N' / ', p.diff_max_age_minutes, N' / ', p.log_max_age_minutes, N' min') AS [SLA full/diff/log],
+           c.notes AS [Notes],
+           CASE WHEN ISNULL(s.is_present, 1) = 0 THEN N'DROPPED' ELSE N'' END AS [State],
+           c.modified_utc AS [Modified UTC], c.modified_by AS [Modified by]
+    FROM mon.DatabaseCheck AS c
+    LEFT JOIN mon.DatabaseStatus AS s ON s.database_name = c.database_name
+    LEFT JOIN mon.DatabasePolicy AS p ON p.database_name = c.database_name
+    WHERE c.database_name LIKE @Database
+    ORDER BY c.monitored DESC, c.database_name;
+
+    SELECT s.check_code AS [Code], s.display_name AS [Server-level check],
+           CASE WHEN s.is_enabled = 1 THEN @y ELSE N'' END AS [Enabled],
+           k.description AS [What it checks], k.threshold_info AS [Tuned by], s.notes AS [Notes],
+           s.modified_utc AS [Modified UTC], s.modified_by AS [Modified by]
+    FROM mon.ServerCheck AS s
+    JOIN mon.CheckCatalog AS k ON k.check_code = s.check_code
+    ORDER BY k.sort_order;
+
+    SELECT k.check_code AS [Code], k.scope AS [Scope], k.display_name AS [Check], k.column_name AS [DatabaseCheck column],
+           k.description AS [What it checks], k.threshold_info AS [Tuned by], k.key_pattern AS [Issue key pattern]
+    FROM mon.CheckCatalog AS k
+    ORDER BY k.sort_order;
+
+    SELECT TOP (50) l.changed_utc AS [Changed UTC], l.changed_by AS [By], l.host_name AS [Host], l.object_name AS [Object],
+           l.item_name AS [Item], l.property_name AS [Property], l.old_value AS [Old], l.new_value AS [New]
+    FROM mon.CheckChangeLog AS l
+    ORDER BY l.change_log_id DESC;
+END;
+GO
+
+/*
    Switch a check ON/OFF.
      @Database : exact name or LIKE pattern (N'%' = all databases). Ignored for server checks.
      @Check    : check code (FULL, LOG, LONGQ, CPU, ...), column name (long_queries), or 'ALL'
@@ -4281,69 +4384,6 @@ BEGIN
     EXEC mon.usp_CloseDisabledIssues @Closed = @closed OUTPUT;
     PRINT CONCAT(N'Updated ', @n, N' database(s). ', ISNULL(@closed, 0), N' open issue(s) of disabled checks closed now (silently); re-enabled checks are evaluated at the next 5-minute cycle.');
     EXEC mon.usp_ShowChecks @Database = @Database;
-END;
-GO
-
-/*
-   Everything that is checked on this server, in one call (SSMS grid friendly):
-     1) database matrix with check marks   2) server-level checks
-     3) catalog: what each check does + which setting tunes it   4) last 50 changes (audit)
-*/
-CREATE OR ALTER PROCEDURE mon.usp_ShowChecks
-    @Database sysname = N'%'
-AS
-BEGIN
-    SET NOCOUNT ON;
-    DECLARE @y nchar(1) = NCHAR(10004), @na nvarchar(3) = N'n/a', @def int = ISNULL(mon.fn_SettingInt('backup_retention_target_days'), 7);
-
-    SELECT c.database_name AS [Database],
-           ISNULL(s.recovery_model, N'?') AS [Recovery],
-           CASE WHEN c.monitored = 1 THEN @y ELSE N'' END AS [Monitored],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.full_backup = 1 THEN @y ELSE N'' END AS [Full],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.diff_backup = 1 THEN @y ELSE N'' END AS [Diff],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN ISNULL(s.recovery_model, N'FULL') <> N'FULL' THEN @na
-                WHEN c.log_backup = 1 THEN @y ELSE N'' END AS [Log],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.backup_retention = 1 THEN @y ELSE N'' END AS [Retention],
-           CONCAT(ISNULL(c.retention_days, @def), N'd', CASE WHEN c.retention_days IS NULL THEN N' (default)' END) AS [Retention target],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.checkdb = 1 THEN @y ELSE N'' END AS [CHECKDB],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.log_used = 1 THEN @y ELSE N'' END AS [Log used],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.vlf_count = 1 THEN @y ELSE N'' END AS [VLF],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.file_near_max = 1 THEN @y ELSE N'' END AS [File max],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.config_drift = 1 THEN @y ELSE N'' END AS [Drift],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.config_best_practice = 1 THEN @y ELSE N'' END AS [Config],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.query_store = 1 THEN @y ELSE N'' END AS [Query Store],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.blocking = 1 THEN @y ELSE N'' END AS [Blocking],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.long_queries = 1 THEN @y ELSE N'' END AS [Long queries],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.open_trans = 1 THEN @y ELSE N'' END AS [Open trans],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.deadlocks = 1 THEN @y ELSE N'' END AS [Deadlocks],
-           CASE WHEN c.monitored = 0 THEN N'-' WHEN c.io_latency = 1 THEN @y ELSE N'' END AS [I/O latency],
-           CONCAT(p.full_max_age_minutes, N' / ', p.diff_max_age_minutes, N' / ', p.log_max_age_minutes, N' min') AS [SLA full/diff/log],
-           c.notes AS [Notes],
-           CASE WHEN ISNULL(s.is_present, 1) = 0 THEN N'DROPPED' ELSE N'' END AS [State],
-           c.modified_utc AS [Modified UTC], c.modified_by AS [Modified by]
-    FROM mon.DatabaseCheck AS c
-    LEFT JOIN mon.DatabaseStatus AS s ON s.database_name = c.database_name
-    LEFT JOIN mon.DatabasePolicy AS p ON p.database_name = c.database_name
-    WHERE c.database_name LIKE @Database
-    ORDER BY c.monitored DESC, c.database_name;
-
-    SELECT s.check_code AS [Code], s.display_name AS [Server-level check],
-           CASE WHEN s.is_enabled = 1 THEN @y ELSE N'' END AS [Enabled],
-           k.description AS [What it checks], k.threshold_info AS [Tuned by], s.notes AS [Notes],
-           s.modified_utc AS [Modified UTC], s.modified_by AS [Modified by]
-    FROM mon.ServerCheck AS s
-    JOIN mon.CheckCatalog AS k ON k.check_code = s.check_code
-    ORDER BY k.sort_order;
-
-    SELECT k.check_code AS [Code], k.scope AS [Scope], k.display_name AS [Check], k.column_name AS [DatabaseCheck column],
-           k.description AS [What it checks], k.threshold_info AS [Tuned by], k.key_pattern AS [Issue key pattern]
-    FROM mon.CheckCatalog AS k
-    ORDER BY k.sort_order;
-
-    SELECT TOP (50) l.changed_utc AS [Changed UTC], l.changed_by AS [By], l.host_name AS [Host], l.object_name AS [Object],
-           l.item_name AS [Item], l.property_name AS [Property], l.old_value AS [Old], l.new_value AS [New]
-    FROM mon.CheckChangeLog AS l
-    ORDER BY l.change_log_id DESC;
 END;
 GO
 
@@ -4582,7 +4622,9 @@ BEGIN
                          CASE WHEN @status = 'PENDING' THEN 'INFO' WHEN @status = 'NEEDS_FULL' THEN 'NA'
                               ELSE ISNULL(mon.fn_BackupLevel(@status), 'WARN') END), N'<br>') END,
         CASE WHEN @finish_utc IS NOT NULL
-             THEN CONCAT(mon.fn_Nw(CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, @age_min) * 60), N' ago</b>')), N'<br>',
+             THEN CONCAT(mon.fn_Nw(CASE WHEN @age_min < -5   /* [5.7] a time ahead of the clock is a time-zone problem, not a fresh backup */
+                                        THEN CONCAT(mon.fn_Pill(N'TIME AHEAD', 'WARN'), N' ', mon.fn_Duration(CONVERT(bigint, -@age_min) * 60))
+                                        ELSE CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, @age_min) * 60), N' ago</b>') END), N'<br>',
                          mon.fn_Small(mon.fn_Nw(CONCAT(mon.fn_FmtLocal(@finish_utc, @tz), N' &middot; ',
                                              REPLACE(REPLACE(REPLACE(ISNULL(@source, ''), 'DMV_LOG_STATS', 'dmv'),
                                                      'RDS_TASK', 'rds&nbsp;task'), 'RDS_TLOG', 'rds&nbsp;log')))))
@@ -4640,7 +4682,9 @@ BEGIN
             @min_rank int      = mon.fn_SevRank(ISNULL(mon.fn_Setting('alert_min_severity'), N'CRITICAL')),
             @on_resolve bit    = ISNULL(mon.fn_SettingInt('alert_on_resolve'), 1),
             @reminder int      = ISNULL(mon.fn_SettingInt('reminder_minutes'), 0),
-            @suppress int      = ISNULL(mon.fn_SettingInt('realert_suppress_minutes'), 60);
+            @suppress int      = ISNULL(mon.fn_SettingInt('realert_suppress_minutes'), 60),
+            @brief bit         = CASE WHEN ISNULL(mon.fn_Setting('alert_style'), N'BRIEF') = N'FULL' THEN 0 ELSE 1 END,   /* [5.7.1] */
+            @job_rem int       = ISNULL(mon.fn_SettingInt('jobfail_reminder_minutes'), 1440);                              /* [5.7.2] */
 
     /* High-water mark: only changes committed before this point are handled in this pass,
        so a change merged concurrently by another session is never marked SKIPPED unseen. */
@@ -4723,6 +4767,20 @@ BEGIN
               AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@reminder, @now)
               AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
 
+        /* [5.7.2] A failed job is not a one-off: keep mailing it (daily by default) until it succeeds, is disabled,
+           or somebody takes it (usp_AckIssue) / mutes it. Independent of the generic reminder_minutes. */
+        IF @job_rem > 0
+            INSERT #A(change_id, issue_id, kind, severity, change_utc)
+            SELECT NULL, i.issue_id, 'REMINDER', i.severity, @now
+            FROM mon.Issue AS i
+            WHERE i.is_active = 1 AND i.is_muted = 0 AND i.is_event = 0
+              AND i.issue_key LIKE N'JOBFAIL:%'
+              AND mon.fn_SevRank(i.severity) >= @min_rank
+              AND i.ack_utc IS NULL
+              AND i.alert_sent_utc IS NOT NULL
+              AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@job_rem, @now)
+              AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
+
         IF @PreviewOnly = 0
             UPDATE c SET alert_status = 'SKIPPED', alert_utc = @now
             FROM mon.IssueChange AS c
@@ -4751,7 +4809,8 @@ BEGIN
         DECLARE @active_crit int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND severity = 'CRITICAL' AND is_muted = 0),
                 @active_warn int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND severity = 'WARNING' AND is_muted = 0);
 
-        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] ', @worst, N': ', @top_title,
+        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] ',
+                                              CASE WHEN @n_rem = @total THEN N'STILL OPEN' ELSE @worst END, N': ', @top_title,   /* [5.7.2] reminder-only mail */
                                               CASE WHEN @total > 1 THEN CONCAT(N' (+', @total - 1, N' more)') END), 255);
 
         DECLARE @rows_open nvarchar(max), @rows_res nvarchar(max), @rows_ctx nvarchar(max), @body_rows nvarchar(max) = N'';
@@ -4763,8 +4822,8 @@ BEGIN
                    mon.fn_Td(mon.fn_Pill(CASE a.kind WHEN 'OPENED' THEN N'NEW' ELSE a.kind END, 'INFO'), NULL),
                    mon.fn_Td(mon.fn_HtmlEncode(i.category), NULL),
                    mon.fn_Td(CONCAT(N'<b>', mon.fn_HtmlEncode(i.title), N'</b><br>',
-                                    mon.fn_Small(REPLACE(mon.fn_OneLine(i.detail, 1200), N' | ', N'<br>')),
-                                    N'<br>', mon.fn_Small(CONCAT(N'key: ', mon.fn_HtmlEncode(i.issue_key)))), mon.fn_SevLevel(a.severity)),
+                                    mon.fn_Small(REPLACE(mon.fn_OneLine(i.detail, CASE WHEN @brief = 1 THEN 400 ELSE 1200 END), N' | ', N'<br>')),
+                                    CASE WHEN @brief = 0 THEN CONCAT(N'<br>', mon.fn_Small(CONCAT(N'key: ', mon.fn_HtmlEncode(i.issue_key)))) END), mon.fn_SevLevel(a.severity)),
                    mon.fn_Td(mon.fn_HtmlEncode(ISNULL(i.database_name, N'-')), NULL),
                    mon.fn_Td(CONCAT(mon.fn_Nw(mon.fn_FmtLocal(i.first_seen_utc, @tz)), N'<br>',
                                     mon.fn_Small(CONCAT(N'open ', mon.fn_Duration(DATEDIFF(SECOND, i.first_seen_utc, @now))))), NULL),
@@ -4798,6 +4857,7 @@ BEGIN
             FOR XML PATH(''), TYPE
         ).value('(./text())[1]', 'nvarchar(max)');
 
+        IF @brief = 0
         SET @rows_ctx =
         (
             SELECT TOP (15) CONCAT(N'<tr>',
@@ -4827,15 +4887,21 @@ BEGIN
             CASE @worst WHEN 'CRITICAL' THEN '#B91C1C' WHEN 'WARNING' THEN '#B45309' ELSE '#15803D' END,
             CONCAT(@server, N' - SQL Server alert'),
             CASE @worst WHEN 'RESOLVED' THEN N'Resolved' ELSE CONCAT(@worst, N' alert') END,
-            CONCAT(@n_new, N' new &middot; ', @n_esc, N' escalated &middot; ', @n_res, N' resolved',
+            CASE WHEN @brief = 1
+                 THEN CONCAT(mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET'),
+                             CASE WHEN @total > 1 THEN CONCAT(N' &nbsp;|&nbsp; ', @total, N' changes') END)
+                 ELSE CONCAT(@n_new, N' new &middot; ', @n_esc, N' escalated &middot; ', @n_res, N' resolved',
                    CASE WHEN @n_rem > 0 THEN CONCAT(N' &middot; ', @n_rem, N' reminder') END,
                    N' &nbsp;|&nbsp; now active: ', @active_crit, N' critical, ', @active_warn, N' warning',
-                   N' &nbsp;|&nbsp; ', mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET')),
+                   N' &nbsp;|&nbsp; ', mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET')) END,
             @body_rows,
-            CONCAT(N'<b>Change-only alerting.</b> You get mail only when an issue opens, escalates or resolves. ',
+            CASE WHEN @brief = 1
+                 THEN CONCAT(N'Sent only when something changes. Details and all open issues: the daily report, or <code>SELECT * FROM OPS.mon.vw_ActiveIssues;</code> ',
+                             N'&middot; OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.')
+                 ELSE CONCAT(N'<b>Change-only alerting.</b> You get mail only when an issue opens, escalates or resolves. ',
                    N'Mute a known issue: <code>EXEC OPS.mon.usp_MuteIssue @KeyPattern = N''&lt;key&gt;'', @Hours = 8, @Reason = N''...'';</code><br>',
                    N'Live view: <code>SELECT * FROM OPS.mon.vw_ActiveIssues;</code> &middot; blocking chains: <code>OPS.mon.vw_BlockingNow</code><br>',
-                   N'Generated ', CONVERT(nvarchar(19), @now, 120), N' UTC by OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.'));
+                   N'Generated ', CONVERT(nvarchar(19), @now, 120), N' UTC by OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.') END);
 
         IF @PreviewOnly = 1
         BEGIN
@@ -5340,14 +5406,15 @@ BEGIN
             WHERE NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
               AND (f.run_start_utc >= @window_start
                /* older failure of a job whose last run is still failed (e.g. unscheduled job, nobody re-ran it) */
-               OR (f.run_start_utc >= DATEADD(DAY, -ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 7), @now)
+               OR (f.run_start_utc >= DATEADD(DAY, -ISNULL(NULLIF(mon.fn_SettingInt('job_failure_max_age_days'), 0), 36500), @now)
                    AND f.instance_id = (SELECT MAX(r.instance_id) FROM mon.AgentJobRun AS r WHERE r.job_id = f.job_id)))
             ORDER BY f.run_start_utc DESC
             FOR XML PATH(''), TYPE
         ).value('(./text())[1]', 'nvarchar(max)');
         SET @body += mon.fn_Section(CONCAT(N'SQL Agent failures - last ', @lookback, N'h + jobs still failed'),
-            CONCAT(N'All jobs, with the step that actually failed. STILL FAILED = older failure (up to ',
-                   ISNULL(mon.fn_Setting('job_failure_max_age_days'), N'7'), N' days) and the job has not succeeded since.'),
+            CONCAT(N'All jobs, with the step that actually failed. STILL FAILED = older failure and the job has not succeeded since',
+                   CASE WHEN ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 0) > 0
+                        THEN CONCAT(N' (up to ', mon.fn_Setting('job_failure_max_age_days'), N' days)') END, N'.'),
             N'Job|Outcome|Failed step|Started|Duration|Message',
             ISNULL(@rows, mon.fn_EmptyRow(6, N'No failed or cancelled jobs.')));
 
@@ -5818,14 +5885,41 @@ GO
                       full_report_change_only = 1 sends it only when something changed.
                       Empty full_report_hours_local = legacy mode (one change-only digest per day at report_hour_local).
 
+   [5.7] daily_email_mode = AUTO (default since 5.7): ONE scheduled email per day at full_report_hours_local:
+                      everything good (no open, unmuted issue) -> the SHORT summary ("all clear");
+                      anything open                            -> the FULL report.
+                      Nothing changed since the previous daily email -> no email at all (DIGEST_SKIPPED),
+                      except a weekly proof-of-life on heartbeat_weekday (0 = never).
+                      Failures / anomalies are never held for the daily email: usp_SendAlerts mails them
+                      at the next 5-minute cycle (alert_min_severity), once per change.
+                      daily_email_mode = SCHEDULE keeps the separate summary_* / full_report_* schedules.
+
    Issue workflow: OPEN -> ACKNOWLEDGED (usp_AckIssue: someone is on it, no more reminders)
                         -> RESOLVED automatically when the condition clears (or usp_ResolveIssue, manual;
                            re-opens at the next cycle if the condition still exists).
    ============================================================================= */
 
+/* [5.7] one-time switch to the AUTO email policy (first install of 5.7 = daily_email_mode not there yet):
+         daily email every day, brief when all good / full when not, nothing when nothing changed;
+         WARNING and CRITICAL alerts mailed when they happen; no reminders for unchanged issues. */
+IF OBJECT_ID(N'mon.Setting', N'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM mon.Setting WHERE setting_name = 'daily_email_mode')
+BEGIN
+    UPDATE mon.Setting SET setting_value = N'1,2,3,4,5,6,7' WHERE setting_name = 'full_report_weekdays';
+    UPDATE mon.Setting SET setting_value = N'8' WHERE setting_name = 'full_report_hours_local' AND NULLIF(LTRIM(setting_value), N'') IS NULL;
+    UPDATE mon.Setting SET setting_value = N'WARNING' WHERE setting_name = 'alert_min_severity';
+    UPDATE mon.Setting SET setting_value = N'0' WHERE setting_name = 'reminder_minutes';
+    UPDATE mon.Setting SET setting_value = N'0' WHERE setting_name = 'job_failure_max_age_days' AND setting_value = N'7';  /* failed job stays open until it succeeds */
+    PRINT N'5.7 email policy applied: one daily email (brief if all good, full if not, none if nothing changed); WARNING+CRITICAL alerts when they happen; no reminders.';
+END;
+
 INSERT mon.Setting(setting_name, setting_value, value_type, category, description)
 SELECT v.n, v.v, v.t, v.c, v.d
 FROM (VALUES
+    ('daily_email_mode', N'AUTO', 'text', 'email',
+     N'AUTO = one email a day at full_report_hours_local: short summary when everything is good, full report when an issue is open, nothing when nothing changed (weekly heartbeat_weekday still sends). SCHEDULE = separate summary_* and full_report_* schedules.'),
+    ('rds_task_times_utc', N'AUTO', 'text', 'backup',
+     N'Time zone of msdb.dbo.rds_task_status created_at / last_updated. AUTO = detected (a value ahead of the server clock means UTC); 1 = UTC; 0 = server local time.'),
     ('summary_email_hours_local', N'8', 'text', 'email',
      N'Local hours (comma list, 0-23) when the SHORT summary email is sent. Empty = no summary emails.'),
     ('summary_email_weekdays', N'1,2,3,4,5,6,7', 'text', 'email',
@@ -5837,9 +5931,9 @@ FROM (VALUES
     ('summary_skip_when_full', N'1', 'bit', 'email',
      N'1 = do not send the summary in an hour when the full report is sent anyway.'),
     ('full_report_hours_local', N'8', 'text', 'email',
-     N'Local hours (comma list, 0-23) when the FULL report (every monitored item) is sent. Empty = legacy: one change-only digest per day at report_hour_local.'),
-    ('full_report_weekdays', N'1,4', 'text', 'email',
-     N'ISO weekdays for the full report (1 = Monday ... 7 = Sunday). Default Monday and Thursday.'),
+     N'Local hours (comma list, 0-23) when the FULL report (every monitored item) is sent; in AUTO mode the hour of the one daily email. Empty = legacy: one change-only digest per day at report_hour_local.'),
+    ('full_report_weekdays', N'1,2,3,4,5,6,7', 'text', 'email',
+     N'ISO weekdays for the full report / AUTO daily email (1 = Monday ... 7 = Sunday). Default every day.'),
     ('full_report_change_only', N'0', 'bit', 'email',
      N'1 = the scheduled full report is skipped when nothing changed since the previous one; 0 = always sent.'),
     ('retention_perf_days', N'', 'text', 'issues',
@@ -6070,8 +6164,13 @@ BEGIN
         N'<b>Work an issue:</b> <code>EXEC OPS.mon.usp_AckIssue @KeyPattern = N''&lt;key&gt;'', @Note = N''on it'';</code> &middot; ',
         N'after the fix it resolves automatically within 5 minutes (or <code>EXEC OPS.mon.usp_ResolveIssue @KeyPattern = N''&lt;key&gt;'', @Note = N''what was done'';</code>) &middot; ',
         N'known condition: <code>EXEC OPS.mon.usp_MuteIssue</code>.<br>',
-        N'Issue alerts are sent only when something changes. Full report: hours ', ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'(daily digest)'),
-        N', weekdays ', ISNULL(mon.fn_Setting('full_report_weekdays'), N'-'), N'. Run now: <code>EXEC OPS.mon.usp_SendDailyDigest @Force = 1;</code>',
+        CASE WHEN ISNULL(mon.fn_Setting('daily_email_mode'), N'AUTO') = N'AUTO'
+             THEN CONCAT(N'Failures and anomalies are emailed when they happen (once per change). One daily email at ',
+                         ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'8'),
+                         N':00 - this short one when everything is good, the full report when something is open, none when nothing changed. ')
+             ELSE CONCAT(N'Issue alerts are sent only when something changes. Full report: hours ', ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'(daily digest)'),
+                         N', weekdays ', ISNULL(mon.fn_Setting('full_report_weekdays'), N'-'), N'. ') END,
+        N'Full report now: <code>EXEC OPS.mon.usp_SendDailyDigest @Force = 1;</code>',
         N'</div></td></tr></table></body></html>');
 
     IF @PreviewOnly = 1
@@ -6115,6 +6214,38 @@ BEGIN
             @iso_wd int = (DATEPART(WEEKDAY, @local_now) + @@DATEFIRST - 2) % 7 + 1;   /* 1 = Monday */
     DECLARE @full_hours nvarchar(400) = mon.fn_Setting('full_report_hours_local'),
             @full_due bit = 0, @full_sent bit = 0;
+
+    /* [5.7] AUTO: one email per day - brief when all good, full when something is open, none when nothing changed */
+    IF ISNULL(mon.fn_Setting('daily_email_mode'), N'AUTO') = N'AUTO'
+    BEGIN
+        IF mon.fn_InIntList(ISNULL(NULLIF(LTRIM(@full_hours), N''), N'8'), @hour) = 0
+           OR mon.fn_InIntList(ISNULL(mon.fn_Setting('full_report_weekdays'), N'1,2,3,4,5,6,7'), @iso_wd) = 0
+           OR EXISTS (SELECT 1 FROM mon.Notification
+                      WHERE notification_type IN ('DIGEST', 'HEARTBEAT', 'DIGEST_SKIPPED', 'SUMMARY')
+                        AND created_utc >= DATEADD(MINUTE, -50, @now))
+            RETURN;
+
+        DECLARE @last_daily datetime2(0) = (SELECT MAX(created_utc) FROM mon.Notification
+                                            WHERE notification_type IN ('DIGEST', 'HEARTBEAT', 'SUMMARY') AND send_ok = 1);
+        DECLARE @changes int =
+              (SELECT COUNT(*) FROM mon.IssueChange WHERE change_utc > ISNULL(@last_daily, '19000101') AND change_type <> 'EXPIRED')
+            + (SELECT COUNT(*) FROM mon.CheckChangeLog WHERE changed_utc > ISNULL(@last_daily, '19000101'));
+        DECLARE @open int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND is_muted = 0);
+        DECLARE @hb bit = CASE WHEN @iso_wd = ISNULL(mon.fn_SettingInt('heartbeat_weekday'), 1) THEN 1 ELSE 0 END;
+
+        IF @changes = 0 AND @last_daily IS NOT NULL AND @hb = 0
+        BEGIN
+            INSERT mon.Notification(notification_type, created_utc, report_date_local, change_count)
+            VALUES ('DIGEST_SKIPPED', @now, CONVERT(date, @local_now), 0);      /* nothing changed: no email */
+            RETURN;
+        END;
+
+        IF @open = 0
+            EXEC mon.usp_SendSummary;                       /* everything good: brief */
+        ELSE
+            EXEC mon.usp_SendDailyDigest @Force = 1;        /* something open: full report */
+        RETURN;
+    END;
 
     /* FULL REPORT */
     IF NULLIF(LTRIM(@full_hours), N'') IS NULL
@@ -6952,8 +7083,12 @@ GO
    RELEASE GATE: self-test, then resume the engine only if everything is valid.
    ============================================================================= */
 DECLARE @rid int, @since datetime2(0), @prev_engine nvarchar(20), @version varchar(20), @e int, @w int;
-SELECT TOP (1) @rid = release_id, @since = started_server_time, @prev_engine = prev_engine_enabled, @version = version
-FROM mon.ReleaseHistory WHERE status = 'INSTALLING' ORDER BY release_id DESC;
+/* [5.6.3] this install's own row (set at the start of the script); fallback: newest INSTALLING row */
+SET @rid = TRY_CONVERT(int, SESSION_CONTEXT(N'mon_release_id'));
+IF @rid IS NULL OR NOT EXISTS (SELECT 1 FROM mon.ReleaseHistory WHERE release_id = @rid)
+    SELECT TOP (1) @rid = release_id FROM mon.ReleaseHistory WHERE status = 'INSTALLING' ORDER BY release_id DESC;
+SELECT @since = started_server_time, @prev_engine = prev_engine_enabled, @version = version
+FROM mon.ReleaseHistory WHERE release_id = @rid;
 
 EXEC mon.usp_SelfTest @Deep = 1, @Since = @since, @Quiet = 1, @Errors = @e OUTPUT, @Warnings = @w OUTPUT;
 

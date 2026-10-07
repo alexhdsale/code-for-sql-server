@@ -444,14 +444,15 @@ BEGIN
             WHERE NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
               AND (f.run_start_utc >= @window_start
                /* older failure of a job whose last run is still failed (e.g. unscheduled job, nobody re-ran it) */
-               OR (f.run_start_utc >= DATEADD(DAY, -ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 7), @now)
+               OR (f.run_start_utc >= DATEADD(DAY, -ISNULL(NULLIF(mon.fn_SettingInt('job_failure_max_age_days'), 0), 36500), @now)
                    AND f.instance_id = (SELECT MAX(r.instance_id) FROM mon.AgentJobRun AS r WHERE r.job_id = f.job_id)))
             ORDER BY f.run_start_utc DESC
             FOR XML PATH(''), TYPE
         ).value('(./text())[1]', 'nvarchar(max)');
         SET @body += mon.fn_Section(CONCAT(N'SQL Agent failures - last ', @lookback, N'h + jobs still failed'),
-            CONCAT(N'All jobs, with the step that actually failed. STILL FAILED = older failure (up to ',
-                   ISNULL(mon.fn_Setting('job_failure_max_age_days'), N'7'), N' days) and the job has not succeeded since.'),
+            CONCAT(N'All jobs, with the step that actually failed. STILL FAILED = older failure and the job has not succeeded since',
+                   CASE WHEN ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 0) > 0
+                        THEN CONCAT(N' (up to ', mon.fn_Setting('job_failure_max_age_days'), N' days)') END, N'.'),
             N'Job|Outcome|Failed step|Started|Duration|Message',
             ISNULL(@rows, mon.fn_EmptyRow(6, N'No failed or cancelled jobs.')));
 

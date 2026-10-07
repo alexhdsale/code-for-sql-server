@@ -106,7 +106,9 @@ BEGIN
                          CASE WHEN @status = 'PENDING' THEN 'INFO' WHEN @status = 'NEEDS_FULL' THEN 'NA'
                               ELSE ISNULL(mon.fn_BackupLevel(@status), 'WARN') END), N'<br>') END,
         CASE WHEN @finish_utc IS NOT NULL
-             THEN CONCAT(mon.fn_Nw(CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, @age_min) * 60), N' ago</b>')), N'<br>',
+             THEN CONCAT(mon.fn_Nw(CASE WHEN @age_min < -5   /* [5.7] a time ahead of the clock is a time-zone problem, not a fresh backup */
+                                        THEN CONCAT(mon.fn_Pill(N'TIME AHEAD', 'WARN'), N' ', mon.fn_Duration(CONVERT(bigint, -@age_min) * 60))
+                                        ELSE CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, @age_min) * 60), N' ago</b>') END), N'<br>',
                          mon.fn_Small(mon.fn_Nw(CONCAT(mon.fn_FmtLocal(@finish_utc, @tz), N' &middot; ',
                                              REPLACE(REPLACE(REPLACE(ISNULL(@source, ''), 'DMV_LOG_STATS', 'dmv'),
                                                      'RDS_TASK', 'rds&nbsp;task'), 'RDS_TLOG', 'rds&nbsp;log')))))
@@ -164,7 +166,9 @@ BEGIN
             @min_rank int      = mon.fn_SevRank(ISNULL(mon.fn_Setting('alert_min_severity'), N'CRITICAL')),
             @on_resolve bit    = ISNULL(mon.fn_SettingInt('alert_on_resolve'), 1),
             @reminder int      = ISNULL(mon.fn_SettingInt('reminder_minutes'), 0),
-            @suppress int      = ISNULL(mon.fn_SettingInt('realert_suppress_minutes'), 60);
+            @suppress int      = ISNULL(mon.fn_SettingInt('realert_suppress_minutes'), 60),
+            @brief bit         = CASE WHEN ISNULL(mon.fn_Setting('alert_style'), N'BRIEF') = N'FULL' THEN 0 ELSE 1 END,   /* [5.7.1] */
+            @job_rem int       = ISNULL(mon.fn_SettingInt('jobfail_reminder_minutes'), 1440);                              /* [5.7.2] */
 
     /* High-water mark: only changes committed before this point are handled in this pass,
        so a change merged concurrently by another session is never marked SKIPPED unseen. */
@@ -247,6 +251,20 @@ BEGIN
               AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@reminder, @now)
               AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
 
+        /* [5.7.2] A failed job is not a one-off: keep mailing it (daily by default) until it succeeds, is disabled,
+           or somebody takes it (usp_AckIssue) / mutes it. Independent of the generic reminder_minutes. */
+        IF @job_rem > 0
+            INSERT #A(change_id, issue_id, kind, severity, change_utc)
+            SELECT NULL, i.issue_id, 'REMINDER', i.severity, @now
+            FROM mon.Issue AS i
+            WHERE i.is_active = 1 AND i.is_muted = 0 AND i.is_event = 0
+              AND i.issue_key LIKE N'JOBFAIL:%'
+              AND mon.fn_SevRank(i.severity) >= @min_rank
+              AND i.ack_utc IS NULL
+              AND i.alert_sent_utc IS NOT NULL
+              AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@job_rem, @now)
+              AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
+
         IF @PreviewOnly = 0
             UPDATE c SET alert_status = 'SKIPPED', alert_utc = @now
             FROM mon.IssueChange AS c
@@ -275,7 +293,8 @@ BEGIN
         DECLARE @active_crit int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND severity = 'CRITICAL' AND is_muted = 0),
                 @active_warn int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND severity = 'WARNING' AND is_muted = 0);
 
-        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] ', @worst, N': ', @top_title,
+        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] ',
+                                              CASE WHEN @n_rem = @total THEN N'STILL OPEN' ELSE @worst END, N': ', @top_title,   /* [5.7.2] reminder-only mail */
                                               CASE WHEN @total > 1 THEN CONCAT(N' (+', @total - 1, N' more)') END), 255);
 
         DECLARE @rows_open nvarchar(max), @rows_res nvarchar(max), @rows_ctx nvarchar(max), @body_rows nvarchar(max) = N'';
@@ -287,8 +306,8 @@ BEGIN
                    mon.fn_Td(mon.fn_Pill(CASE a.kind WHEN 'OPENED' THEN N'NEW' ELSE a.kind END, 'INFO'), NULL),
                    mon.fn_Td(mon.fn_HtmlEncode(i.category), NULL),
                    mon.fn_Td(CONCAT(N'<b>', mon.fn_HtmlEncode(i.title), N'</b><br>',
-                                    mon.fn_Small(REPLACE(mon.fn_OneLine(i.detail, 1200), N' | ', N'<br>')),
-                                    N'<br>', mon.fn_Small(CONCAT(N'key: ', mon.fn_HtmlEncode(i.issue_key)))), mon.fn_SevLevel(a.severity)),
+                                    mon.fn_Small(REPLACE(mon.fn_OneLine(i.detail, CASE WHEN @brief = 1 THEN 400 ELSE 1200 END), N' | ', N'<br>')),
+                                    CASE WHEN @brief = 0 THEN CONCAT(N'<br>', mon.fn_Small(CONCAT(N'key: ', mon.fn_HtmlEncode(i.issue_key)))) END), mon.fn_SevLevel(a.severity)),
                    mon.fn_Td(mon.fn_HtmlEncode(ISNULL(i.database_name, N'-')), NULL),
                    mon.fn_Td(CONCAT(mon.fn_Nw(mon.fn_FmtLocal(i.first_seen_utc, @tz)), N'<br>',
                                     mon.fn_Small(CONCAT(N'open ', mon.fn_Duration(DATEDIFF(SECOND, i.first_seen_utc, @now))))), NULL),
@@ -322,6 +341,7 @@ BEGIN
             FOR XML PATH(''), TYPE
         ).value('(./text())[1]', 'nvarchar(max)');
 
+        IF @brief = 0
         SET @rows_ctx =
         (
             SELECT TOP (15) CONCAT(N'<tr>',
@@ -351,15 +371,21 @@ BEGIN
             CASE @worst WHEN 'CRITICAL' THEN '#B91C1C' WHEN 'WARNING' THEN '#B45309' ELSE '#15803D' END,
             CONCAT(@server, N' - SQL Server alert'),
             CASE @worst WHEN 'RESOLVED' THEN N'Resolved' ELSE CONCAT(@worst, N' alert') END,
-            CONCAT(@n_new, N' new &middot; ', @n_esc, N' escalated &middot; ', @n_res, N' resolved',
+            CASE WHEN @brief = 1
+                 THEN CONCAT(mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET'),
+                             CASE WHEN @total > 1 THEN CONCAT(N' &nbsp;|&nbsp; ', @total, N' changes') END)
+                 ELSE CONCAT(@n_new, N' new &middot; ', @n_esc, N' escalated &middot; ', @n_res, N' resolved',
                    CASE WHEN @n_rem > 0 THEN CONCAT(N' &middot; ', @n_rem, N' reminder') END,
                    N' &nbsp;|&nbsp; now active: ', @active_crit, N' critical, ', @active_warn, N' warning',
-                   N' &nbsp;|&nbsp; ', mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET')),
+                   N' &nbsp;|&nbsp; ', mon.fn_FmtLocal(@now, @tz), N' ', ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET')) END,
             @body_rows,
-            CONCAT(N'<b>Change-only alerting.</b> You get mail only when an issue opens, escalates or resolves. ',
+            CASE WHEN @brief = 1
+                 THEN CONCAT(N'Sent only when something changes. Details and all open issues: the daily report, or <code>SELECT * FROM OPS.mon.vw_ActiveIssues;</code> ',
+                             N'&middot; OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.')
+                 ELSE CONCAT(N'<b>Change-only alerting.</b> You get mail only when an issue opens, escalates or resolves. ',
                    N'Mute a known issue: <code>EXEC OPS.mon.usp_MuteIssue @KeyPattern = N''&lt;key&gt;'', @Hours = 8, @Reason = N''...'';</code><br>',
                    N'Live view: <code>SELECT * FROM OPS.mon.vw_ActiveIssues;</code> &middot; blocking chains: <code>OPS.mon.vw_BlockingNow</code><br>',
-                   N'Generated ', CONVERT(nvarchar(19), @now, 120), N' UTC by OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.'));
+                   N'Generated ', CONVERT(nvarchar(19), @now, 120), N' UTC by OPS.mon on ', mon.fn_HtmlEncode(@@SERVERNAME), N'.') END);
 
         IF @PreviewOnly = 1
         BEGIN
