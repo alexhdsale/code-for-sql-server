@@ -519,7 +519,8 @@ BEGIN
                        SUM(CASE WHEN f.run_start_utc >= DATEADD(HOUR, -@lookback, @now) THEN 1 ELSE 0 END) OVER (PARTITION BY f.job_id) AS fails
                 FROM mon.AgentFailure AS f
                 /* not only the event window: a job whose LAST run failed stays open until it succeeds (max N days) */
-                WHERE f.run_start_utc >= DATEADD(DAY, -ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 7), @now)
+                /* [5.7] default 0 = no age limit: an unscheduled job that failed 7+ days ago is still failed */
+                WHERE f.run_start_utc >= DATEADD(DAY, -ISNULL(NULLIF(mon.fn_SettingInt('job_failure_max_age_days'), 0), 36500), @now)
                   /* the engine itself: cancel by the installer / error 2801 after a redeploy are expected;
                      real engine outages are caught by the ENGINE_STALE watchdog */
                   AND NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
@@ -537,7 +538,9 @@ BEGIN
             OUTER APPLY (SELECT TOP (1) r.run_status FROM mon.AgentJobRun AS r
                          WHERE r.job_id = F.job_id ORDER BY r.run_start_utc DESC, r.instance_id DESC) AS last_run
             WHERE F.rn = 1
-              AND (last_run.run_status IN (0, 3) OR F.run_start_utc >= DATEADD(MINUTE, -30, @now));
+              AND (last_run.run_status IN (0, 3) OR F.run_start_utc >= DATEADD(MINUTE, -30, @now))
+              /* [5.7] deleted or disabled job: nothing left to fix -> resolves */
+              AND EXISTS (SELECT 1 FROM msdb.dbo.sysjobs AS sj WHERE sj.job_id = F.job_id AND sj.enabled = 1);
 
             INSERT #Issue(issue_key, category, severity, is_event, title, detail)
             SELECT CONCAT(N'JOBSLA:', j.job_id), 'AGENT',
