@@ -2,6 +2,11 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.7.0 — 2026-10-06
+- **Email policy AUTO** (`daily_email_mode`, applied on upgrade): failures and anomalies (WARNING + CRITICAL) are emailed when they happen, once per change, no reminders; **one daily email at 08:00** — the short summary when everything is good, the full report when something is open, **no email when nothing changed** (weekly proof-of-life on `heartbeat_weekday`). `SCHEDULE` keeps the 5.6 behaviour.
+- Fix: a failed Agent job (e.g. unscheduled `_test_job`) was auto-resolved after 7 days although its last run still failed. `job_failure_max_age_days` now defaults to 0 = open until the job succeeds, is disabled or deleted.
+- Fix: RDS native backup task times (`rds_task_status`) are UTC; on an instance with a non-UTC time zone they were shifted into the future ("0s ago" for every FULL backup). Auto-detected (`rds_task_times_utc`), stored rows corrected; a time still ahead of the clock shows **TIME AHEAD** instead of "0s ago".
+
 ## 5.6.4 — 2026-10-06
 - CHECKDB issues are reported under category **INTEGRITY** instead of BACKUP (open issues move over at the next 5-minute cycle).
 
