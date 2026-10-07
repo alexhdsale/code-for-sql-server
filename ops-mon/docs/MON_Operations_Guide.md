@@ -157,7 +157,7 @@ Note: the backup retention report can only look back as far as `retention_backup
 
 Email policy since 5.7 (`daily_email_mode = AUTO`, applied automatically on upgrade):
 
-- **Failures and anomalies:** emailed **when they happen** — WARNING and CRITICAL (`alert_min_severity = WARNING`), once per change (opened / escalated / resolved). No reminders for an unchanged issue (`reminder_minutes = 0`).
+- **Failures and anomalies:** a **brief** mail (`alert_style = BRIEF`: just the failure, nothing else) emailed **when they happen** — WARNING and CRITICAL (`alert_min_severity = WARNING`), once per change (opened / escalated / resolved). No reminders for an unchanged issue (`reminder_minutes = 0`).
 - **One daily email at 08:00** (`full_report_hours_local`, every day):
   - everything good (no open, unmuted issue) → the **short summary** ("All clear");
   - something open → the **full report**;
@@ -173,6 +173,7 @@ Email policy since 5.7 (`daily_email_mode = AUTO`, applied automatically on upgr
 | `summary_recipients` | (empty) | summary only |
 | `daily_email_mode` | `AUTO` | AUTO = one daily email: short when all good, full when something is open, none when nothing changed. SCHEDULE = separate summary / full schedules |
 | `alert_min_severity` | `WARNING` (5.7) | `CRITICAL` = alert only on critical; warnings then wait for the daily email |
+| `alert_style` | `BRIEF` | BRIEF = the alert mail shows only the failure / resolution itself (one line per issue, short detail). FULL = adds the "still active" context table, active counts and issue keys |
 | `alert_on_resolve` | 1 | send a RESOLVED email for issues that were alerted |
 | `reminder_minutes` | 0 | re-send still-open, **not acknowledged** CRITICAL issues every N minutes (0 = off) |
 | `summary_email_hours_local` | `8` | comma list of hours 0–23; empty = no summary |
