@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.6.3 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.6.4 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -28,6 +28,7 @@
              5.6.2: no msdb.dbo.syssessions anywhere (Msg 229 on RDS): installer engine check, JOBLONG running-job list.
              5.6.3: object order (no "depends on the missing object" message); release gate finds its own
                     ReleaseHistory row via SESSION_CONTEXT, so the history records COMPLETED reliably.
+             5.6.4: CHECKDB issues are category INTEGRITY (were BACKUP).
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -171,7 +172,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.6.3';
+DECLARE @version varchar(20) = '5.6.4';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
@@ -3463,7 +3464,7 @@ BEGIN
             WHERE v.sev IS NOT NULL;
 
             INSERT #Issue(issue_key, category, severity, is_event, database_name, title, detail)
-            SELECT CONCAT(N'CHECKDB:', h.database_name), 'BACKUP',
+            SELECT CONCAT(N'CHECKDB:', h.database_name), 'INTEGRITY',   /* [5.6.4] database integrity, not a backup */
                    CASE WHEN h.checkdb_age_hours > h.checkdb_max_age_days * 24 * ISNULL(mon.fn_SettingInt('checkdb_crit_factor'), 4)
                         THEN 'CRITICAL' ELSE 'WARNING' END, 0, h.database_name,
                    CONCAT(N'No clean CHECKDB ', CASE WHEN h.checkdb_status = 'NEVER' THEN N'ever recorded'
@@ -3513,7 +3514,7 @@ BEGIN
 
             IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'BACKUPS')
                AND EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'DATABASE_STATE')
-                INSERT #Scope VALUES ('BACKUP');
+                INSERT #Scope VALUES ('BACKUP'), ('INTEGRITY');
         END TRY
         BEGIN CATCH
             INSERT #EvalError VALUES ('BACKUP', ERROR_MESSAGE());
@@ -3950,6 +3951,7 @@ BEGIN
                t.detail            = s.detail,
                t.ref_id            = s.ref_id,
                t.database_name     = s.database_name,
+               t.category          = s.category,      /* [5.6.4] re-categorised checks move over (CHECKDB -> INTEGRITY) */
                t.is_muted          = s.is_muted,
                t.last_critical_utc = CASE WHEN s.severity = 'CRITICAL' THEN @now ELSE t.last_critical_utc END
         FROM mon.Issue AS t
