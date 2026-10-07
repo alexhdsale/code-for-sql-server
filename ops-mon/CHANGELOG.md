@@ -2,6 +2,9 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.6.4 — 2026-10-06
+- CHECKDB issues are reported under category **INTEGRITY** instead of BACKUP (open issues move over at the next 5-minute cycle).
+
 ## 5.6.3 — 2026-10-06
 - `usp_ShowChecks` is created before `usp_SetCheck` — no more "depends on the missing object" message during install.
 - Release gate finds this install's `ReleaseHistory` row through `SESSION_CONTEXT` (the previous run was reported as "previous: none"); the start message shows the last version even if it was not recorded as COMPLETED.
