@@ -452,7 +452,7 @@ BEGIN
             WHERE v.sev IS NOT NULL;
 
             INSERT #Issue(issue_key, category, severity, is_event, database_name, title, detail)
-            SELECT CONCAT(N'CHECKDB:', h.database_name), 'BACKUP',
+            SELECT CONCAT(N'CHECKDB:', h.database_name), 'INTEGRITY',   /* [5.6.4] database integrity, not a backup */
                    CASE WHEN h.checkdb_age_hours > h.checkdb_max_age_days * 24 * ISNULL(mon.fn_SettingInt('checkdb_crit_factor'), 4)
                         THEN 'CRITICAL' ELSE 'WARNING' END, 0, h.database_name,
                    CONCAT(N'No clean CHECKDB ', CASE WHEN h.checkdb_status = 'NEVER' THEN N'ever recorded'
@@ -502,7 +502,7 @@ BEGIN
 
             IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'BACKUPS')
                AND EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'DATABASE_STATE')
-                INSERT #Scope VALUES ('BACKUP');
+                INSERT #Scope VALUES ('BACKUP'), ('INTEGRITY');
         END TRY
         BEGIN CATCH
             INSERT #EvalError VALUES ('BACKUP', ERROR_MESSAGE());
@@ -939,6 +939,7 @@ BEGIN
                t.detail            = s.detail,
                t.ref_id            = s.ref_id,
                t.database_name     = s.database_name,
+               t.category          = s.category,      /* [5.6.4] re-categorised checks move over (CHECKDB -> INTEGRITY) */
                t.is_muted          = s.is_muted,
                t.last_critical_utc = CASE WHEN s.severity = 'CRITICAL' THEN @now ELSE t.last_critical_utc END
         FROM mon.Issue AS t
