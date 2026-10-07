@@ -49,9 +49,11 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Data
 # [rev 5.7] High-DPI: declare per-monitor awareness BEFORE the first window, otherwise Windows scales the
 # fonts but not the fixed-size controls (clipped buttons, tiny text boxes, tiny tab headers).
+# SYSTEM DPI aware (not per-monitor): native controls (TextBox, TabControl) and GDI+ text then use the same DPI,
+# so fonts and control sizes stay proportional; on a second monitor with another scale Windows stretches the window.
 try {
     Add-Type -Namespace MonUi -Name Dpi -MemberDefinition '[DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);' -ErrorAction Stop
-    [void][MonUi.Dpi]::SetProcessDpiAwareness(2)      # 2 = PROCESS_PER_MONITOR_DPI_AWARE
+    [void][MonUi.Dpi]::SetProcessDpiAwareness(1)      # 1 = PROCESS_SYSTEM_DPI_AWARE
 } catch { try { Add-Type -Namespace MonUi -Name Dpi2 -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'; [void][MonUi.Dpi2]::SetProcessDPIAware() } catch { } }
 [System.Windows.Forms.Application]::EnableVisualStyles()
 # (SetCompatibleTextRenderingDefault is NOT called: it throws when the script is re-run in the same console / ISE session.)
@@ -95,11 +97,6 @@ $BadgeOff   = [System.Drawing.Color]::FromArgb(220, 38, 38)     # red    = disab
 $BadgeNA    = [System.Drawing.Color]::FromArgb(156, 163, 175)   # grey   = not defined / not applicable
 $BadgeEdit  = [System.Drawing.Color]::FromArgb(245, 158, 11)    # orange frame = changed, not applied
 $BadgeSel   = [System.Drawing.Color]::FromArgb(37, 99, 235)     # blue frame = selected
-$UiFont     = New-Object System.Drawing.Font('Segoe UI', 9.75)
-$UiBold     = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Drawing.FontStyle]::Bold)
-$UiSmall    = New-Object System.Drawing.Font('Segoe UI', 8.75)
-$GridFont   = New-Object System.Drawing.Font('Segoe UI', 9.25)
-$GridBold   = New-Object System.Drawing.Font('Segoe UI', 9.25, [System.Drawing.FontStyle]::Bold)
 $ColPanel   = [System.Drawing.Color]::FromArgb(243, 244, 246)   # light grey tool bars
 $ColBorder  = [System.Drawing.Color]::FromArgb(209, 213, 219)
 $ColText    = [System.Drawing.Color]::FromArgb(31, 41, 55)
@@ -110,6 +107,17 @@ $ColAccent  = [System.Drawing.Color]::FromArgb(37, 99, 235)
 $script:Scale = 1.0
 try { $gfx = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:Scale = [double]$gfx.DpiX / 96.0; $gfx.Dispose() } catch { }
 function S([double]$Px) { return [int][Math]::Round($Px * $script:Scale) }
+# Fonts in PIXELS (scaled with S) - identical size in every control type, whatever Windows thinks the DPI is.
+function New-UiFont([double]$Px, [bool]$Bold = $false) {
+    $style = if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
+    return New-Object System.Drawing.Font('Segoe UI', [single](S $Px), $style, [System.Drawing.GraphicsUnit]::Pixel)
+}
+$UiFont     = New-UiFont 13
+$UiBold     = New-UiFont 13 $true
+$UiSmall    = New-UiFont 12
+$GridFont   = New-UiFont 12.5
+$GridBold   = New-UiFont 12.5 $true
+$script:LineH = [System.Windows.Forms.TextRenderer]::MeasureText('Xg', $GridBold).Height
 
 # --------------------------------------------------------------------------------------------
 #  Data access
@@ -291,7 +299,7 @@ function New-Grid([bool]$ReadOnly) {
     $g.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding((S 6), 0, (S 6), 0)
     $g.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(219, 234, 254)
     $g.DefaultCellStyle.SelectionForeColor = $ColText
-    $g.RowTemplate.Height = S 26
+    $g.RowTemplate.Height = $script:LineH + (S 10)
     $g.EnableHeadersVisualStyles = $false
     $g.ColumnHeadersDefaultCellStyle.BackColor = $ColHeader
     $g.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
@@ -301,7 +309,7 @@ function New-Grid([bool]$ReadOnly) {
     $g.ColumnHeadersDefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding((S 6), (S 4), (S 6), (S 4))
     $g.ColumnHeadersDefaultCellStyle.WrapMode = 'True'
     $g.ColumnHeadersHeightSizeMode = 'DisableResizing'
-    $g.ColumnHeadersHeight = S 46            # room for two header lines at every DPI
+    $g.ColumnHeadersHeight = 2 * $script:LineH + (S 12)      # room for two header lines at every DPI
     $g.ColumnHeadersBorderStyle = 'None'
     $g.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(249, 250, 251)
     # Double buffering (smooth scrolling of wide grids)
@@ -647,15 +655,8 @@ $BtnConnect = New-ToolButton 'Connect' $top $true
 $BtnConnect.Margin = New-Object System.Windows.Forms.Padding((S 14), 0, 0, 0)
 $ChkWin.Add_CheckedChanged({ $script:TxtLogin.Enabled = -not $script:ChkWin.Checked; $script:TxtPwd.Enabled = -not $script:ChkWin.Checked })
 
-# --- action bar: buttons on the left, colour legend on the right ---
-$barHost = New-Object System.Windows.Forms.TableLayoutPanel
-$barHost.Dock = 'Top'; $barHost.Height = S 46; $barHost.ColumnCount = 2; $barHost.RowCount = 1
-$barHost.BackColor = $ColPanel
-[void]$barHost.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-[void]$barHost.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
-$bar = New-Object System.Windows.Forms.FlowLayoutPanel
-$bar.Dock = 'Fill'; $bar.WrapContents = $false; $bar.BackColor = $ColPanel
-$bar.Padding = New-Object System.Windows.Forms.Padding((S 10), (S 7), 0, 0)
+# --- action bar ---
+$bar = New-ToolBar 46
 [void](New-FieldLabel 'Filter' $bar)
 $script:TxtFilter = New-Field 200 $bar
 $TxtFilter.Margin = New-Object System.Windows.Forms.Padding(0, (S 2), (S 14), 0)
@@ -669,36 +670,10 @@ $BtnApply.Margin = New-Object System.Windows.Forms.Padding((S 14), 0, 0, 0)
 $BtnApply.Enabled = $false; $BtnDiscard.Enabled = $false
 $BtnApply.Add_EnabledChanged({ param($s, $e) if ($s.Enabled) { $s.BackColor = $ColAccent; $s.FlatAppearance.BorderColor = $ColAccent } else { $s.BackColor = [System.Drawing.Color]::FromArgb(191, 219, 254); $s.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(191, 219, 254) } })
 $BtnApply.BackColor = [System.Drawing.Color]::FromArgb(191, 219, 254); $BtnApply.FlatAppearance.BorderColor = $BtnApply.BackColor
-
-$legend = New-Object System.Windows.Forms.FlowLayoutPanel
-$legend.AutoSize = $true; $legend.WrapContents = $false; $legend.BackColor = $ColPanel; $legend.Anchor = 'Right'
-$legend.Padding = New-Object System.Windows.Forms.Padding(0, (S 9), (S 10), 0)
-function Add-LegendChip([string]$Text, [System.Drawing.Color]$Color, [string]$Caption) {
-    $chip = New-Object System.Windows.Forms.Label
-    $chip.Text = $Text; $chip.AutoSize = $false; $chip.TextAlign = 'MiddleCenter'
-    $chip.Size = New-Object System.Drawing.Size((S 44), (S 20)); $chip.Font = $UiSmall
-    $chip.BackColor = $Color; $chip.ForeColor = [System.Drawing.Color]::White
-    $chip.Margin = New-Object System.Windows.Forms.Padding((S 10), (S 2), (S 4), 0)
-    $cap = New-Object System.Windows.Forms.Label
-    $cap.Text = $Caption; $cap.AutoSize = $true; $cap.Font = $UiSmall; $cap.ForeColor = $ColMuted
-    $cap.Margin = New-Object System.Windows.Forms.Padding(0, (S 4), 0, 0)
-    $legend.Controls.Add($chip); $legend.Controls.Add($cap)
-}
-Add-LegendChip 'ON'  $BadgeOn  'enabled'
-Add-LegendChip 'OFF' $BadgeOff 'disabled'
-Add-LegendChip 'n/a' $BadgeNA  'not defined / not applicable'
-$chgChip = New-Object System.Windows.Forms.Label
-$chgChip.Text = 'ON *'; $chgChip.AutoSize = $false; $chgChip.TextAlign = 'MiddleCenter'; $chgChip.Font = $UiSmall
-$chgChip.Size = New-Object System.Drawing.Size((S 44), (S 20)); $chgChip.BackColor = $BadgeOn; $chgChip.ForeColor = [System.Drawing.Color]::White
-$chgChip.Margin = New-Object System.Windows.Forms.Padding((S 10), (S 2), (S 4), 0)
-$chgChip.Add_Paint({ param($s, $e) $pen = New-Object System.Drawing.Pen($BadgeEdit, (S 2)); $e.Graphics.DrawRectangle($pen, 1, 1, $s.Width - 3, $s.Height - 3); $pen.Dispose() })
-$chgCap = New-Object System.Windows.Forms.Label; $chgCap.Text = 'changed, not applied'; $chgCap.AutoSize = $true; $chgCap.Font = $UiSmall; $chgCap.ForeColor = $ColMuted
-$chgCap.Margin = New-Object System.Windows.Forms.Padding(0, (S 4), 0, 0)
-$legend.Controls.Add($chgChip); $legend.Controls.Add($chgCap)
-$legendTip = New-Object System.Windows.Forms.ToolTip
-$legendTip.SetToolTip($legend, 'Click a badge to toggle it. Select several cells and use Check / Uncheck selected for bulk changes. Ctrl+S = APPLY.')
-$barHost.Controls.Add($bar, 0, 0)
-$barHost.Controls.Add($legend, 1, 0)
+$barTip = New-Object System.Windows.Forms.ToolTip
+$barTip.SetToolTip($BtnOn,  'Set every selected badge to ON (select cells with the mouse, Shift / Ctrl for ranges)')
+$barTip.SetToolTip($BtnOff, 'Set every selected badge to OFF')
+$barTip.SetToolTip($BtnApply, 'Write all changes in one transaction (Ctrl+S). Disabled checks close their open issues immediately.')
 
 $sep = New-Object System.Windows.Forms.Panel; $sep.Dock = 'Top'; $sep.Height = 1; $sep.BackColor = $ColBorder
 
@@ -763,13 +738,28 @@ $status.Padding = New-Object System.Windows.Forms.Padding((S 10), (S 3), (S 10),
 $script:StatusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
 $StatusLabel.Text = 'Not connected.'; $StatusLabel.ForeColor = $ColText; $StatusLabel.Spring = $true; $StatusLabel.TextAlign = 'MiddleLeft'
 [void]$status.Items.Add($StatusLabel)
+# colour legend (right side of the status bar - never collides with the buttons)
+function Add-LegendChip([string]$Text, [System.Drawing.Color]$Color, [string]$Caption) {
+    $chip = New-Object System.Windows.Forms.ToolStripStatusLabel
+    $chip.Text = $Text; $chip.BackColor = $Color; $chip.ForeColor = [System.Drawing.Color]::White; $chip.Font = $UiSmall
+    $chip.Padding = New-Object System.Windows.Forms.Padding((S 6), 0, (S 6), 0)
+    $chip.Margin = New-Object System.Windows.Forms.Padding((S 10), (S 2), (S 2), (S 2))
+    $cap = New-Object System.Windows.Forms.ToolStripStatusLabel
+    $cap.Text = $Caption; $cap.ForeColor = $ColMuted; $cap.Font = $UiSmall
+    [void]$status.Items.Add($chip); [void]$status.Items.Add($cap)
+}
+Add-LegendChip 'ON'   $BadgeOn   'enabled'
+Add-LegendChip 'OFF'  $BadgeOff  'disabled'
+Add-LegendChip 'n/a'  $BadgeNA   'not defined / not applicable'
+Add-LegendChip 'ON *' $BadgeEdit 'changed, not applied'
 $dpiLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
-$dpiLabel.Text = ('{0:P0}' -f $script:Scale); $dpiLabel.ForeColor = $ColMuted
+$dpiLabel.Text = ('scale {0:P0}' -f $script:Scale); $dpiLabel.ForeColor = $ColMuted; $dpiLabel.Font = $UiSmall
+$dpiLabel.Margin = New-Object System.Windows.Forms.Padding((S 14), 0, 0, 0)
 [void]$status.Items.Add($dpiLabel)
 
 $Form.Controls.Add($tabHost)
 $Form.Controls.Add($sep)
-$Form.Controls.Add($barHost)
+$Form.Controls.Add($bar)
 $Form.Controls.Add($top)
 $Form.Controls.Add($status)
 
