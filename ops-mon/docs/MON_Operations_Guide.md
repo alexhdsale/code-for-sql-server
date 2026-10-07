@@ -175,6 +175,7 @@ Email policy since 5.7 (`daily_email_mode = AUTO`, applied automatically on upgr
 | `alert_min_severity` | `WARNING` (5.7) | `CRITICAL` = alert only on critical; warnings then wait for the daily email |
 | `alert_style` | `BRIEF` | BRIEF = the alert mail shows only the failure / resolution itself (one line per issue, short detail). FULL = adds the "still active" context table, active counts and issue keys |
 | `alert_on_resolve` | 1 | send a RESOLVED email for issues that were alerted |
+| `jobfail_reminder_minutes` | 1440 | a failed Agent job is re-mailed every N minutes (subject STILL OPEN) until it succeeds, is disabled/deleted, or is acknowledged / muted; 0 = mail once |
 | `reminder_minutes` | 0 | re-send still-open, **not acknowledged** CRITICAL issues every N minutes (0 = off) |
 | `summary_email_hours_local` | `8` | comma list of hours 0–23; empty = no summary |
 | `summary_email_weekdays` | `1,2,3,4,5,6,7` | ISO weekdays (1 = Monday) |
