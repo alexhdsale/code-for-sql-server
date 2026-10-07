@@ -167,7 +167,8 @@ BEGIN
             @on_resolve bit    = ISNULL(mon.fn_SettingInt('alert_on_resolve'), 1),
             @reminder int      = ISNULL(mon.fn_SettingInt('reminder_minutes'), 0),
             @suppress int      = ISNULL(mon.fn_SettingInt('realert_suppress_minutes'), 60),
-            @brief bit         = CASE WHEN ISNULL(mon.fn_Setting('alert_style'), N'BRIEF') = N'FULL' THEN 0 ELSE 1 END;   /* [5.7.1] */
+            @brief bit         = CASE WHEN ISNULL(mon.fn_Setting('alert_style'), N'BRIEF') = N'FULL' THEN 0 ELSE 1 END,   /* [5.7.1] */
+            @job_rem int       = ISNULL(mon.fn_SettingInt('jobfail_reminder_minutes'), 1440);                              /* [5.7.2] */
 
     /* High-water mark: only changes committed before this point are handled in this pass,
        so a change merged concurrently by another session is never marked SKIPPED unseen. */
@@ -250,6 +251,20 @@ BEGIN
               AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@reminder, @now)
               AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
 
+        /* [5.7.2] A failed job is not a one-off: keep mailing it (daily by default) until it succeeds, is disabled,
+           or somebody takes it (usp_AckIssue) / mutes it. Independent of the generic reminder_minutes. */
+        IF @job_rem > 0
+            INSERT #A(change_id, issue_id, kind, severity, change_utc)
+            SELECT NULL, i.issue_id, 'REMINDER', i.severity, @now
+            FROM mon.Issue AS i
+            WHERE i.is_active = 1 AND i.is_muted = 0 AND i.is_event = 0
+              AND i.issue_key LIKE N'JOBFAIL:%'
+              AND mon.fn_SevRank(i.severity) >= @min_rank
+              AND i.ack_utc IS NULL
+              AND i.alert_sent_utc IS NOT NULL
+              AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@job_rem, @now)
+              AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
+
         IF @PreviewOnly = 0
             UPDATE c SET alert_status = 'SKIPPED', alert_utc = @now
             FROM mon.IssueChange AS c
@@ -278,7 +293,8 @@ BEGIN
         DECLARE @active_crit int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND severity = 'CRITICAL' AND is_muted = 0),
                 @active_warn int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND severity = 'WARNING' AND is_muted = 0);
 
-        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] ', @worst, N': ', @top_title,
+        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] ',
+                                              CASE WHEN @n_rem = @total THEN N'STILL OPEN' ELSE @worst END, N': ', @top_title,   /* [5.7.2] reminder-only mail */
                                               CASE WHEN @total > 1 THEN CONCAT(N' (+', @total - 1, N' more)') END), 255);
 
         DECLARE @rows_open nvarchar(max), @rows_res nvarchar(max), @rows_ctx nvarchar(max), @body_rows nvarchar(max) = N'';
