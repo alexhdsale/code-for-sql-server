@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    MON Check Editor - checkbox editor for OPS.mon (rev 5.2) monitoring on MS-APP-STG.
+    MON Check Editor - check matrix editor for OPS.mon (rev 5.7) monitoring on MS-APP-STG.
 
 .DESCRIPTION
     Windows GUI (WinForms) for the DBA:
@@ -47,7 +47,14 @@ if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Data
+# [rev 5.7] High-DPI: declare per-monitor awareness BEFORE the first window, otherwise Windows scales the
+# fonts but not the fixed-size controls (clipped buttons, tiny text boxes, tiny tab headers).
+try {
+    Add-Type -Namespace MonUi -Name Dpi -MemberDefinition '[DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);' -ErrorAction Stop
+    [void][MonUi.Dpi]::SetProcessDpiAwareness(2)      # 2 = PROCESS_PER_MONITOR_DPI_AWARE
+} catch { try { Add-Type -Namespace MonUi -Name Dpi2 -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'; [void][MonUi.Dpi2]::SetProcessDPIAware() } catch { } }
 [System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 
 # --------------------------------------------------------------------------------------------
 #  State
@@ -88,8 +95,21 @@ $BadgeOff   = [System.Drawing.Color]::FromArgb(220, 38, 38)     # red    = disab
 $BadgeNA    = [System.Drawing.Color]::FromArgb(156, 163, 175)   # grey   = not defined / not applicable
 $BadgeEdit  = [System.Drawing.Color]::FromArgb(245, 158, 11)    # orange frame = changed, not applied
 $BadgeSel   = [System.Drawing.Color]::FromArgb(37, 99, 235)     # blue frame = selected
-$UiFont     = New-Object System.Drawing.Font('Segoe UI', 9)
-$UiBold     = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$UiFont     = New-Object System.Drawing.Font('Segoe UI', 9.75)
+$UiBold     = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Drawing.FontStyle]::Bold)
+$UiSmall    = New-Object System.Drawing.Font('Segoe UI', 8.75)
+$GridFont   = New-Object System.Drawing.Font('Segoe UI', 9.25)
+$GridBold   = New-Object System.Drawing.Font('Segoe UI', 9.25, [System.Drawing.FontStyle]::Bold)
+$ColPanel   = [System.Drawing.Color]::FromArgb(243, 244, 246)   # light grey tool bars
+$ColBorder  = [System.Drawing.Color]::FromArgb(209, 213, 219)
+$ColText    = [System.Drawing.Color]::FromArgb(31, 41, 55)
+$ColMuted   = [System.Drawing.Color]::FromArgb(107, 114, 128)
+$ColAccent  = [System.Drawing.Color]::FromArgb(37, 99, 235)
+
+# Everything that has a fixed pixel size goes through S() so the layout is identical at 100 % / 125 % / 150 % / 200 %.
+$script:Scale = 1.0
+try { $gfx = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:Scale = [double]$gfx.DpiX / 96.0; $gfx.Dispose() } catch { }
+function S([double]$Px) { return [int][Math]::Round($Px * $script:Scale) }
 
 # --------------------------------------------------------------------------------------------
 #  Data access
@@ -260,17 +280,29 @@ function New-Grid([bool]$ReadOnly) {
     $g.AllowUserToDeleteRows = $false
     $g.ReadOnly = $ReadOnly
     $g.SelectionMode = 'CellSelect'
-    $g.RowHeadersWidth = 24
+    $g.RowHeadersVisible = $false
     $g.AutoSizeColumnsMode = 'DisplayedCells'
     $g.BackgroundColor = [System.Drawing.Color]::White
     $g.BorderStyle = 'None'
-    $g.Font = $UiFont
+    $g.CellBorderStyle = 'SingleHorizontal'
+    $g.GridColor = [System.Drawing.Color]::FromArgb(229, 231, 235)
+    $g.Font = $GridFont
+    $g.DefaultCellStyle.ForeColor = $ColText
+    $g.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding((S 6), 0, (S 6), 0)
+    $g.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(219, 234, 254)
+    $g.DefaultCellStyle.SelectionForeColor = $ColText
+    $g.RowTemplate.Height = S 26
     $g.EnableHeadersVisualStyles = $false
     $g.ColumnHeadersDefaultCellStyle.BackColor = $ColHeader
     $g.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
-    $g.ColumnHeadersDefaultCellStyle.Font = $UiBold
-    $g.ColumnHeadersHeightSizeMode = 'AutoSize'
+    $g.ColumnHeadersDefaultCellStyle.SelectionBackColor = $ColHeader
+    $g.ColumnHeadersDefaultCellStyle.Font = $GridBold
+    $g.ColumnHeadersDefaultCellStyle.Alignment = 'MiddleLeft'
+    $g.ColumnHeadersDefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding((S 6), (S 4), (S 6), (S 4))
     $g.ColumnHeadersDefaultCellStyle.WrapMode = 'True'
+    $g.ColumnHeadersHeightSizeMode = 'DisableResizing'
+    $g.ColumnHeadersHeight = S 46            # room for two header lines at every DPI
+    $g.ColumnHeadersBorderStyle = 'None'
     $g.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(249, 250, 251)
     # Double buffering (smooth scrolling of wide grids)
     $prop = $g.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
@@ -285,10 +317,25 @@ function Set-ReadOnlyColumns([System.Windows.Forms.DataGridView]$Grid, [string]$
         if (-not $editable) { $col.DefaultCellStyle.ForeColor = [System.Drawing.Color]::FromArgb(55, 65, 81) }
         if ($col -is [System.Windows.Forms.DataGridViewCheckBoxColumn]) {
             $col.AutoSizeMode = 'None'
-            $col.Width = 70
+            $col.Width = S 84
             $col.ReadOnly = $true          # toggled by our click handler, painted as a colored badge
             $col.SortMode = 'Automatic'
+            $col.HeaderCell.Style.Alignment = 'MiddleCenter'
         }
+    }
+}
+
+# [rev 5.7] Badge columns: as wide as the longest word of their header (wrapped to two lines), never clipped.
+function Set-BadgeColumnWidths([System.Windows.Forms.DataGridView]$Grid) {
+    foreach ($col in $Grid.Columns) {
+        if (-not ($col -is [System.Windows.Forms.DataGridViewCheckBoxColumn])) { continue }
+        $w = S 84
+        foreach ($word in ([string]$col.HeaderText -split '\s+')) {
+            if (-not $word) { continue }
+            $m = [System.Windows.Forms.TextRenderer]::MeasureText($word, $GridBold).Width + (S 18)
+            if ($m -gt $w) { $w = $m }
+        }
+        $col.Width = $w
     }
 }
 
@@ -398,6 +445,8 @@ ORDER BY k.sort_order;
         $h['last_checkdb'].HeaderText = 'Last good CHECKDB'
         $h['last_checkdb'].ToolTipText = 'Newest of DATABASEPROPERTYEX LastGoodCheckDbTime / DBCC DBINFO / Ola CommandLog DBCC_CHECKDB.'
         $h['checkdb_source'].HeaderText = 'CHECKDB source'
+        $h['database_name'].DefaultCellStyle.Font = $GridBold
+        foreach ($key in @('db','server')) { Set-BadgeColumnWidths $script:Grids[$key] }
         Invoke-ApplyFilter
     } finally {
         $script:Loading = $false
@@ -535,95 +584,192 @@ function Save-Config {
 # --------------------------------------------------------------------------------------------
 $script:Form = New-Object System.Windows.Forms.Form
 $Form.Text = 'MON Check Editor - OPS.mon'
-$Form.Size = New-Object System.Drawing.Size(1480, 860)
+$Form.AutoScaleMode = 'None'            # we scale explicitly with S()
+$Form.Size = New-Object System.Drawing.Size((S 1500), (S 880))
+$Form.MinimumSize = New-Object System.Drawing.Size((S 1100), (S 600))
 $Form.StartPosition = 'CenterScreen'
 $Form.Font = $UiFont
+$Form.BackColor = [System.Drawing.Color]::White
 $Form.KeyPreview = $true
 
+function New-ToolBar([int]$Height) {
+    $p = New-Object System.Windows.Forms.FlowLayoutPanel
+    $p.Dock = 'Top'; $p.Height = S $Height; $p.WrapContents = $false; $p.AutoSize = $false
+    $p.Padding = New-Object System.Windows.Forms.Padding((S 10), (S 7), (S 10), 0)
+    $p.BackColor = $ColPanel
+    return $p
+}
+function New-FieldLabel([string]$Text, [System.Windows.Forms.Control]$Parent) {
+    $l = New-Object System.Windows.Forms.Label; $l.Text = $Text; $l.AutoSize = $true; $l.ForeColor = $ColText
+    $l.Margin = New-Object System.Windows.Forms.Padding((S 10), (S 6), (S 4), 0)
+    $Parent.Controls.Add($l); return $l
+}
+function New-Field([int]$Width, [System.Windows.Forms.Control]$Parent) {
+    $t = New-Object System.Windows.Forms.TextBox; $t.Width = S $Width; $t.Font = $UiFont
+    $t.Margin = New-Object System.Windows.Forms.Padding(0, (S 2), 0, 0)
+    $Parent.Controls.Add($t); return $t
+}
+function New-Check([string]$Text, [System.Windows.Forms.Control]$Parent) {
+    $c = New-Object System.Windows.Forms.CheckBox; $c.Text = $Text; $c.AutoSize = $true; $c.ForeColor = $ColText
+    $c.Margin = New-Object System.Windows.Forms.Padding((S 12), (S 4), 0, 0)
+    $Parent.Controls.Add($c); return $c
+}
+function New-ToolButton([string]$Text, [System.Windows.Forms.Control]$Parent, [bool]$Primary = $false) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $Text; $b.AutoSize = $true; $b.AutoSizeMode = 'GrowAndShrink'
+    $b.MinimumSize = New-Object System.Drawing.Size((S 96), (S 30))
+    $b.Padding = New-Object System.Windows.Forms.Padding((S 10), 0, (S 10), 0)
+    $b.Margin = New-Object System.Windows.Forms.Padding((S 4), 0, (S 4), 0)
+    $b.FlatStyle = 'Flat'; $b.FlatAppearance.BorderSize = 1; $b.UseVisualStyleBackColor = $false
+    if ($Primary) {
+        $b.BackColor = $ColAccent; $b.ForeColor = [System.Drawing.Color]::White; $b.Font = $UiBold
+        $b.FlatAppearance.BorderColor = $ColAccent
+        $b.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(29, 78, 216)
+    } else {
+        $b.BackColor = [System.Drawing.Color]::White; $b.ForeColor = $ColText
+        $b.FlatAppearance.BorderColor = $ColBorder
+        $b.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(239, 246, 255)
+    }
+    $Parent.Controls.Add($b); return $b
+}
+
 # --- connection bar ---
-$top = New-Object System.Windows.Forms.FlowLayoutPanel
-$top.Dock = 'Top'; $top.Height = 38; $top.Padding = '6,6,6,0'; $top.WrapContents = $false
-function Add-Label($Text) { $l = New-Object System.Windows.Forms.Label; $l.Text = $Text; $l.AutoSize = $true; $l.Margin = '6,6,2,0'; $top.Controls.Add($l) }
-Add-Label 'Server:'
-$script:TxtServer = New-Object System.Windows.Forms.TextBox; $TxtServer.Width = 380; $top.Controls.Add($TxtServer)
-$script:ChkWin = New-Object System.Windows.Forms.CheckBox; $ChkWin.Text = 'Windows auth'; $ChkWin.AutoSize = $true; $ChkWin.Margin = '10,5,0,0'; $top.Controls.Add($ChkWin)
-Add-Label 'Login:'
-$script:TxtLogin = New-Object System.Windows.Forms.TextBox; $TxtLogin.Width = 140; $top.Controls.Add($TxtLogin)
-Add-Label 'Password:'
-$script:TxtPwd = New-Object System.Windows.Forms.TextBox; $TxtPwd.Width = 140; $TxtPwd.UseSystemPasswordChar = $true; $top.Controls.Add($TxtPwd)
-$script:ChkTrust = New-Object System.Windows.Forms.CheckBox; $ChkTrust.Text = 'Trust server certificate'; $ChkTrust.AutoSize = $true; $ChkTrust.Margin = '10,5,0,0'; $ChkTrust.Checked = $true; $top.Controls.Add($ChkTrust)
-$BtnConnect = New-Object System.Windows.Forms.Button; $BtnConnect.Text = 'Connect'; $BtnConnect.Width = 90; $BtnConnect.Margin = '10,2,0,0'; $top.Controls.Add($BtnConnect)
+$top = New-ToolBar 46
+[void](New-FieldLabel 'Server' $top)
+$script:TxtServer = New-Field 420 $top
+$script:ChkWin = New-Check 'Windows auth' $top
+[void](New-FieldLabel 'Login' $top)
+$script:TxtLogin = New-Field 150 $top
+[void](New-FieldLabel 'Password' $top)
+$script:TxtPwd = New-Field 170 $top; $TxtPwd.UseSystemPasswordChar = $true
+$script:ChkTrust = New-Check 'Trust server certificate' $top; $ChkTrust.Checked = $true
+$BtnConnect = New-ToolButton 'Connect' $top $true
+$BtnConnect.Margin = New-Object System.Windows.Forms.Padding((S 14), 0, 0, 0)
 $ChkWin.Add_CheckedChanged({ $script:TxtLogin.Enabled = -not $script:ChkWin.Checked; $script:TxtPwd.Enabled = -not $script:ChkWin.Checked })
 
-# --- action bar ---
+# --- action bar: buttons on the left, colour legend on the right ---
+$barHost = New-Object System.Windows.Forms.TableLayoutPanel
+$barHost.Dock = 'Top'; $barHost.Height = S 46; $barHost.ColumnCount = 2; $barHost.RowCount = 1
+$barHost.BackColor = $ColPanel
+[void]$barHost.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$barHost.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
 $bar = New-Object System.Windows.Forms.FlowLayoutPanel
-$bar.Dock = 'Top'; $bar.Height = 38; $bar.Padding = '6,4,6,0'; $bar.WrapContents = $false
-$lf = New-Object System.Windows.Forms.Label; $lf.Text = 'Filter:'; $lf.AutoSize = $true; $lf.Margin = '6,7,2,0'; $bar.Controls.Add($lf)
-$script:TxtFilter = New-Object System.Windows.Forms.TextBox; $TxtFilter.Width = 180; $TxtFilter.Margin = '0,4,12,0'; $bar.Controls.Add($TxtFilter)
-function Add-Button($Text, $Width) { $b = New-Object System.Windows.Forms.Button; $b.Text = $Text; $b.Width = $Width; $b.Height = 28; $bar.Controls.Add($b); return $b }
-$BtnOn      = Add-Button 'Check selected' 120
-$BtnOff     = Add-Button 'Uncheck selected' 120
-$script:BtnDiscard = Add-Button 'Discard changes' 120
-$BtnRefresh = Add-Button 'Refresh (F5)' 110
-$script:BtnApply = Add-Button 'APPLY' 130
-$BtnApply.Font = $UiBold; $BtnApply.BackColor = [System.Drawing.Color]::FromArgb(37, 99, 235); $BtnApply.ForeColor = [System.Drawing.Color]::White
-$BtnApply.FlatStyle = 'Flat'; $BtnApply.Enabled = $false; $BtnDiscard.Enabled = $false
-$hint = New-Object System.Windows.Forms.Label
-$hint.Text = 'Click a badge to toggle.  GREEN = enabled   RED = disabled   GREY = not defined / not applicable   ORANGE frame = changed, not applied.  Multi-select + Check/Uncheck for bulk.'
-$hint.AutoSize = $true; $hint.Margin = '14,8,0,0'; $hint.ForeColor = [System.Drawing.Color]::FromArgb(107, 114, 128); $bar.Controls.Add($hint)
+$bar.Dock = 'Fill'; $bar.WrapContents = $false; $bar.BackColor = $ColPanel
+$bar.Padding = New-Object System.Windows.Forms.Padding((S 10), (S 7), 0, 0)
+[void](New-FieldLabel 'Filter' $bar)
+$script:TxtFilter = New-Field 200 $bar
+$TxtFilter.Margin = New-Object System.Windows.Forms.Padding(0, (S 2), (S 14), 0)
+$BtnOn      = New-ToolButton 'Check selected' $bar
+$BtnOff     = New-ToolButton 'Uncheck selected' $bar
+$script:BtnDiscard = New-ToolButton 'Discard changes' $bar
+$BtnRefresh = New-ToolButton 'Refresh  (F5)' $bar
+$script:BtnApply = New-ToolButton 'APPLY' $bar $true
+$BtnApply.MinimumSize = New-Object System.Drawing.Size((S 120), (S 30))
+$BtnApply.Margin = New-Object System.Windows.Forms.Padding((S 14), 0, 0, 0)
+$BtnApply.Enabled = $false; $BtnDiscard.Enabled = $false
+$BtnApply.Add_EnabledChanged({ param($s, $e) if ($s.Enabled) { $s.BackColor = $ColAccent; $s.FlatAppearance.BorderColor = $ColAccent } else { $s.BackColor = [System.Drawing.Color]::FromArgb(191, 219, 254); $s.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(191, 219, 254) } })
+$BtnApply.BackColor = [System.Drawing.Color]::FromArgb(191, 219, 254); $BtnApply.FlatAppearance.BorderColor = $BtnApply.BackColor
+
+$legend = New-Object System.Windows.Forms.FlowLayoutPanel
+$legend.AutoSize = $true; $legend.WrapContents = $false; $legend.BackColor = $ColPanel; $legend.Anchor = 'Right'
+$legend.Padding = New-Object System.Windows.Forms.Padding(0, (S 9), (S 10), 0)
+function Add-LegendChip([string]$Text, [System.Drawing.Color]$Color, [string]$Caption) {
+    $chip = New-Object System.Windows.Forms.Label
+    $chip.Text = $Text; $chip.AutoSize = $false; $chip.TextAlign = 'MiddleCenter'
+    $chip.Size = New-Object System.Drawing.Size((S 44), (S 20)); $chip.Font = $UiSmall
+    $chip.BackColor = $Color; $chip.ForeColor = [System.Drawing.Color]::White
+    $chip.Margin = New-Object System.Windows.Forms.Padding((S 10), (S 2), (S 4), 0)
+    $cap = New-Object System.Windows.Forms.Label
+    $cap.Text = $Caption; $cap.AutoSize = $true; $cap.Font = $UiSmall; $cap.ForeColor = $ColMuted
+    $cap.Margin = New-Object System.Windows.Forms.Padding(0, (S 4), 0, 0)
+    $legend.Controls.Add($chip); $legend.Controls.Add($cap)
+}
+Add-LegendChip 'ON'  $BadgeOn  'enabled'
+Add-LegendChip 'OFF' $BadgeOff 'disabled'
+Add-LegendChip 'n/a' $BadgeNA  'not defined / not applicable'
+$chgChip = New-Object System.Windows.Forms.Label
+$chgChip.Text = 'ON *'; $chgChip.AutoSize = $false; $chgChip.TextAlign = 'MiddleCenter'; $chgChip.Font = $UiSmall
+$chgChip.Size = New-Object System.Drawing.Size((S 44), (S 20)); $chgChip.BackColor = $BadgeOn; $chgChip.ForeColor = [System.Drawing.Color]::White
+$chgChip.Margin = New-Object System.Windows.Forms.Padding((S 10), (S 2), (S 4), 0)
+$chgChip.Add_Paint({ param($s, $e) $pen = New-Object System.Drawing.Pen($BadgeEdit, (S 2)); $e.Graphics.DrawRectangle($pen, 1, 1, $s.Width - 3, $s.Height - 3); $pen.Dispose() })
+$chgCap = New-Object System.Windows.Forms.Label; $chgCap.Text = 'changed, not applied'; $chgCap.AutoSize = $true; $chgCap.Font = $UiSmall; $chgCap.ForeColor = $ColMuted
+$chgCap.Margin = New-Object System.Windows.Forms.Padding(0, (S 4), 0, 0)
+$legend.Controls.Add($chgChip); $legend.Controls.Add($chgCap)
+$legendTip = New-Object System.Windows.Forms.ToolTip
+$legendTip.SetToolTip($legend, 'Click a badge to toggle it. Select several cells and use Check / Uncheck selected for bulk changes. Ctrl+S = APPLY.')
+$barHost.Controls.Add($bar, 0, 0)
+$barHost.Controls.Add($legend, 1, 0)
+
+$sep = New-Object System.Windows.Forms.Panel; $sep.Dock = 'Top'; $sep.Height = 1; $sep.BackColor = $ColBorder
 
 # --- tabs ---
 $script:TabControl = New-Object System.Windows.Forms.TabControl
-$TabControl.Dock = 'Fill'
+$TabControl.Dock = 'Fill'; $TabControl.Font = $UiFont
+$TabControl.Padding = New-Object System.Drawing.Point((S 16), (S 6))
+$TabControl.SizeMode = 'Normal'
+$tabHost = New-Object System.Windows.Forms.Panel
+$tabHost.Dock = 'Fill'; $tabHost.Padding = New-Object System.Windows.Forms.Padding((S 8), (S 8), (S 8), (S 4)); $tabHost.BackColor = [System.Drawing.Color]::White
+$tabHost.Controls.Add($TabControl)
 function Add-Tab([string]$Title, [string]$Key, [System.Windows.Forms.Control]$Content) {
     $t = New-Object System.Windows.Forms.TabPage
-    $t.Text = $Title; $t.Tag = $Key; $t.Padding = '4,4,4,4'
+    $t.Text = $Title; $t.Tag = $Key; $t.Padding = New-Object System.Windows.Forms.Padding((S 6)); $t.BackColor = [System.Drawing.Color]::White
+    $t.UseVisualStyleBackColor = $false
     $t.Controls.Add($Content)
     $script:TabControl.TabPages.Add($t)
 }
+function New-SectionLabel([string]$Text) {
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Text; $lbl.Dock = 'Top'; $lbl.Height = S 28; $lbl.Font = $UiBold; $lbl.ForeColor = $ColText
+    $lbl.TextAlign = 'MiddleLeft'; $lbl.Padding = New-Object System.Windows.Forms.Padding((S 2), 0, 0, (S 2))
+    return $lbl
+}
 function New-SplitGrids([string]$TopKey, [string]$TopTitle, [string]$BottomKey, [string]$BottomTitle) {
     $split = New-Object System.Windows.Forms.SplitContainer
-    $split.Dock = 'Fill'; $split.Orientation = 'Horizontal'
+    $split.Dock = 'Fill'; $split.Orientation = 'Horizontal'; $split.SplitterWidth = S 8; $split.BackColor = [System.Drawing.Color]::White
     $script:Splits += $split
     foreach ($pair in @(@($split.Panel1, $TopKey, $TopTitle), @($split.Panel2, $BottomKey, $BottomTitle))) {
         $g = New-Grid $true
         $script:Grids[$pair[1]] = $g
-        $lbl = New-Object System.Windows.Forms.Label
-        $lbl.Text = $pair[2]; $lbl.Dock = 'Top'; $lbl.Height = 22; $lbl.Font = $UiBold
-        $pair[0].Controls.Add($g); $pair[0].Controls.Add($lbl)
+        $pair[0].Controls.Add($g); $pair[0].Controls.Add((New-SectionLabel $pair[2]))
     }
     return $split
 }
 
 foreach ($k in @('db','server','settings','log')) { $script:Grids[$k] = New-Grid ($k -eq 'log') }
-Add-Tab 'Databases - what is checked' 'db' $Grids['db']
+Add-Tab 'Databases' 'db' $Grids['db']
 Add-Tab 'Server checks' 'server' $Grids['server']
-Add-Tab 'Settings / thresholds' 'settings' $Grids['settings']
+Add-Tab 'Settings' 'settings' $Grids['settings']
 Add-Tab 'Backup retention' 'ret' (New-SplitGrids 'retsum' 'Totals per backup type (files made / on storage / policy)' 'ret' 'Per database and type (opens from the daily snapshot; F5 on this tab = live from msdb)')
 $olaPanel = New-Object System.Windows.Forms.Panel; $olaPanel.Dock = 'Fill'
 $script:OlaNote = New-Object System.Windows.Forms.Label
-$OlaNote.Dock = 'Top'; $OlaNote.Height = 34; $OlaNote.ForeColor = [System.Drawing.Color]::FromArgb(180, 83, 9)
+$OlaNote.Dock = 'Top'; $OlaNote.Height = S 34; $OlaNote.ForeColor = [System.Drawing.Color]::FromArgb(180, 83, 9); $OlaNote.TextAlign = 'MiddleLeft'
 $olaOuter = New-SplitGrids 'ola' 'Commands per type (30 days)' 'olafail' 'Commands with errors (CORRUPTION FOUND / FAILED / SKIPPED)'
 $olaInner = New-SplitGrids 'oladb' 'Last successful CHECKDB / FULL / DIFF / LOG per database (all imported history)' 'olasrc' 'Where dbo.CommandLog was found'
-$olaMain = New-Object System.Windows.Forms.SplitContainer; $olaMain.Dock = 'Fill'; $olaMain.Orientation = 'Vertical'
+$olaMain = New-Object System.Windows.Forms.SplitContainer; $olaMain.Dock = 'Fill'; $olaMain.Orientation = 'Vertical'; $olaMain.SplitterWidth = S 8
 $olaMain.Panel1.Controls.Add($olaOuter); $olaMain.Panel2.Controls.Add($olaInner)
 $olaPanel.Controls.Add($olaMain); $olaPanel.Controls.Add($OlaNote)
-Add-Tab 'Ola CommandLog (30 days)' 'ola' $olaPanel
+Add-Tab 'Ola CommandLog' 'ola' $olaPanel
 $mailLeft  = New-SplitGrids 'mailday' 'MON emails per day (alerts / digests / heartbeats / skipped / failures)' 'maillast' 'Last 100 MON emails'
 $mailRight = New-SplitGrids 'mailsrv' 'ALL Database Mail on this server per day: MON vs others (OPS.monitor rev 4, jobs, apps)' 'mailsubj' 'Who sends the most (by subject, all senders)'
-$mailMain = New-Object System.Windows.Forms.SplitContainer; $mailMain.Dock = 'Fill'; $mailMain.Orientation = 'Vertical'
+$mailMain = New-Object System.Windows.Forms.SplitContainer; $mailMain.Dock = 'Fill'; $mailMain.Orientation = 'Vertical'; $mailMain.SplitterWidth = S 8
 $mailMain.Panel1.Controls.Add($mailLeft); $mailMain.Panel2.Controls.Add($mailRight)
-Add-Tab 'Emails (30 days)' 'mail' $mailMain
-Add-Tab 'Change log (audit)' 'log' $Grids['log']
+Add-Tab 'Emails' 'mail' $mailMain
+Add-Tab 'Change log' 'log' $Grids['log']
 
 # --- status bar ---
 $status = New-Object System.Windows.Forms.StatusStrip
+$status.SizingGrip = $false; $status.BackColor = $ColPanel; $status.Font = $UiSmall
+$status.Padding = New-Object System.Windows.Forms.Padding((S 10), (S 3), (S 10), (S 3))
 $script:StatusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
-$StatusLabel.Text = 'Not connected.'
+$StatusLabel.Text = 'Not connected.'; $StatusLabel.ForeColor = $ColText; $StatusLabel.Spring = $true; $StatusLabel.TextAlign = 'MiddleLeft'
 [void]$status.Items.Add($StatusLabel)
+$dpiLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
+$dpiLabel.Text = ('{0:P0}' -f $script:Scale); $dpiLabel.ForeColor = $ColMuted
+[void]$status.Items.Add($dpiLabel)
 
-$Form.Controls.Add($TabControl)
-$Form.Controls.Add($bar)
+$Form.Controls.Add($tabHost)
+$Form.Controls.Add($sep)
+$Form.Controls.Add($barHost)
 $Form.Controls.Add($top)
 $Form.Controls.Add($status)
 
@@ -644,25 +790,30 @@ foreach ($key in @('db','server','settings')) {
         $changed = Test-ValueChanged $row $colName
         $selected = ($e.State -band [System.Windows.Forms.DataGridViewElementStates]::Selected) -ne 0
 
-        $e.Graphics.FillRectangle([System.Drawing.Brushes]::White, $e.CellBounds)
-        $r = [System.Drawing.Rectangle]::Inflate($e.CellBounds, -3, -2)
+        $back = if (($e.RowIndex % 2) -eq 1) { $s.AlternatingRowsDefaultCellStyle.BackColor } else { [System.Drawing.Color]::White }
+        $bb = New-Object System.Drawing.SolidBrush $back
+        $e.Graphics.FillRectangle($bb, $e.CellBounds); $bb.Dispose()
+        # badge: fixed size, centred in the cell (same size in every column at every DPI)
+        $bw = [Math]::Min($e.CellBounds.Width - (S 12), (S 56)); $bh = [Math]::Min($e.CellBounds.Height - (S 8), (S 20))
+        $r = New-Object System.Drawing.Rectangle(($e.CellBounds.X + [int](($e.CellBounds.Width - $bw) / 2)), ($e.CellBounds.Y + [int](($e.CellBounds.Height - $bh) / 2)), $bw, $bh)
         $color = switch ($state) { 'ON' { $BadgeOn } 'OFF' { $BadgeOff } default { $BadgeNA } }
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $rad = S 4; $d = $rad * 2
+        $path.AddArc($r.X, $r.Y, $d, $d, 180, 90); $path.AddArc($r.Right - $d, $r.Y, $d, $d, 270, 90)
+        $path.AddArc($r.Right - $d, $r.Bottom - $d, $d, $d, 0, 90); $path.AddArc($r.X, $r.Bottom - $d, $d, $d, 90, 90); $path.CloseFigure()
         $brush = New-Object System.Drawing.SolidBrush $color
-        $e.Graphics.FillRectangle($brush, $r); $brush.Dispose()
+        $e.Graphics.FillPath($brush, $path); $brush.Dispose()
+        if ($changed) { $pen = New-Object System.Drawing.Pen($BadgeEdit, (S 2)); $e.Graphics.DrawPath($pen, $path); $pen.Dispose() }
+        if ($selected) { $pen = New-Object System.Drawing.Pen($BadgeSel, (S 1.5)); $e.Graphics.DrawRectangle($pen, $e.CellBounds.X + 1, $e.CellBounds.Y + 1, $e.CellBounds.Width - 3, $e.CellBounds.Height - 3); $pen.Dispose() }
+        $path.Dispose()
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::Default
         $text = switch ($state) { 'ON' { 'ON' } 'OFF' { 'OFF' } default { 'n/a' } }
         if ($changed) { $text += ' *' }
-        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $UiBold, $r, [System.Drawing.Color]::White,
+        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $GridBold, $r, [System.Drawing.Color]::White,
             [System.Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine')
-        if ($changed) {
-            $pen = New-Object System.Drawing.Pen($BadgeEdit, 3)
-            $e.Graphics.DrawRectangle($pen, $r.X, $r.Y, $r.Width - 1, $r.Height - 1); $pen.Dispose()
-        }
-        if ($selected) {
-            $pen = New-Object System.Drawing.Pen($BadgeSel, 2)
-            $e.Graphics.DrawRectangle($pen, $e.CellBounds.X + 1, $e.CellBounds.Y + 1, $e.CellBounds.Width - 3, $e.CellBounds.Height - 3); $pen.Dispose()
-        }
-        $grid = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(229, 231, 235))
-        $e.Graphics.DrawLine($grid, $e.CellBounds.Left, $e.CellBounds.Bottom - 1, $e.CellBounds.Right, $e.CellBounds.Bottom - 1); $grid.Dispose()
+        $gp = New-Object System.Drawing.Pen($s.GridColor)
+        $e.Graphics.DrawLine($gp, $e.CellBounds.Left, $e.CellBounds.Bottom - 1, $e.CellBounds.Right, $e.CellBounds.Bottom - 1); $gp.Dispose()
         $e.Handled = $true
     })
     # Single click (no Ctrl/Shift) on a badge toggles it
@@ -745,7 +896,7 @@ $BtnConnect.Add_Click({
         $script:ConnString = $b.ConnectionString
         $script:ServerLabel = $script:TxtServer.Text.Trim()
         $t = Get-MonTable "SELECT CASE WHEN SCHEMA_ID(N'mon') IS NULL THEN 0 ELSE 1 END AS ok, @@SERVERNAME AS srv;"
-        if (-not $t.Rows[0].ok) { throw "Schema [mon] not found in database $Database. Install stage_monitoring_mon_v5.4.sql first." }
+        if (-not $t.Rows[0].ok) { throw "Schema [mon] not found in database $Database. Run install/MON_Install.sql first." }
         $script:Loading = $false
         Save-Config
         $script:Form.Text = ('MON Check Editor - {0} ({1}).{2}' -f $script:ServerLabel, $t.Rows[0].srv, $Database)
@@ -803,7 +954,7 @@ if ($cfg) {
     $ChkWin.Checked = [bool]$cfg.WindowsAuth
     $ChkTrust.Checked = [bool]$cfg.TrustCert
 }
-$Form.Add_Shown({ foreach ($sp in $script:Splits) { try { $sp.SplitterDistance = [int]($sp.Height * 0.3) } catch { } } })
+$Form.Add_Shown({ foreach ($sp in $script:Splits) { try { $sp.SplitterDistance = [int]($sp.Height * 0.32) } catch { } } })
 $Form.Add_Shown({ if ($script:TxtServer.Text) { $script:TxtPwd.Focus() } else { $script:TxtServer.Focus() } })
 [void]$Form.ShowDialog()
 $Form.Dispose()
