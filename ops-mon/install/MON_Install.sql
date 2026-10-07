@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.6.4 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.7.0 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -29,6 +29,10 @@
              5.6.3: object order (no "depends on the missing object" message); release gate finds its own
                     ReleaseHistory row via SESSION_CONTEXT, so the history records COMPLETED reliably.
              5.6.4: CHECKDB issues are category INTEGRITY (were BACKUP).
+             5.7.0: email policy AUTO - one daily email (short when all good, full when something is open,
+                    none when nothing changed); WARNING+CRITICAL alerts when they happen, no reminders.
+                    Failed Agent job stays open until it succeeds (no 7-day auto-resolve).
+                    RDS task times: UTC auto-detected (fixes backups shown "0s ago" / in the future).
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -172,7 +176,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.6.4';
+DECLARE @version varchar(20) = '5.7.0';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
@@ -1241,8 +1245,8 @@ SELECT v.n, v.v, v.t, v.c, v.d
 FROM (VALUES
     ('ola_commandlog_database', N'', 'text', 'ola',
      N'Database that holds Ola Hallengren dbo.CommandLog. Empty = auto-discover (every online database + master, re-checked hourly).'),
-    ('job_failure_max_age_days', N'7', 'int', 'jobs',
-     N'A job whose LAST run failed stays an open issue (and is listed in the digest) until it succeeds or the failure is older than N days - also for unscheduled / manually started jobs.'),
+    ('job_failure_max_age_days', N'0', 'int', 'jobs',
+     N'A job whose LAST run failed stays an open issue (and is listed in the digest) until it succeeds, is disabled/deleted, or the issue is muted. N > 0 = also stop after N days. 0 (default since 5.7) = no age limit - also for unscheduled / manually started jobs.'),
     ('checkdb_crit_factor', N'4', 'int', 'backup',
      N'CHECKDB issue becomes CRITICAL when the last clean CHECKDB is older than checkdb_max_age_days x this factor (WARNING before that).'),
     ('ola_initial_load_days', N'35', 'int', 'ola',
@@ -1967,13 +1971,32 @@ BEGIN
             SET @task_error = 1;
         END CATCH;
 
+        /* [5.7] Are rds_task_status times UTC or server-local? On an instance with a non-UTC time zone
+           a UTC value of a fresh task is ahead of the server clock -> UTC (remembered in rds_task_times_utc).
+           Wrong guess = backups shown in the future ("0s ago"). */
+        DECLARE @rds_utc_setting nvarchar(10) = ISNULL(mon.fn_Setting('rds_task_times_utc'), N'AUTO'),
+                @tz_off int = DATEPART(TZOFFSET, SYSDATETIMEOFFSET()), @rds_utc bit = 0;
+        IF @rds_utc_setting = N'1' OR @tz_off = 0
+            SET @rds_utc = 1;
+        ELSE IF @rds_utc_setting = N'AUTO'
+             AND EXISTS (SELECT 1 FROM #RdsTasks
+                         WHERE last_updated > DATEADD(MINUTE, 10, GETDATE()) OR created_at > DATEADD(MINUTE, 10, GETDATE()))
+        BEGIN
+            SET @rds_utc = 1;
+            UPDATE mon.Setting SET setting_value = N'1', modified_utc = SYSUTCDATETIME()
+            WHERE setting_name = 'rds_task_times_utc';
+            /* rows stored earlier were shifted by the server offset: put them back */
+            UPDATE mon.RdsTask SET last_updated_utc = DATEADD(MINUTE, @tz_off, last_updated_utc),
+                                   created_utc      = DATEADD(MINUTE, @tz_off, created_utc);
+        END;
+
         MERGE mon.RdsTask AS t
         USING (SELECT task_id, task_type, database_name,
                       TRY_CONVERT(decimal(9,2), REPLACE(percent_complete_text, N'%', N'')) AS pct,
                       TRY_CONVERT(int, duration_minutes_text) AS dur,
                       lifecycle, task_info,
-                      mon.fn_ServerToUtc(last_updated) AS last_updated_utc,
-                      mon.fn_ServerToUtc(created_at) AS created_utc,
+                      CASE WHEN @rds_utc = 1 THEN CONVERT(datetime2(3), last_updated) ELSE mon.fn_ServerToUtc(last_updated) END AS last_updated_utc,
+                      CASE WHEN @rds_utc = 1 THEN CONVERT(datetime2(3), created_at)   ELSE mon.fn_ServerToUtc(created_at)   END AS created_utc,
                       LEFT(s3_object_arn, 4000) AS arn
                FROM #RdsTasks) AS s
         ON t.task_id = s.task_id
@@ -3531,7 +3554,8 @@ BEGIN
                        SUM(CASE WHEN f.run_start_utc >= DATEADD(HOUR, -@lookback, @now) THEN 1 ELSE 0 END) OVER (PARTITION BY f.job_id) AS fails
                 FROM mon.AgentFailure AS f
                 /* not only the event window: a job whose LAST run failed stays open until it succeeds (max N days) */
-                WHERE f.run_start_utc >= DATEADD(DAY, -ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 7), @now)
+                /* [5.7] default 0 = no age limit: an unscheduled job that failed 7+ days ago is still failed */
+                WHERE f.run_start_utc >= DATEADD(DAY, -ISNULL(NULLIF(mon.fn_SettingInt('job_failure_max_age_days'), 0), 36500), @now)
                   /* the engine itself: cancel by the installer / error 2801 after a redeploy are expected;
                      real engine outages are caught by the ENGINE_STALE watchdog */
                   AND NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
@@ -3549,7 +3573,9 @@ BEGIN
             OUTER APPLY (SELECT TOP (1) r.run_status FROM mon.AgentJobRun AS r
                          WHERE r.job_id = F.job_id ORDER BY r.run_start_utc DESC, r.instance_id DESC) AS last_run
             WHERE F.rn = 1
-              AND (last_run.run_status IN (0, 3) OR F.run_start_utc >= DATEADD(MINUTE, -30, @now));
+              AND (last_run.run_status IN (0, 3) OR F.run_start_utc >= DATEADD(MINUTE, -30, @now))
+              /* [5.7] deleted or disabled job: nothing left to fix -> resolves */
+              AND EXISTS (SELECT 1 FROM msdb.dbo.sysjobs AS sj WHERE sj.job_id = F.job_id AND sj.enabled = 1);
 
             INSERT #Issue(issue_key, category, severity, is_event, title, detail)
             SELECT CONCAT(N'JOBSLA:', j.job_id), 'AGENT',
@@ -4592,7 +4618,9 @@ BEGIN
                          CASE WHEN @status = 'PENDING' THEN 'INFO' WHEN @status = 'NEEDS_FULL' THEN 'NA'
                               ELSE ISNULL(mon.fn_BackupLevel(@status), 'WARN') END), N'<br>') END,
         CASE WHEN @finish_utc IS NOT NULL
-             THEN CONCAT(mon.fn_Nw(CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, @age_min) * 60), N' ago</b>')), N'<br>',
+             THEN CONCAT(mon.fn_Nw(CASE WHEN @age_min < -5   /* [5.7] a time ahead of the clock is a time-zone problem, not a fresh backup */
+                                        THEN CONCAT(mon.fn_Pill(N'TIME AHEAD', 'WARN'), N' ', mon.fn_Duration(CONVERT(bigint, -@age_min) * 60))
+                                        ELSE CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, @age_min) * 60), N' ago</b>') END), N'<br>',
                          mon.fn_Small(mon.fn_Nw(CONCAT(mon.fn_FmtLocal(@finish_utc, @tz), N' &middot; ',
                                              REPLACE(REPLACE(REPLACE(ISNULL(@source, ''), 'DMV_LOG_STATS', 'dmv'),
                                                      'RDS_TASK', 'rds&nbsp;task'), 'RDS_TLOG', 'rds&nbsp;log')))))
@@ -5350,14 +5378,15 @@ BEGIN
             WHERE NOT (f.job_name LIKE N'MON - Engine%' AND (f.run_status = 3 OR ISNULL(f.message, N'') LIKE N'%Error 2801%'))
               AND (f.run_start_utc >= @window_start
                /* older failure of a job whose last run is still failed (e.g. unscheduled job, nobody re-ran it) */
-               OR (f.run_start_utc >= DATEADD(DAY, -ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 7), @now)
+               OR (f.run_start_utc >= DATEADD(DAY, -ISNULL(NULLIF(mon.fn_SettingInt('job_failure_max_age_days'), 0), 36500), @now)
                    AND f.instance_id = (SELECT MAX(r.instance_id) FROM mon.AgentJobRun AS r WHERE r.job_id = f.job_id)))
             ORDER BY f.run_start_utc DESC
             FOR XML PATH(''), TYPE
         ).value('(./text())[1]', 'nvarchar(max)');
         SET @body += mon.fn_Section(CONCAT(N'SQL Agent failures - last ', @lookback, N'h + jobs still failed'),
-            CONCAT(N'All jobs, with the step that actually failed. STILL FAILED = older failure (up to ',
-                   ISNULL(mon.fn_Setting('job_failure_max_age_days'), N'7'), N' days) and the job has not succeeded since.'),
+            CONCAT(N'All jobs, with the step that actually failed. STILL FAILED = older failure and the job has not succeeded since',
+                   CASE WHEN ISNULL(mon.fn_SettingInt('job_failure_max_age_days'), 0) > 0
+                        THEN CONCAT(N' (up to ', mon.fn_Setting('job_failure_max_age_days'), N' days)') END, N'.'),
             N'Job|Outcome|Failed step|Started|Duration|Message',
             ISNULL(@rows, mon.fn_EmptyRow(6, N'No failed or cancelled jobs.')));
 
@@ -5828,14 +5857,41 @@ GO
                       full_report_change_only = 1 sends it only when something changed.
                       Empty full_report_hours_local = legacy mode (one change-only digest per day at report_hour_local).
 
+   [5.7] daily_email_mode = AUTO (default since 5.7): ONE scheduled email per day at full_report_hours_local:
+                      everything good (no open, unmuted issue) -> the SHORT summary ("all clear");
+                      anything open                            -> the FULL report.
+                      Nothing changed since the previous daily email -> no email at all (DIGEST_SKIPPED),
+                      except a weekly proof-of-life on heartbeat_weekday (0 = never).
+                      Failures / anomalies are never held for the daily email: usp_SendAlerts mails them
+                      at the next 5-minute cycle (alert_min_severity), once per change.
+                      daily_email_mode = SCHEDULE keeps the separate summary_* / full_report_* schedules.
+
    Issue workflow: OPEN -> ACKNOWLEDGED (usp_AckIssue: someone is on it, no more reminders)
                         -> RESOLVED automatically when the condition clears (or usp_ResolveIssue, manual;
                            re-opens at the next cycle if the condition still exists).
    ============================================================================= */
 
+/* [5.7] one-time switch to the AUTO email policy (first install of 5.7 = daily_email_mode not there yet):
+         daily email every day, brief when all good / full when not, nothing when nothing changed;
+         WARNING and CRITICAL alerts mailed when they happen; no reminders for unchanged issues. */
+IF OBJECT_ID(N'mon.Setting', N'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM mon.Setting WHERE setting_name = 'daily_email_mode')
+BEGIN
+    UPDATE mon.Setting SET setting_value = N'1,2,3,4,5,6,7' WHERE setting_name = 'full_report_weekdays';
+    UPDATE mon.Setting SET setting_value = N'8' WHERE setting_name = 'full_report_hours_local' AND NULLIF(LTRIM(setting_value), N'') IS NULL;
+    UPDATE mon.Setting SET setting_value = N'WARNING' WHERE setting_name = 'alert_min_severity';
+    UPDATE mon.Setting SET setting_value = N'0' WHERE setting_name = 'reminder_minutes';
+    UPDATE mon.Setting SET setting_value = N'0' WHERE setting_name = 'job_failure_max_age_days' AND setting_value = N'7';  /* failed job stays open until it succeeds */
+    PRINT N'5.7 email policy applied: one daily email (brief if all good, full if not, none if nothing changed); WARNING+CRITICAL alerts when they happen; no reminders.';
+END;
+
 INSERT mon.Setting(setting_name, setting_value, value_type, category, description)
 SELECT v.n, v.v, v.t, v.c, v.d
 FROM (VALUES
+    ('daily_email_mode', N'AUTO', 'text', 'email',
+     N'AUTO = one email a day at full_report_hours_local: short summary when everything is good, full report when an issue is open, nothing when nothing changed (weekly heartbeat_weekday still sends). SCHEDULE = separate summary_* and full_report_* schedules.'),
+    ('rds_task_times_utc', N'AUTO', 'text', 'backup',
+     N'Time zone of msdb.dbo.rds_task_status created_at / last_updated. AUTO = detected (a value ahead of the server clock means UTC); 1 = UTC; 0 = server local time.'),
     ('summary_email_hours_local', N'8', 'text', 'email',
      N'Local hours (comma list, 0-23) when the SHORT summary email is sent. Empty = no summary emails.'),
     ('summary_email_weekdays', N'1,2,3,4,5,6,7', 'text', 'email',
@@ -5847,9 +5903,9 @@ FROM (VALUES
     ('summary_skip_when_full', N'1', 'bit', 'email',
      N'1 = do not send the summary in an hour when the full report is sent anyway.'),
     ('full_report_hours_local', N'8', 'text', 'email',
-     N'Local hours (comma list, 0-23) when the FULL report (every monitored item) is sent. Empty = legacy: one change-only digest per day at report_hour_local.'),
-    ('full_report_weekdays', N'1,4', 'text', 'email',
-     N'ISO weekdays for the full report (1 = Monday ... 7 = Sunday). Default Monday and Thursday.'),
+     N'Local hours (comma list, 0-23) when the FULL report (every monitored item) is sent; in AUTO mode the hour of the one daily email. Empty = legacy: one change-only digest per day at report_hour_local.'),
+    ('full_report_weekdays', N'1,2,3,4,5,6,7', 'text', 'email',
+     N'ISO weekdays for the full report / AUTO daily email (1 = Monday ... 7 = Sunday). Default every day.'),
     ('full_report_change_only', N'0', 'bit', 'email',
      N'1 = the scheduled full report is skipped when nothing changed since the previous one; 0 = always sent.'),
     ('retention_perf_days', N'', 'text', 'issues',
@@ -6080,8 +6136,13 @@ BEGIN
         N'<b>Work an issue:</b> <code>EXEC OPS.mon.usp_AckIssue @KeyPattern = N''&lt;key&gt;'', @Note = N''on it'';</code> &middot; ',
         N'after the fix it resolves automatically within 5 minutes (or <code>EXEC OPS.mon.usp_ResolveIssue @KeyPattern = N''&lt;key&gt;'', @Note = N''what was done'';</code>) &middot; ',
         N'known condition: <code>EXEC OPS.mon.usp_MuteIssue</code>.<br>',
-        N'Issue alerts are sent only when something changes. Full report: hours ', ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'(daily digest)'),
-        N', weekdays ', ISNULL(mon.fn_Setting('full_report_weekdays'), N'-'), N'. Run now: <code>EXEC OPS.mon.usp_SendDailyDigest @Force = 1;</code>',
+        CASE WHEN ISNULL(mon.fn_Setting('daily_email_mode'), N'AUTO') = N'AUTO'
+             THEN CONCAT(N'Failures and anomalies are emailed when they happen (once per change). One daily email at ',
+                         ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'8'),
+                         N':00 - this short one when everything is good, the full report when something is open, none when nothing changed. ')
+             ELSE CONCAT(N'Issue alerts are sent only when something changes. Full report: hours ', ISNULL(NULLIF(mon.fn_Setting('full_report_hours_local'), N''), N'(daily digest)'),
+                         N', weekdays ', ISNULL(mon.fn_Setting('full_report_weekdays'), N'-'), N'. ') END,
+        N'Full report now: <code>EXEC OPS.mon.usp_SendDailyDigest @Force = 1;</code>',
         N'</div></td></tr></table></body></html>');
 
     IF @PreviewOnly = 1
@@ -6125,6 +6186,38 @@ BEGIN
             @iso_wd int = (DATEPART(WEEKDAY, @local_now) + @@DATEFIRST - 2) % 7 + 1;   /* 1 = Monday */
     DECLARE @full_hours nvarchar(400) = mon.fn_Setting('full_report_hours_local'),
             @full_due bit = 0, @full_sent bit = 0;
+
+    /* [5.7] AUTO: one email per day - brief when all good, full when something is open, none when nothing changed */
+    IF ISNULL(mon.fn_Setting('daily_email_mode'), N'AUTO') = N'AUTO'
+    BEGIN
+        IF mon.fn_InIntList(ISNULL(NULLIF(LTRIM(@full_hours), N''), N'8'), @hour) = 0
+           OR mon.fn_InIntList(ISNULL(mon.fn_Setting('full_report_weekdays'), N'1,2,3,4,5,6,7'), @iso_wd) = 0
+           OR EXISTS (SELECT 1 FROM mon.Notification
+                      WHERE notification_type IN ('DIGEST', 'HEARTBEAT', 'DIGEST_SKIPPED', 'SUMMARY')
+                        AND created_utc >= DATEADD(MINUTE, -50, @now))
+            RETURN;
+
+        DECLARE @last_daily datetime2(0) = (SELECT MAX(created_utc) FROM mon.Notification
+                                            WHERE notification_type IN ('DIGEST', 'HEARTBEAT', 'SUMMARY') AND send_ok = 1);
+        DECLARE @changes int =
+              (SELECT COUNT(*) FROM mon.IssueChange WHERE change_utc > ISNULL(@last_daily, '19000101') AND change_type <> 'EXPIRED')
+            + (SELECT COUNT(*) FROM mon.CheckChangeLog WHERE changed_utc > ISNULL(@last_daily, '19000101'));
+        DECLARE @open int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND is_muted = 0);
+        DECLARE @hb bit = CASE WHEN @iso_wd = ISNULL(mon.fn_SettingInt('heartbeat_weekday'), 1) THEN 1 ELSE 0 END;
+
+        IF @changes = 0 AND @last_daily IS NOT NULL AND @hb = 0
+        BEGIN
+            INSERT mon.Notification(notification_type, created_utc, report_date_local, change_count)
+            VALUES ('DIGEST_SKIPPED', @now, CONVERT(date, @local_now), 0);      /* nothing changed: no email */
+            RETURN;
+        END;
+
+        IF @open = 0
+            EXEC mon.usp_SendSummary;                       /* everything good: brief */
+        ELSE
+            EXEC mon.usp_SendDailyDigest @Force = 1;        /* something open: full report */
+        RETURN;
+    END;
 
     /* FULL REPORT */
     IF NULLIF(LTRIM(@full_hours), N'') IS NULL
