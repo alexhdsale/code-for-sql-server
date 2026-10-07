@@ -106,7 +106,9 @@ BEGIN
                          CASE WHEN @status = 'PENDING' THEN 'INFO' WHEN @status = 'NEEDS_FULL' THEN 'NA'
                               ELSE ISNULL(mon.fn_BackupLevel(@status), 'WARN') END), N'<br>') END,
         CASE WHEN @finish_utc IS NOT NULL
-             THEN CONCAT(mon.fn_Nw(CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, @age_min) * 60), N' ago</b>')), N'<br>',
+             THEN CONCAT(mon.fn_Nw(CASE WHEN @age_min < -5   /* [5.7] a time ahead of the clock is a time-zone problem, not a fresh backup */
+                                        THEN CONCAT(mon.fn_Pill(N'TIME AHEAD', 'WARN'), N' ', mon.fn_Duration(CONVERT(bigint, -@age_min) * 60))
+                                        ELSE CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, @age_min) * 60), N' ago</b>') END), N'<br>',
                          mon.fn_Small(mon.fn_Nw(CONCAT(mon.fn_FmtLocal(@finish_utc, @tz), N' &middot; ',
                                              REPLACE(REPLACE(REPLACE(ISNULL(@source, ''), 'DMV_LOG_STATS', 'dmv'),
                                                      'RDS_TASK', 'rds&nbsp;task'), 'RDS_TLOG', 'rds&nbsp;log')))))
