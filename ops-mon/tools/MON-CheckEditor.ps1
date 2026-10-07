@@ -54,7 +54,7 @@ try {
     [void][MonUi.Dpi]::SetProcessDpiAwareness(2)      # 2 = PROCESS_PER_MONITOR_DPI_AWARE
 } catch { try { Add-Type -Namespace MonUi -Name Dpi2 -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'; [void][MonUi.Dpi2]::SetProcessDPIAware() } catch { } }
 [System.Windows.Forms.Application]::EnableVisualStyles()
-[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+# (SetCompatibleTextRenderingDefault is NOT called: it throws when the script is re-run in the same console / ISE session.)
 
 # --------------------------------------------------------------------------------------------
 #  State
