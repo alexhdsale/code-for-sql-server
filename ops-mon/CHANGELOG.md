@@ -2,6 +2,10 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.7.1 — 2026-10-06
+- `alert_style` = **BRIEF** (default): the alert mail contains only what changed — the failure or the resolution, one line per issue with a short detail. No "still active" context table, no counts, no issue keys. `FULL` restores the 5.6 layout.
+- Check Editor: system-DPI mode with pixel-scaled fonts (proportional on mixed-DPI monitors), legend in the status bar, header/row heights from the font; removed `SetCompatibleTextRenderingDefault` (failed on re-run in the same console).
+
 ## 5.7.0 — 2026-10-06
 - **Email policy AUTO** (`daily_email_mode`, applied on upgrade): failures and anomalies (WARNING + CRITICAL) are emailed when they happen, once per change, no reminders; **one daily email at 08:00** — the short summary when everything is good, the full report when something is open, **no email when nothing changed** (weekly proof-of-life on `heartbeat_weekday`). `SCHEDULE` keeps the 5.6 behaviour.
 - Fix: a failed Agent job (e.g. unscheduled `_test_job`) was auto-resolved after 7 days although its last run still failed. `job_failure_max_age_days` now defaults to 0 = open until the job succeeds, is disabled or deleted.
