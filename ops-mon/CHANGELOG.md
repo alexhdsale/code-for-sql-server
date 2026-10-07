@@ -2,6 +2,9 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.7.2 — 2026-10-07
+- Failed SQL Agent jobs are **re-mailed daily** (`jobfail_reminder_minutes`, default 1440) until the job succeeds, is disabled or deleted, or the issue is acknowledged / muted. Reminder-only mails carry the subject prefix **STILL OPEN**. Independent of the generic `reminder_minutes`.
+
 ## 5.7.1 — 2026-10-06
 - `alert_style` = **BRIEF** (default): the alert mail contains only what changed — the failure or the resolution, one line per issue with a short detail. No "still active" context table, no counts, no issue keys. `FULL` restores the 5.6 layout.
 - Check Editor: system-DPI mode with pixel-scaled fonts (proportional on mixed-DPI monitors), legend in the status bar, header/row heights from the font; removed `SetCompatibleTextRenderingDefault` (failed on re-run in the same console).
