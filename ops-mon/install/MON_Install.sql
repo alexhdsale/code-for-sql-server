@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.7.1 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.7.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -34,6 +34,7 @@
                     Failed Agent job stays open until it succeeds (no 7-day auto-resolve).
                     RDS task times: UTC auto-detected (fixes backups shown "0s ago" / in the future).
              5.7.1: alert_style BRIEF (default) - the alert mail contains only the failure / resolution itself.
+             5.7.2: failed Agent jobs are re-mailed daily (jobfail_reminder_minutes) until fixed / acknowledged / muted.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -177,7 +178,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.7.1';
+DECLARE @version varchar(20) = '5.7.2';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
@@ -284,6 +285,7 @@ GO
     ,('alert_style',                   N'BRIEF',                          'text',   'email',      0, N'BRIEF = alert mail shows only what changed (the failure / the resolution), one line per issue. FULL = also the "still active" context table and the active counts.')
     ,('alert_on_resolve',              N'1',                              'bit',    'email',      0, N'Send a RESOLVED mail for issues that were alerted.')
     ,('reminder_minutes',              N'0',                              'int',    'email',      0, N'Re-send still-active CRITICAL issues after N minutes. 0 = off (pure change-only).')
+    ,('jobfail_reminder_minutes',      N'1440',                           'int',    'email',      0, N'[5.7.2] A failed SQL Agent job is re-mailed every N minutes until the job succeeds, is disabled/deleted, or the issue is acknowledged (usp_AckIssue) or muted. Default daily. 0 = mail once only.')
     ,('realert_suppress_minutes',      N'60',                             'int',    'email',      0, N'Do not re-alert an escalation of an issue that was alerted CRITICAL within N minutes.')
     ,('email_max_rows_per_section',    N'40',                             'int',    'email',      0, N'Row cap per digest section (keeps mail under Gmail 102 KB clipping).')
     ,('resolve_grace_minutes',         N'10',                             'int',    'issues',     0, N'A state issue must be absent this long before it is RESOLVED (anti-flap).')
@@ -4681,7 +4683,8 @@ BEGIN
             @on_resolve bit    = ISNULL(mon.fn_SettingInt('alert_on_resolve'), 1),
             @reminder int      = ISNULL(mon.fn_SettingInt('reminder_minutes'), 0),
             @suppress int      = ISNULL(mon.fn_SettingInt('realert_suppress_minutes'), 60),
-            @brief bit         = CASE WHEN ISNULL(mon.fn_Setting('alert_style'), N'BRIEF') = N'FULL' THEN 0 ELSE 1 END;   /* [5.7.1] */
+            @brief bit         = CASE WHEN ISNULL(mon.fn_Setting('alert_style'), N'BRIEF') = N'FULL' THEN 0 ELSE 1 END,   /* [5.7.1] */
+            @job_rem int       = ISNULL(mon.fn_SettingInt('jobfail_reminder_minutes'), 1440);                              /* [5.7.2] */
 
     /* High-water mark: only changes committed before this point are handled in this pass,
        so a change merged concurrently by another session is never marked SKIPPED unseen. */
@@ -4764,6 +4767,20 @@ BEGIN
               AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@reminder, @now)
               AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
 
+        /* [5.7.2] A failed job is not a one-off: keep mailing it (daily by default) until it succeeds, is disabled,
+           or somebody takes it (usp_AckIssue) / mutes it. Independent of the generic reminder_minutes. */
+        IF @job_rem > 0
+            INSERT #A(change_id, issue_id, kind, severity, change_utc)
+            SELECT NULL, i.issue_id, 'REMINDER', i.severity, @now
+            FROM mon.Issue AS i
+            WHERE i.is_active = 1 AND i.is_muted = 0 AND i.is_event = 0
+              AND i.issue_key LIKE N'JOBFAIL:%'
+              AND mon.fn_SevRank(i.severity) >= @min_rank
+              AND i.ack_utc IS NULL
+              AND i.alert_sent_utc IS NOT NULL
+              AND COALESCE(i.last_reminder_utc, i.alert_sent_utc) < DATEADD(MINUTE, -@job_rem, @now)
+              AND NOT EXISTS (SELECT 1 FROM #A AS a WHERE a.issue_id = i.issue_id);
+
         IF @PreviewOnly = 0
             UPDATE c SET alert_status = 'SKIPPED', alert_utc = @now
             FROM mon.IssueChange AS c
@@ -4792,7 +4809,8 @@ BEGIN
         DECLARE @active_crit int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND severity = 'CRITICAL' AND is_muted = 0),
                 @active_warn int = (SELECT COUNT(*) FROM mon.Issue WHERE is_active = 1 AND severity = 'WARNING' AND is_muted = 0);
 
-        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] ', @worst, N': ', @top_title,
+        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] ',
+                                              CASE WHEN @n_rem = @total THEN N'STILL OPEN' ELSE @worst END, N': ', @top_title,   /* [5.7.2] reminder-only mail */
                                               CASE WHEN @total > 1 THEN CONCAT(N' (+', @total - 1, N' more)') END), 255);
 
         DECLARE @rows_open nvarchar(max), @rows_res nvarchar(max), @rows_ctx nvarchar(max), @body_rows nvarchar(max) = N'';
