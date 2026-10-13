@@ -149,7 +149,8 @@ EXEC OPS.mon.usp_SetCheck @Database = N'MioCore', @Check = 'RETENTION', @Enabled
 - **Сняли:** со следующего 5-минутного цикла проверка перестаёт создавать issues для этой базы. Уже открытые issues этой проверки **закрываются молча**, письма RESOLVED не будет. В digest изменение видно в разделе «Monitoring configuration changes», а база попадает в раздел «Monitoring coverage».
 - **Поставили:** если проблема существует, issue откроется заново и придёт alert.
   - Для событийных проверок (DEADLOCK, ERRORLOG, MAIL) при повторном включении откроются события за последние `event_lookback_hours` (24 ч). Это ожидаемо.
-- **Новая база** появляется в матрице автоматически, со всеми галочками ON.
+- **Новая база** появляется в матрице автоматически, со всеми галочками ON, **кроме DIFF backup и CHECKDB** — они изначально OFF (5.7.3; настройки `new_db_diff_backup` / `new_db_checkdb`, 1 = ON). Включить для базы:
+  `EXEC OPS.mon.usp_SetCheck @Database = N'MyDb', @Check = 'DIFF', @Enabled = 1;` (так же `'CHECKDB'`).
 - **Удалённая база** остаётся в матрице, и приходит issue «no longer exists». Выключите её через `@Check='MONITORED', @Enabled=0`.
 - Пороги (минуты, проценты) задаются **не** в матрице, а в `mon.Setting` (глобально) и `mon.DatabasePolicy` (SLA по базе).
 
