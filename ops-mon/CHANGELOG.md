@@ -2,6 +2,11 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.7.3 — 2026-10-13
+- **DIFF backup and CHECKDB checks start OFF.** New databases get `diff_backup = 0` and `checkdb = 0` in `mon.DatabaseCheck` (settings `new_db_diff_backup` / `new_db_checkdb`, default 0; set to 1 for the old behaviour).
+- One-time on upgrade: existing databases whose DIFF / CHECKDB checkbox was never changed by hand (no `mon.CheckChangeLog` row) are switched OFF too; open DIFF / CHECKDB issues close silently at the next cycle. Checkboxes switched on deliberately are kept.
+- Enable per database: `EXEC OPS.mon.usp_SetCheck @Database = N'MyDb', @Check = 'DIFF', @Enabled = 1;` (same with `'CHECKDB'`), or in the Check Editor.
+
 ## 5.7.2 — 2026-10-07
 - Failed SQL Agent jobs are **re-mailed daily** (`jobfail_reminder_minutes`, default 1440) until the job succeeds, is disabled or deleted, or the issue is acknowledged / muted. Reminder-only mails carry the subject prefix **STILL OPEN**. Independent of the generic `reminder_minutes`.
 
