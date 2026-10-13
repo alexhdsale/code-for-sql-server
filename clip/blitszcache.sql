@@ -61,3 +61,7 @@ Two other things sp_help shows:
 
 Type mismatch confirmed: the column is varchar(255) and the parameters arrive as varchar(30…80). Same type family, different length, which is what produces the per-parameter Compute Scalars. The app should bind them all as varchar(255), which also stops the one-plan-per-length-combination problem.
 Wide clustering key: the clustered PK is a varchar(255), and it is carried in every nonclustered index row. It isn’t worth changing now, but it makes the new index larger than you’d expect.
+
+
+App side (the proper fix): bind the parameters with a fixed type matching the column, e.g. varchar(255) or whatever the column is. The aliasing style looks like SQLAlchemy; if it is SQLAlchemy with pyodbc, that means use_setinputsizes=True (default in 2.0) with a proper String(n) column type. Better still, pass the list as a TVP or JSON and join to it, which gives one plan regardless of list length.
+Server side (mitigation only): enable optimize for ad hoc workloads to cut the cache memory used by single-use plans. It doesn’t remove the compiles.
