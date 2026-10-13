@@ -218,7 +218,8 @@ Server → **Reports → Custom Reports…** → `MON_Checks_and_Retention.rdl` 
 
 - **Off:** open issues of that check close **immediately and silently** (no RESOLVED email) when changed via the Check Editor or `usp_SetCheck`; with direct table edits, at the next cycle at the latest. The digest and alert sender also close them before sending, so a disabled check never appears in an email. The digest lists the change under *Monitoring configuration changes* and the database under *Monitoring coverage*.
 - **On:** if the problem exists, the issue re-opens at the next 5-minute cycle and an alert is sent. Event checks (DEADLOCK, ERRORLOG, MAIL) re-open events from the last `event_lookback_hours` (24 h) — expected.
-- **New database:** added automatically with all checks ON.
+- **New database:** added automatically with all checks ON **except DIFF backup and CHECKDB**, which start OFF (5.7.3; settings `new_db_diff_backup` / `new_db_checkdb`, 1 = ON). Enable them per database:
+  `EXEC OPS.mon.usp_SetCheck @Database = N'MyDb', @Check = 'DIFF', @Enabled = 1;` (same with `'CHECKDB'`).
 - **Dropped database:** stays in the matrix with a "no longer exists" issue. Switch it off with `@Check = 'MONITORED', @Enabled = 0`.
 - Thresholds are **not** in the matrix: they live in `mon.Setting` (global) and `mon.DatabasePolicy` (per-database SLA).
 
