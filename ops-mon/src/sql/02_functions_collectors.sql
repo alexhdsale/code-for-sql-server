@@ -272,9 +272,12 @@ BEGIN
           AND d.source_database_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM mon.DatabasePolicy AS p WHERE p.database_name = d.name);
 
-        /* Check matrix row for every new database: all checks ON (edit mon.DatabaseCheck to opt out). */
-        INSERT mon.DatabaseCheck(database_name)
-        SELECT d.name
+        /* Check matrix row for every new database: all checks ON except DIFF and CHECKDB, which follow
+           settings new_db_diff_backup / new_db_checkdb (default 0 = OFF) [5.7.3]. Edit mon.DatabaseCheck to change. */
+        INSERT mon.DatabaseCheck(database_name, diff_backup, checkdb)
+        SELECT d.name,
+               CASE WHEN ISNULL(mon.fn_SettingInt('new_db_diff_backup'), 0) = 1 THEN 1 ELSE 0 END,
+               CASE WHEN ISNULL(mon.fn_SettingInt('new_db_checkdb'), 0) = 1 THEN 1 ELSE 0 END
         FROM sys.databases AS d
         WHERE d.database_id > 4
           AND d.name <> N'rdsadmin'
