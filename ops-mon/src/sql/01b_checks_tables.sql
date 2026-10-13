@@ -427,3 +427,48 @@ BEGIN
     CREATE INDEX IX_mon_OlaCommand_Db   ON mon.OlaCommand(database_name, command_type, end_utc DESC) INCLUDE (error_number);
 END;
 GO
+
+/* [5.7.3] DIFF backup and CHECKDB start OFF.
+   New databases: usp_SyncPolicies uses settings new_db_diff_backup / new_db_checkdb (default 0).
+   One-time on the first install of 5.7.3 (settings not there yet): existing databases whose DIFF / CHECKDB
+   checkbox was never changed by a person (no row in mon.CheckChangeLog) are switched OFF too.
+   A checkbox someone switched on deliberately is kept. Open DIFF / CHECKDB issues close silently
+   at the next cycle (usp_CloseDisabledIssues). Switch on per database:
+       EXEC OPS.mon.usp_SetCheck @Database = N'MyDb', @Check = 'DIFF',    @Enabled = 1;
+       EXEC OPS.mon.usp_SetCheck @Database = N'MyDb', @Check = 'CHECKDB', @Enabled = 1;  */
+IF OBJECT_ID(N'mon.DatabaseCheck', N'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM mon.Setting WHERE setting_name = 'new_db_diff_backup')
+BEGIN
+    DECLARE @diff_off int, @chk_off int;
+
+    UPDATE c SET diff_backup = 0
+    FROM mon.DatabaseCheck AS c
+    WHERE c.diff_backup = 1
+      AND NOT EXISTS (SELECT 1 FROM mon.CheckChangeLog AS l
+                      WHERE l.object_name = 'DatabaseCheck' AND l.item_name = c.database_name
+                        AND l.property_name = N'diff_backup');
+    SET @diff_off = @@ROWCOUNT;
+
+    UPDATE c SET checkdb = 0
+    FROM mon.DatabaseCheck AS c
+    WHERE c.checkdb = 1
+      AND NOT EXISTS (SELECT 1 FROM mon.CheckChangeLog AS l
+                      WHERE l.object_name = 'DatabaseCheck' AND l.item_name = c.database_name
+                        AND l.property_name = N'checkdb');
+    SET @chk_off = @@ROWCOUNT;
+
+    PRINT CONCAT(N'5.7.3: DIFF backup check switched OFF for ', @diff_off, N' database(s), CHECKDB for ', @chk_off,
+                 N' (never changed by hand). Enable per database: EXEC OPS.mon.usp_SetCheck @Database = N''<db>'', @Check = ''DIFF'' | ''CHECKDB'', @Enabled = 1;');
+END;
+GO
+
+INSERT mon.Setting(setting_name, setting_value, value_type, category, description)
+SELECT v.n, v.v, v.t, v.c, v.d
+FROM (VALUES
+    ('new_db_diff_backup', N'0', 'bit', 'backup',
+     N'[5.7.3] DIFF backup check for newly discovered databases. 0 = OFF (default; enable per database with usp_SetCheck @Check = ''DIFF''), 1 = ON.'),
+    ('new_db_checkdb',     N'0', 'bit', 'backup',
+     N'[5.7.3] CHECKDB check for newly discovered databases. 0 = OFF (default; enable per database with usp_SetCheck @Check = ''CHECKDB''), 1 = ON.')
+) AS v(n, v, t, c, d)
+WHERE NOT EXISTS (SELECT 1 FROM mon.Setting AS s WHERE s.setting_name = v.n);
+GO
