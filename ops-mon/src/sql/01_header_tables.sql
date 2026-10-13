@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.7.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.7.3 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -35,6 +35,8 @@
                     RDS task times: UTC auto-detected (fixes backups shown "0s ago" / in the future).
              5.7.1: alert_style BRIEF (default) - the alert mail contains only the failure / resolution itself.
              5.7.2: failed Agent jobs are re-mailed daily (jobfail_reminder_minutes) until fixed / acknowledged / muted.
+             5.7.3: DIFF backup and CHECKDB checks start OFF for every database (settings new_db_diff_backup /
+                    new_db_checkdb = 0); switch them on per database with usp_SetCheck or the Check Editor.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -178,7 +180,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.7.2';
+DECLARE @version varchar(20) = '5.7.3';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
