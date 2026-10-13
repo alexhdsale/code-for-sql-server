@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.7.2 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.7.3 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -35,6 +35,8 @@
                     RDS task times: UTC auto-detected (fixes backups shown "0s ago" / in the future).
              5.7.1: alert_style BRIEF (default) - the alert mail contains only the failure / resolution itself.
              5.7.2: failed Agent jobs are re-mailed daily (jobfail_reminder_minutes) until fixed / acknowledged / muted.
+             5.7.3: DIFF backup and CHECKDB checks start OFF for every database (settings new_db_diff_backup /
+                    new_db_checkdb = 0); switch them on per database with usp_SetCheck or the Check Editor.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -178,7 +180,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.7.2';
+DECLARE @version varchar(20) = '5.7.3';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
@@ -1328,6 +1330,51 @@ BEGIN
 END;
 GO
 
+/* [5.7.3] DIFF backup and CHECKDB start OFF.
+   New databases: usp_SyncPolicies uses settings new_db_diff_backup / new_db_checkdb (default 0).
+   One-time on the first install of 5.7.3 (settings not there yet): existing databases whose DIFF / CHECKDB
+   checkbox was never changed by a person (no row in mon.CheckChangeLog) are switched OFF too.
+   A checkbox someone switched on deliberately is kept. Open DIFF / CHECKDB issues close silently
+   at the next cycle (usp_CloseDisabledIssues). Switch on per database:
+       EXEC OPS.mon.usp_SetCheck @Database = N'MyDb', @Check = 'DIFF',    @Enabled = 1;
+       EXEC OPS.mon.usp_SetCheck @Database = N'MyDb', @Check = 'CHECKDB', @Enabled = 1;  */
+IF OBJECT_ID(N'mon.DatabaseCheck', N'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM mon.Setting WHERE setting_name = 'new_db_diff_backup')
+BEGIN
+    DECLARE @diff_off int, @chk_off int;
+
+    UPDATE c SET diff_backup = 0
+    FROM mon.DatabaseCheck AS c
+    WHERE c.diff_backup = 1
+      AND NOT EXISTS (SELECT 1 FROM mon.CheckChangeLog AS l
+                      WHERE l.object_name = 'DatabaseCheck' AND l.item_name = c.database_name
+                        AND l.property_name = N'diff_backup');
+    SET @diff_off = @@ROWCOUNT;
+
+    UPDATE c SET checkdb = 0
+    FROM mon.DatabaseCheck AS c
+    WHERE c.checkdb = 1
+      AND NOT EXISTS (SELECT 1 FROM mon.CheckChangeLog AS l
+                      WHERE l.object_name = 'DatabaseCheck' AND l.item_name = c.database_name
+                        AND l.property_name = N'checkdb');
+    SET @chk_off = @@ROWCOUNT;
+
+    PRINT CONCAT(N'5.7.3: DIFF backup check switched OFF for ', @diff_off, N' database(s), CHECKDB for ', @chk_off,
+                 N' (never changed by hand). Enable per database: EXEC OPS.mon.usp_SetCheck @Database = N''<db>'', @Check = ''DIFF'' | ''CHECKDB'', @Enabled = 1;');
+END;
+GO
+
+INSERT mon.Setting(setting_name, setting_value, value_type, category, description)
+SELECT v.n, v.v, v.t, v.c, v.d
+FROM (VALUES
+    ('new_db_diff_backup', N'0', 'bit', 'backup',
+     N'[5.7.3] DIFF backup check for newly discovered databases. 0 = OFF (default; enable per database with usp_SetCheck @Check = ''DIFF''), 1 = ON.'),
+    ('new_db_checkdb',     N'0', 'bit', 'backup',
+     N'[5.7.3] CHECKDB check for newly discovered databases. 0 = OFF (default; enable per database with usp_SetCheck @Check = ''CHECKDB''), 1 = ON.')
+) AS v(n, v, t, c, d)
+WHERE NOT EXISTS (SELECT 1 FROM mon.Setting AS s WHERE s.setting_name = v.n);
+GO
+
 /* =============================================================================
    SECTION 3d  -  PERFORMANCE INDEXES   [rev 5.5]
    Idempotent: each index is created only if missing (or rebuilt with DROP_EXISTING
@@ -1655,9 +1702,12 @@ BEGIN
           AND d.source_database_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM mon.DatabasePolicy AS p WHERE p.database_name = d.name);
 
-        /* Check matrix row for every new database: all checks ON (edit mon.DatabaseCheck to opt out). */
-        INSERT mon.DatabaseCheck(database_name)
-        SELECT d.name
+        /* Check matrix row for every new database: all checks ON except DIFF and CHECKDB, which follow
+           settings new_db_diff_backup / new_db_checkdb (default 0 = OFF) [5.7.3]. Edit mon.DatabaseCheck to change. */
+        INSERT mon.DatabaseCheck(database_name, diff_backup, checkdb)
+        SELECT d.name,
+               CASE WHEN ISNULL(mon.fn_SettingInt('new_db_diff_backup'), 0) = 1 THEN 1 ELSE 0 END,
+               CASE WHEN ISNULL(mon.fn_SettingInt('new_db_checkdb'), 0) = 1 THEN 1 ELSE 0 END
         FROM sys.databases AS d
         WHERE d.database_id > 4
           AND d.name <> N'rdsadmin'
