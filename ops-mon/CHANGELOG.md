@@ -2,6 +2,9 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## 5.8.1 — 2026-10-14
+- Fix: 5.8.0 install failed its self-test — `mon.usp_CollectTempdb` was not created (Msg 10714: the RCSI-cutover `MERGE` had two `WHEN MATCHED … UPDATE` clauses; SQL Server allows one). ON and OFF switches are now one `WHEN MATCHED AND s.is_on <> t.is_on` with `CASE`. Re-run the installer; the engine resumes after the self-test passes.
+
 ## 5.8.0 — 2026-10-14
 - **tempdb / version store / RCSI before-after tracking** (new source file `03c_tempdb_rcsi.sql`). Every 5 minutes `mon.usp_CollectTempdb` stores: tempdb size / used / free split into user objects, internal objects, version store and mixed extents; per-file size, used, max size, growth setting; **version store per database** (`sys.dm_tran_version_store_space_usage`) with active versioning transactions and the longest one (who / which database / program); **top row-version generators** resolved to `schema.table` / index (`sys.dm_tran_top_version_generators`); **top tempdb consumers** (session + running tasks, login / host / program / database, statement text); cumulative tempdb I/O; tempdb **autogrowth events** from the default trace; RCSI / SI database counts. Tables `mon.TempdbSample`, `mon.TempdbFileSample`, `mon.TempdbVersionStoreDb`, `mon.TempdbVersionGenerator`, `mon.TempdbTopConsumer`, `mon.TempdbGrowthEvent`.
 - **RCSI cutover** is detected automatically per database and recorded in `mon.RcsiCutover` (raises a WARNING event `RCSI:<db>:<time>` once, check `RCSI`). Databases already ON when monitoring starts get no date — set it with `EXEC OPS.mon.usp_SetRcsiCutover @Database = N'MyDb', @EnabledLocal = '2026-10-20 22:00';`.
