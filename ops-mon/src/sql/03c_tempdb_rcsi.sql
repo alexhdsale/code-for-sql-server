@@ -520,13 +520,17 @@ BEGIN
                     CASE WHEN @first = 1 THEN 'INSTALL' ELSE 'AUTO' END,
                     CASE WHEN @first = 1 THEN N'RCSI was already ON when tempdb monitoring started; no pre-RCSI baseline. Set the real date: EXEC mon.usp_SetRcsiCutover.'
                          ELSE N'RCSI switched ON (detected by the collector).' END)
-        WHEN MATCHED AND s.is_on = 1 AND t.is_on = 0 THEN
-            UPDATE SET is_on = 1, enabled_utc = @now, disabled_utc = NULL, change_utc = @now,
-                       source = CASE WHEN t.source = 'MANUAL' THEN 'MANUAL' ELSE 'AUTO' END,
-                       note = N'RCSI switched ON (detected by the collector).', modified_utc = @now, modified_by = N'mon.usp_CollectTempdb'
-        WHEN MATCHED AND s.is_on = 0 AND t.is_on = 1 THEN
-            UPDATE SET is_on = 0, disabled_utc = @now, change_utc = @now,
-                       note = N'RCSI switched OFF (detected by the collector).', modified_utc = @now, modified_by = N'mon.usp_CollectTempdb';
+        /* [5.8.1] one WHEN MATCHED ... UPDATE only (Msg 10714): ON and OFF switches handled with CASE */
+        WHEN MATCHED AND s.is_on <> t.is_on THEN
+            UPDATE SET is_on        = s.is_on,
+                       enabled_utc  = CASE WHEN s.is_on = 1 THEN @now ELSE t.enabled_utc END,
+                       disabled_utc = CASE WHEN s.is_on = 1 THEN NULL ELSE @now END,
+                       change_utc   = @now,
+                       source       = CASE WHEN s.is_on = 1 AND t.source <> 'MANUAL' THEN 'AUTO' ELSE t.source END,
+                       note         = CASE WHEN s.is_on = 1 THEN N'RCSI switched ON (detected by the collector).'
+                                           ELSE N'RCSI switched OFF (detected by the collector).' END,
+                       modified_utc = @now,
+                       modified_by  = N'mon.usp_CollectTempdb';
     END TRY
     BEGIN CATCH
         SET @errors = CONCAT(@errors, N' RCSI: ', ERROR_MESSAGE());
