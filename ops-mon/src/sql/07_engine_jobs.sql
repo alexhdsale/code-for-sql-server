@@ -89,6 +89,7 @@ BEGIN
                 EXEC mon.usp_CollectEvents @ReadErrorLog = @read_elog;
                 IF @read_elog = 1 SET @next_elog = DATEADD(MINUTE, @elog_m, SYSUTCDATETIME());
                 EXEC mon.usp_CollectPerf;
+                EXEC mon.usp_CollectTempdb;          /* [5.8] tempdb / version store / RCSI */
                 EXEC mon.usp_EvaluateIssues @Scope = 'ALL';
                 EXEC mon.usp_SendAlerts;
                 EXEC mon.usp_SetComponentStatus 'ENGINE_CYCLE', 1, @cycle_start;
@@ -151,13 +152,17 @@ BEGIN
             @bk_days    int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_backup_days'), N'')), @days),
             @iss_days   int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_issue_days'), N'')), @days),
             @mail_days  int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_email_days'), N'')), @days),
-            @audit_days int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_audit_days'), N'')), 4 * @days);
+            @audit_days int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_audit_days'), N'')), 4 * @days),
+            @tdb_days   int = ISNULL(mon.fn_SettingInt('retention_tempdb_days'), 30),               /* [5.8] */
+            @tdbd_days  int = ISNULL(mon.fn_SettingInt('retention_tempdb_daily_days'), 400);
     DECLARE @cut datetime2(0) = DATEADD(DAY, -@days, SYSUTCDATETIME()),
             @bcut datetime2(0) = DATEADD(DAY, -@bdays, SYSUTCDATETIME()),
             @pcut datetime2(0) = DATEADD(DAY, -@perf_days, SYSUTCDATETIME()),
             @kcut datetime2(0) = DATEADD(DAY, -@bk_days, SYSUTCDATETIME()),
             @icut datetime2(0) = DATEADD(DAY, -@iss_days, SYSUTCDATETIME()),
             @mcut datetime2(0) = DATEADD(DAY, -@mail_days, SYSUTCDATETIME()),
+            @tcut datetime2(0) = DATEADD(DAY, -@tdb_days, SYSUTCDATETIME()),
+            @tdcut datetime2(0) = DATEADD(DAY, -@tdbd_days, SYSUTCDATETIME()),
             @n int, @started datetime2(3) = SYSUTCDATETIME();
 
     BEGIN TRY
@@ -168,6 +173,14 @@ BEGIN
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.StorageSample     WHERE sample_utc < @pcut;        SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.WaitStatsSnapshot WHERE snapshot_utc < @pcut;      SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.FileStatsSnapshot WHERE snapshot_utc < @pcut;      SET @n = @@ROWCOUNT; END;
+        /* [5.8] tempdb raw samples (retention_tempdb_days) and daily aggregates / growth events (retention_tempdb_daily_days) */
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbTopConsumer     WHERE sample_utc < @tcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbVersionGenerator WHERE sample_utc < @tcut;       SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbVersionStoreDb  WHERE sample_utc < @tcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbFileSample      WHERE sample_utc < @tcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbSample          WHERE sample_utc < @tcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbGrowthEvent     WHERE event_utc < @tdcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbDaily           WHERE report_date < CONVERT(date, @tdcut); SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.AgentJobRun       WHERE run_start_utc < @cut;     SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.AgentFailure      WHERE run_start_utc < @cut;     SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (1000) FROM mon.Deadlock          WHERE event_utc < @cut;         SET @n = @@ROWCOUNT; END;
@@ -213,6 +226,7 @@ BEGIN
     BEGIN TRY EXEC mon.usp_EvaluateIssues @Scope = 'WATCHDOG'; END TRY BEGIN CATCH END CATCH;
     BEGIN TRY EXEC mon.usp_SendAlerts;                         END TRY BEGIN CATCH END CATCH;
     BEGIN TRY EXEC mon.usp_RunScheduledEmails;                 END TRY BEGIN CATCH END CATCH;   /* [5.6] summary + full report schedule */
+    BEGIN TRY EXEC mon.usp_RunTempdbReport;                    END TRY BEGIN CATCH END CATCH;   /* [5.8] daily "MON - TempDB RCSI" email */
     IF DATEPART(HOUR, SYSUTCDATETIME()) % 6 = 0
     BEGIN
         BEGIN TRY EXEC mon.usp_Purge; END TRY BEGIN CATCH END CATCH;
@@ -268,7 +282,7 @@ DECLARE @owner sysname = SUSER_SNAME(),
         @cmd nvarchar(max) = N'SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
 SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
 EXEC mon.usp_EngineLoop;',
-        @desc nvarchar(512) = N'OPS.mon engine: blocking sampler every 30 s; collectors, issue evaluation and change-only alert mail every 5 min. Loops ~55 min per execution; scheduled every minute (Agent skips starts while running).';
+        @desc nvarchar(512) = N'OPS.mon engine: blocking sampler every 30 s; collectors (incl. tempdb / version store / RCSI), issue evaluation and change-only alert mail every 5 min. Loops ~55 min per execution; scheduled every minute (Agent skips starts while running).';
 
 IF NOT EXISTS (SELECT 1 FROM dbo.sysjobs WHERE name = @job)
 BEGIN
@@ -307,7 +321,7 @@ DECLARE @owner sysname = SUSER_SNAME(),
         @cmd nvarchar(max) = N'SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
 SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
 EXEC mon.usp_RunHourly;',
-        @desc nvarchar(512) = N'OPS.mon hourly: engine watchdog (alerts if MON - Engine stops), scheduled summary and full report emails (mon.Setting summary_* / full_report_*), history purge every 6 h.';
+        @desc nvarchar(512) = N'OPS.mon hourly: engine watchdog (alerts if MON - Engine stops), scheduled summary and full report emails (mon.Setting summary_* / full_report_*), daily MON - TempDB RCSI email (tempdb_report_*), history purge every 6 h.';
 
 IF NOT EXISTS (SELECT 1 FROM dbo.sysjobs WHERE name = @job)
 BEGIN
@@ -359,6 +373,7 @@ EXEC mon.usp_CollectAgent;
 EXEC mon.usp_CollectOlaCommandLog;
 EXEC mon.usp_CollectEvents @ReadErrorLog = 1;
 EXEC mon.usp_CollectPerf;
+EXEC mon.usp_CollectTempdb;
 EXEC mon.usp_CaptureBlocking;
 EXEC mon.usp_SnapshotBackupInventory @Force = 1;
 EXEC mon.usp_EvaluateIssues @Scope = 'ALL';
@@ -395,6 +410,7 @@ GO
 EXEC mon.usp_ShowChecks;
 EXEC mon.usp_ShowBackupRetention @Live = 0;
 EXEC mon.usp_ShowOlaLog @Hours = 168;
+EXEC mon.usp_ShowTempdb @Days = 7;
 GO
 
 /*
@@ -447,7 +463,14 @@ GO
         UPDATE OPS.mon.Setting SET setting_value = N'0' WHERE setting_name = 'engine_enabled';   -- stops within 30 s
         UPDATE OPS.mon.Setting SET setting_value = N'1' WHERE setting_name = 'engine_enabled';   -- next minute
 
- 8. When satisfied, retire the previous version (optional, manual):
+ 8. tempdb / RCSI (rev 5.8): the daily "MON - TempDB RCSI" email compares tempdb before and after RCSI.
+        EXEC OPS.mon.usp_SendTempdbReport @PreviewOnly = 1;                         -- html only
+        EXEC OPS.mon.usp_SendTempdbReport @Force = 1;                               -- send now (yesterday)
+        EXEC OPS.mon.usp_SetRcsiCutover @Database = N'YourDb', @EnabledLocal = '2026-10-20 22:00', @Note = N'CHG-1234';
+        EXEC OPS.mon.usp_ShowTempdb;                                                -- now, cutovers, daily, by database, generators, consumers
+        UPDATE OPS.mon.Setting SET setting_value = N'7' WHERE setting_name = 'tempdb_report_hours_local';   -- send at 07:00
+
+ 9. When satisfied, retire the previous version (optional, manual):
         EXEC msdb.dbo.sp_update_job @job_name = N'OPS - Backup and Maintenance Monitor',   @enabled = 0;
         EXEC msdb.dbo.sp_update_job @job_name = N'OPS - Daily Backup and Maintenance Report', @enabled = 0;
 

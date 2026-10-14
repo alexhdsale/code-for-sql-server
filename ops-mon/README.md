@@ -2,7 +2,7 @@
 
 Self-contained monitoring for SQL Server / Amazon RDS for SQL Server. Everything lives in **one schema (`mon`) of the OPS database**; the only objects outside it are two SQL Agent jobs (`MON - Engine`, `MON - Digest & Watchdog`). Easy to upgrade, move or remove as one unit.
 
-**Current version: 5.7.3** — see [CHANGELOG.md](CHANGELOG.md).
+**Current version: 5.8.0** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 1. Open [`install/MON_Install.sql`](install/MON_Install.sql) in SSMS (RDS master login) and run the whole file. It is idempotent: re-running upgrades in place and keeps settings, check matrix and history.
@@ -31,5 +31,7 @@ EXEC OPS.mon.usp_SendSummary;           -- short status email now
 EXEC OPS.mon.usp_AckIssue @KeyPattern = N'<key>', @Note = N'on it';
 EXEC OPS.mon.usp_ShowBackupRetention;   -- backup history, files, retention
 EXEC OPS.mon.usp_ShowOlaLog;            -- Ola Hallengren CommandLog
+EXEC OPS.mon.usp_ShowTempdb;            -- tempdb / version store / RCSI before-after (5.8)
+EXEC OPS.mon.usp_SendTempdbReport @PreviewOnly = 1;   -- the daily "MON - TempDB RCSI" email, html only
 SELECT * FROM OPS.mon.vw_ActiveIssues;  -- open issues now
 ```

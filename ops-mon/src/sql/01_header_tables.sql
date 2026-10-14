@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.7.3 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.8.0 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -37,6 +37,14 @@
              5.7.2: failed Agent jobs are re-mailed daily (jobfail_reminder_minutes) until fixed / acknowledged / muted.
              5.7.3: DIFF backup and CHECKDB checks start OFF for every database (settings new_db_diff_backup /
                     new_db_checkdb = 0); switch them on per database with usp_SetCheck or the Check Editor.
+             5.8.0: tempdb / version store / RCSI before-after tracking (03c): 5-minute samples of tempdb
+                    space split, version store per database, row-version generators (objects), top tempdb
+                    consumers with statement text, autogrowth events, RCSI cutover detection (mon.RcsiCutover),
+                    daily aggregates (mon.TempdbDaily); separate daily email "MON - TempDB RCSI"
+                    (usp_SendTempdbReport: day vs previous day vs 7-day baseline, BEFORE vs AFTER RCSI);
+                    checks TEMPDB_VS, TEMPDB_GROWTH, RCSI. Installer: self-test failures are printed in the
+                    Messages tab; a forced mail_profile that does not exist on this instance falls back to
+                    the only profile defined here.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -180,7 +188,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.7.3';
+DECLARE @version varchar(20) = '5.8.0';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
@@ -337,6 +345,30 @@ WHEN MATCHED AND (s.force_update = 1 OR t.description <> s.description OR t.cate
                category      = s.category,
                modified_utc  = SYSUTCDATETIME(),
                modified_by   = ORIGINAL_LOGIN();
+GO
+
+/* [5.8] Deploying the same script on another instance: the forced mail_profile ('Notifications') may not
+   exist there. If exactly one Database Mail profile is defined on this instance, use it (and say so). */
+BEGIN TRY
+    DECLARE @mp sysname = (SELECT setting_value FROM mon.Setting WHERE setting_name = 'mail_profile'),
+            @only sysname = NULL, @nprof int = 0;
+    SELECT @nprof = COUNT(*), @only = MAX(name) FROM msdb.dbo.sysmail_profile;
+    IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profile WHERE name = @mp)
+    BEGIN
+        IF @nprof = 1
+        BEGIN
+            UPDATE mon.Setting SET setting_value = @only, modified_utc = SYSUTCDATETIME(), modified_by = ORIGINAL_LOGIN()
+            WHERE setting_name = 'mail_profile';
+            PRINT CONCAT(N'mail_profile: ''', @mp, N''' does not exist on this instance - using the only Database Mail profile here: ''', @only, N'''.');
+        END
+        ELSE
+            PRINT CONCAT(N'WARNING: mail_profile ''', @mp, N''' does not exist on this instance (', @nprof,
+                         N' profile(s) in msdb.dbo.sysmail_profile). The self-test will fail: UPDATE OPS.mon.Setting SET setting_value = N''<profile>'' WHERE setting_name = ''mail_profile''; and re-run.');
+    END;
+END TRY
+BEGIN CATCH
+    PRINT CONCAT(N'mail_profile check skipped: ', ERROR_MESSAGE());
+END CATCH;
 GO
 
 IF OBJECT_ID(N'mon.DatabasePolicy', N'U') IS NULL

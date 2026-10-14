@@ -124,6 +124,7 @@ CREATE OR ALTER PROCEDURE mon.usp_SelfTest
     @Deep       bit = 0,
     @Since      datetime2(0) = NULL,      /* server time: objects created since then must all be in [mon] */
     @Quiet      bit = 0,
+    @Print      bit = 0,                  /* [5.8] also PRINT every ERROR / WARN row (visible in the SSMS Messages tab) */
     @Errors     int = NULL OUTPUT,
     @Warnings   int = NULL OUTPUT
 AS
@@ -148,7 +149,9 @@ BEGIN
                  (N'mon.usp_SendAlertsCore'), (N'mon.usp_SendDailyDigest'), (N'mon.usp_CloseDisabledIssues'),
                  (N'mon.usp_SetCheck'), (N'mon.usp_ShowChecks'), (N'mon.usp_ShowBackupRetention'),
                  (N'mon.usp_ShowOlaLog'), (N'mon.usp_ShowEmailStats'),
-                 (N'mon.usp_SendSummary'), (N'mon.usp_RunScheduledEmails'), (N'mon.usp_AckIssue'), (N'mon.usp_ResolveIssue'), (N'mon.usp_ShowDataRetention')) AS r(n);
+                 (N'mon.usp_SendSummary'), (N'mon.usp_RunScheduledEmails'), (N'mon.usp_AckIssue'), (N'mon.usp_ResolveIssue'), (N'mon.usp_ShowDataRetention'),
+                 (N'mon.TempdbSample'), (N'mon.TempdbDaily'), (N'mon.RcsiCutover'), (N'mon.usp_CollectTempdb'), (N'mon.usp_SnapshotTempdbDaily'),
+                 (N'mon.usp_SendTempdbReport'), (N'mon.usp_RunTempdbReport'), (N'mon.usp_SetRcsiCutover'), (N'mon.usp_ShowTempdb')) AS r(n);
 
     /* 2. Every view in [mon] binds (cheap, no side effects) */
     DECLARE v CURSOR LOCAL FAST_FORWARD FOR
@@ -287,6 +290,22 @@ BEGIN
     FROM #T;
     SELECT @Errors = ISNULL(@Errors, 0), @Warnings = ISNULL(@Warnings, 0);
 
+    IF @Print = 1
+    BEGIN
+        DECLARE @line nvarchar(4000);
+        DECLARE pr CURSOR LOCAL FAST_FORWARD FOR
+            SELECT CONCAT(N'  ', result, N'  ', check_name, N' - ', ISNULL(object_name, N''), CASE WHEN detail IS NOT NULL THEN CONCAT(N': ', detail) ELSE N'' END)
+            FROM #T WHERE result <> 'OK'
+            ORDER BY CASE result WHEN 'ERROR' THEN 0 ELSE 1 END, seq;
+        OPEN pr; FETCH NEXT FROM pr INTO @line;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            PRINT @line;
+            FETCH NEXT FROM pr INTO @line;
+        END;
+        CLOSE pr; DEALLOCATE pr;
+    END;
+
     IF @Quiet = 0
         SELECT result AS [Result], check_name AS [Check], object_name AS [Object], detail AS [Detail]
         FROM #T
@@ -309,7 +328,8 @@ IF @rid IS NULL OR NOT EXISTS (SELECT 1 FROM mon.ReleaseHistory WHERE release_id
 SELECT @since = started_server_time, @prev_engine = prev_engine_enabled, @version = version
 FROM mon.ReleaseHistory WHERE release_id = @rid;
 
-EXEC mon.usp_SelfTest @Deep = 1, @Since = @since, @Quiet = 1, @Errors = @e OUTPUT, @Warnings = @w OUTPUT;
+PRINT N'Self-test (every ERROR / WARN row is also listed in the result set above):';
+EXEC mon.usp_SelfTest @Deep = 1, @Since = @since, @Quiet = 1, @Print = 1, @Errors = @e OUTPUT, @Warnings = @w OUTPUT;
 
 IF @e = 0
 BEGIN
@@ -324,7 +344,7 @@ BEGIN
     UPDATE mon.ReleaseHistory SET status = 'FAILED', finished_utc = SYSUTCDATETIME(), selftest_errors = @e, selftest_warnings = @w,
            notes = N'Self-test failed: engine left paused. Fix the errors listed by EXEC OPS.mon.usp_SelfTest @Deep = 1; and re-run the installer.'
     WHERE release_id = @rid;
-    RAISERROR(N'MON %s install FAILED the self-test (%d error(s)). The engine stays PAUSED (engine_enabled = 0) so the previous alerts are not replaced by a broken version. See the result set above, fix, and re-run the installer.', 16, 1, @version, @e);
+    RAISERROR(N'MON %s install FAILED the self-test (%d error(s)). The engine stays PAUSED (engine_enabled = 0) so the previous alerts are not replaced by a broken version. The ERROR rows are printed above in this Messages tab (and in the Results tab); fix them and re-run the installer. Typical on a new instance: Database Mail profile missing (UPDATE OPS.mon.Setting SET setting_value = N''<profile>'' WHERE setting_name = ''mail_profile'').', 16, 1, @version, @e);
 END;
 GO
 

@@ -419,8 +419,10 @@ BEGIN
            CASE WHEN r.setting_name IS NULL THEN N'kept (configuration / current state)'
                 ELSE CONCAT(COALESCE(TRY_CONVERT(int, NULLIF(s.setting_value, N'')),
                                      CASE r.setting_name WHEN 'retention_audit_days' THEN 4 * @days
-                                                         WHEN 'blocking_sample_retention_days' THEN 30 ELSE @days END), N' days (', r.setting_name,
-                            CASE WHEN NULLIF(s.setting_value, N'') IS NULL AND r.setting_name NOT IN ('history_retention_days', 'blocking_sample_retention_days')
+                                                         WHEN 'blocking_sample_retention_days' THEN 30
+                                                         WHEN 'retention_tempdb_days' THEN 30
+                                                         WHEN 'retention_tempdb_daily_days' THEN 400 ELSE @days END), N' days (', r.setting_name,
+                            CASE WHEN NULLIF(s.setting_value, N'') IS NULL AND r.setting_name NOT IN ('history_retention_days', 'blocking_sample_retention_days', 'retention_tempdb_days', 'retention_tempdb_daily_days')
                                  THEN N' = default' ELSE N'' END, N')') END AS [Retention],
            SUM(CASE WHEN p.index_id IN (0, 1) THEN p.row_count ELSE 0 END) AS [Rows],
            CONVERT(decimal(19,1), SUM(p.reserved_page_count) * 8 / 1024.0) AS [Reserved MB]
@@ -430,6 +432,10 @@ BEGIN
         (N'PerfSample', 'retention_perf_days', N'performance'), (N'CpuSample', 'retention_perf_days', N'performance'),
         (N'StorageSample', 'retention_perf_days', N'performance'), (N'WaitStatsSnapshot', 'retention_perf_days', N'performance'),
         (N'FileStatsSnapshot', 'retention_perf_days', N'performance'),
+        (N'TempdbSample', 'retention_tempdb_days', N'tempdb'), (N'TempdbFileSample', 'retention_tempdb_days', N'tempdb'),
+        (N'TempdbVersionStoreDb', 'retention_tempdb_days', N'tempdb'), (N'TempdbVersionGenerator', 'retention_tempdb_days', N'tempdb'),
+        (N'TempdbTopConsumer', 'retention_tempdb_days', N'tempdb'), (N'TempdbGrowthEvent', 'retention_tempdb_daily_days', N'tempdb'),
+        (N'TempdbDaily', 'retention_tempdb_daily_days', N'tempdb'),
         (N'TlogBackup', 'retention_backup_days', N'backups'), (N'RdsTask', 'retention_backup_days', N'backups'),
         (N'OlaCommand', 'retention_backup_days', N'backups'), (N'BackupInventoryDaily', 'retention_backup_days', N'backups'),
         (N'Issue', 'retention_issue_days', N'issues (resolved only)'), (N'IssueChange', 'retention_issue_days', N'issues (resolved only)'),

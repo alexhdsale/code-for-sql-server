@@ -1,4 +1,4 @@
-# OPS.mon — Operations Guide (rev 5.7)
+# OPS.mon — Operations Guide (rev 5.8)
 
 How to **deploy** the monitor, how its **SQL Agent jobs** work, how long **data** is kept, how the **three kinds of email** are scheduled, and how **issues get resolved**.
 
@@ -67,6 +67,8 @@ The installer pauses the engine, installs, runs the self-test and resumes the en
 EXEC OPS.mon.usp_SelfTest @Deep = 1;            -- lists every ERROR / WARN with the object and the reason
 ```
 Fix the cause (usually a missing permission or Database Mail profile) and **run the installer again**. Until then the engine stays paused (`engine_enabled = 0`) and the hourly watchdog raises the CRITICAL issue `MON_RELEASE`.
+
+Since 5.8 the installer **prints every ERROR / WARN row in the SSMS Messages tab** right before the red failure message, so you do not have to look for the result set in the Results tab. On a new instance the usual cause is the Database Mail profile: the installer forces `mail_profile = 'Notifications'`; if that profile does not exist but exactly one profile is defined, the installer switches to it automatically (printed), otherwise it prints the `UPDATE OPS.mon.Setting ... 'mail_profile'` to run. The "99+" errors in the SSMS Error List while the file is open are IntelliSense (it does not know the `mon` objects until they exist) and can be ignored.
 
 ### 1.6 Uninstall / move to another server
 
@@ -286,6 +288,40 @@ An issue is **really resolved only when its cause is fixed**: the engine re-chec
 
 ---
 
+## 5.5 tempdb / version store / RCSI (rev 5.8)
+
+Switching a database to **READ COMMITTED SNAPSHOT** moves row versions into the tempdb version store. Rev 5.8 measures tempdb before and after the switch:
+
+| What | Where | How often |
+|---|---|---|
+| tempdb size / used / free, user objects, internal objects, version store, mixed extents, data file count and skew, tempdb log, versioning transactions (count, longest, who), sessions using tempdb, top session, RCSI / SI database counts, cumulative tempdb I/O | `mon.TempdbSample` | every 5 min (`mon.usp_CollectTempdb`, in `MON - Engine`) |
+| per-file size / used / max size / growth setting | `mon.TempdbFileSample` | every 5 min |
+| version store **per database**, active versioning transactions, longest | `mon.TempdbVersionStoreDb` | every 5 min |
+| **objects** generating row versions (`schema.table`, index) | `mon.TempdbVersionGenerator` | every 5 min, top `tempdb_top_generators` (10) |
+| top tempdb consumers: login / host / program / database / statement, user + internal MB | `mon.TempdbTopConsumer` | every 5 min, sessions holding ≥ `tempdb_top_min_mb` (50 MB), top `tempdb_top_consumers` (10) |
+| tempdb autogrowth events (default trace) | `mon.TempdbGrowthEvent` | every `tempdb_growth_scan_minutes` (15) |
+| RCSI cutover per database (auto-detected) | `mon.RcsiCutover` | every 5 min |
+| daily aggregates: min / avg / p95 / max, I/O per day, autogrowths | `mon.TempdbDaily` | hourly (`mon.usp_SnapshotTempdbDaily`) |
+
+Retention: raw samples `retention_tempdb_days` (30), daily aggregates and growth events `retention_tempdb_daily_days` (400).
+
+**Email "MON - TempDB RCSI"** — separate from the digest, once a day at `tempdb_report_hours_local` (08:00) on `tempdb_report_weekdays`, to `tempdb_report_recipients` (empty = `report_recipients`); `tempdb_report_enabled = 0` switches it off. Sections: KPI tiles; **reported day vs previous day vs 7-day baseline** (avg / p95 / max per metric, colored deltas of the daily max); **BEFORE vs AFTER RCSI** (`rcsi_compare_days` = 7 days before the first cutover vs everything since the last cutover; "no cutover yet" while the baseline is being collected); version store by database; top row-version generators; top tempdb consumers with statements; hourly profile (bars); tempdb files + autogrowths.
+
+```sql
+EXEC OPS.mon.usp_SendTempdbReport @PreviewOnly = 1;      -- html only (copy html_body into a .html file)
+EXEC OPS.mon.usp_SendTempdbReport @Force = 1;            -- send now (yesterday)
+EXEC OPS.mon.usp_SendTempdbReport @Date = '2026-10-20';  -- a specific local day
+EXEC OPS.mon.usp_ShowTempdb;                             -- SSMS: now, cutovers, daily table, by database, generators, consumers
+-- the real cutover (the collector records the time it first SAW the switch; databases already ON at install have no date):
+EXEC OPS.mon.usp_SetRcsiCutover @Database = N'MyDb', @EnabledLocal = '2026-10-20 22:00', @Note = N'CHG-1234';
+```
+
+Checks (switch in `mon.ServerCheck`, alerts go through the normal alert mail): **TEMPDB_VS** — version store ≥ `tempdb_vs_warn_pct` (50 %) / `tempdb_vs_crit_pct` (75 %) of the allocated tempdb size, or a transaction holding the version store longer than `vs_tran_warn_minutes` (30) / `vs_tran_crit_minutes` (120) — the issue names the session, login, database and program; **TEMPDB_GROWTH** — ≥ `tempdb_growth_warn_per_hour` (10) autogrowths in the last hour; **RCSI** — a database switched RCSI ON / OFF (event, once).
+
+What to expect after RCSI: version store grows with the UPDATE / DELETE rate and lives as long as the **longest open transaction** that started before those versions — the "Longest versioning tran" line and the TEMPDBVS:TRAN issue are the ones to watch; "Top row-version generators" tells which tables pay for it.
+
+---
+
 ## 6. Quick reference
 
 ```sql
@@ -296,5 +332,6 @@ EXEC OPS.mon.usp_SendSummary;            -- short status email now
 EXEC OPS.mon.usp_ShowEmailStats;         -- emails per day / type
 EXEC OPS.mon.usp_ShowDataRetention;      -- data volume and retention
 EXEC OPS.mon.usp_ShowBackupRetention;    -- backup history, files, retention
+EXEC OPS.mon.usp_ShowTempdb;             -- tempdb / version store / RCSI before-after
 SELECT * FROM OPS.mon.Setting ORDER BY category, setting_name;   -- every setting with a description
 ```

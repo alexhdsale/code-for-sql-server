@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.7.3 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.8.0 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -37,6 +37,14 @@
              5.7.2: failed Agent jobs are re-mailed daily (jobfail_reminder_minutes) until fixed / acknowledged / muted.
              5.7.3: DIFF backup and CHECKDB checks start OFF for every database (settings new_db_diff_backup /
                     new_db_checkdb = 0); switch them on per database with usp_SetCheck or the Check Editor.
+             5.8.0: tempdb / version store / RCSI before-after tracking (03c): 5-minute samples of tempdb
+                    space split, version store per database, row-version generators (objects), top tempdb
+                    consumers with statement text, autogrowth events, RCSI cutover detection (mon.RcsiCutover),
+                    daily aggregates (mon.TempdbDaily); separate daily email "MON - TempDB RCSI"
+                    (usp_SendTempdbReport: day vs previous day vs 7-day baseline, BEFORE vs AFTER RCSI);
+                    checks TEMPDB_VS, TEMPDB_GROWTH, RCSI. Installer: self-test failures are printed in the
+                    Messages tab; a forced mail_profile that does not exist on this instance falls back to
+                    the only profile defined here.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -180,7 +188,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.7.3';
+DECLARE @version varchar(20) = '5.8.0';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
@@ -337,6 +345,30 @@ WHEN MATCHED AND (s.force_update = 1 OR t.description <> s.description OR t.cate
                category      = s.category,
                modified_utc  = SYSUTCDATETIME(),
                modified_by   = ORIGINAL_LOGIN();
+GO
+
+/* [5.8] Deploying the same script on another instance: the forced mail_profile ('Notifications') may not
+   exist there. If exactly one Database Mail profile is defined on this instance, use it (and say so). */
+BEGIN TRY
+    DECLARE @mp sysname = (SELECT setting_value FROM mon.Setting WHERE setting_name = 'mail_profile'),
+            @only sysname = NULL, @nprof int = 0;
+    SELECT @nprof = COUNT(*), @only = MAX(name) FROM msdb.dbo.sysmail_profile;
+    IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profile WHERE name = @mp)
+    BEGIN
+        IF @nprof = 1
+        BEGIN
+            UPDATE mon.Setting SET setting_value = @only, modified_utc = SYSUTCDATETIME(), modified_by = ORIGINAL_LOGIN()
+            WHERE setting_name = 'mail_profile';
+            PRINT CONCAT(N'mail_profile: ''', @mp, N''' does not exist on this instance - using the only Database Mail profile here: ''', @only, N'''.');
+        END
+        ELSE
+            PRINT CONCAT(N'WARNING: mail_profile ''', @mp, N''' does not exist on this instance (', @nprof,
+                         N' profile(s) in msdb.dbo.sysmail_profile). The self-test will fail: UPDATE OPS.mon.Setting SET setting_value = N''<profile>'' WHERE setting_name = ''mail_profile''; and re-run.');
+    END;
+END TRY
+BEGIN CATCH
+    PRINT CONCAT(N'mail_profile check skipped: ', ERROR_MESSAGE());
+END CATCH;
 GO
 
 IF OBJECT_ID(N'mon.DatabasePolicy', N'U') IS NULL
@@ -3087,6 +3119,712 @@ BEGIN
     FROM mon.OlaSource;
 END;
 GO
+/* =============================================================================
+   SECTION 7c  -  TEMPDB USAGE / VERSION STORE / RCSI BEFORE-AFTER TRACKING   [rev 5.8]
+
+   Why: READ COMMITTED SNAPSHOT (RCSI) moves row versions into the tempdb version
+   store. This module measures tempdb before and after the switch so the effect is
+   a number, not an impression.
+
+   Every collect_interval_minutes (5 min) mon.usp_CollectTempdb stores:
+     mon.TempdbSample            one row per sample: tempdb size / used / free, user objects,
+                                 internal objects, version store, mixed extents, data file
+                                 count + skew, tempdb log, version-store transactions (count,
+                                 longest, who), sessions using tempdb, top session, RCSI / SI
+                                 database counts, cumulative tempdb I/O (deltas at report time).
+     mon.TempdbFileSample        per tempdb file: size, used, max size, growth setting.
+     mon.TempdbVersionStoreDb    version store reserved per database (sys.dm_tran_version_store_space_usage)
+                                 + active snapshot transactions per database.
+     mon.TempdbVersionGenerator  top objects generating row versions (sys.dm_tran_top_version_generators,
+                                 resolved to schema.table / index).
+     mon.TempdbTopConsumer       top sessions by tempdb allocation (session + running tasks) with
+                                 login / host / program / database / statement text.
+     mon.TempdbGrowthEvent       tempdb autogrowth events from the default trace (scanned every
+                                 tempdb_growth_scan_minutes).
+     mon.RcsiCutover             when RCSI was switched ON / OFF per database (auto-detected; or
+                                 EXEC mon.usp_SetRcsiCutover for the real date).
+     mon.TempdbDaily             one row per local day (min / avg / p95 / max of the samples), kept
+                                 retention_tempdb_daily_days (default 400) - the before/after and
+                                 7-day baseline source. Raw samples are kept retention_tempdb_days (30).
+
+   Checks (mon.ServerCheck, switchable):
+     TEMPDB_VS      version store >= tempdb_vs_warn_pct / tempdb_vs_crit_pct of tempdb size (TEMPDBVS:SIZE),
+                    a transaction has held the version store longer than vs_tran_warn_minutes /
+                    vs_tran_crit_minutes (TEMPDBVS:TRAN).
+     TEMPDB_GROWTH  tempdb autogrew >= tempdb_growth_warn_per_hour times in the last hour.
+     RCSI           RCSI switched ON / OFF for a database (event; the cutover is recorded).
+
+   Email: "MON - TempDB RCSI", separate from the digest (06c_tempdb_report.sql).
+   ============================================================================= */
+USE [OPS];
+GO
+
+INSERT mon.Setting(setting_name, setting_value, value_type, category, description)
+SELECT v.n, v.v, v.t, v.c, v.d
+FROM (VALUES
+    ('tempdb_collect_enabled',       N'1',    'bit',  'tempdb', N'Master switch for the tempdb / version store / RCSI collector (every collect_interval_minutes).'),
+    ('tempdb_top_consumers',         N'10',   'int',  'tempdb', N'Sessions stored per sample, by tempdb allocation (user + internal objects, session + running tasks).'),
+    ('tempdb_top_min_mb',            N'50',   'int',  'tempdb', N'A session is stored as a top consumer only when it holds at least this many MB of tempdb.'),
+    ('tempdb_top_generators',        N'10',   'int',  'tempdb', N'Objects stored per sample from sys.dm_tran_top_version_generators (row-version producers).'),
+    ('tempdb_capture_sql',           N'1',    'bit',  'tempdb', N'1 = store the running statement (max 2000 chars) of every top consumer; 0 = login / host / program / database only.'),
+    ('tempdb_growth_scan_minutes',   N'15',   'int',  'tempdb', N'How often the default trace is scanned for tempdb autogrowth events.'),
+    ('tempdb_vs_warn_pct',           N'50',   'int',  'tempdb', N'Version store >= this % of tempdb allocated size -> WARNING (check TEMPDB_VS).'),
+    ('tempdb_vs_crit_pct',           N'75',   'int',  'tempdb', N'Version store >= this % of tempdb allocated size -> CRITICAL.'),
+    ('vs_tran_warn_minutes',         N'30',   'int',  'tempdb', N'A transaction holding the version store (sys.dm_tran_active_snapshot_database_transactions) longer than this -> WARNING.'),
+    ('vs_tran_crit_minutes',         N'120',  'int',  'tempdb', N'... longer than this -> CRITICAL (the version store cannot be cleaned up behind it).'),
+    ('tempdb_growth_warn_per_hour',  N'10',   'int',  'tempdb', N'tempdb autogrowth events in the last hour that raise a WARNING (check TEMPDB_GROWTH).'),
+    ('rcsi_compare_days',            N'7',    'int',  'tempdb', N'Days before the RCSI cutover used as the "before" window in the TempDB RCSI report (after = everything since the cutover).'),
+    ('tempdb_report_enabled',        N'1',    'bit',  'email',  N'1 = send the daily "MON - TempDB RCSI" email (separate from the digest).'),
+    ('tempdb_report_hours_local',    N'8',    'text', 'email',  N'Local hours (comma list, 0-23) when the TempDB RCSI email is sent.'),
+    ('tempdb_report_weekdays',       N'1,2,3,4,5,6,7', 'text', 'email', N'ISO weekdays for the TempDB RCSI email (1 = Monday ... 7 = Sunday).'),
+    ('tempdb_report_recipients',     N'',     'text', 'email',  N'Recipients of the TempDB RCSI email. Empty = report_recipients.'),
+    ('retention_tempdb_days',        N'30',   'int',  'issues', N'Days kept for raw tempdb samples (TempdbSample, TempdbFileSample, TempdbVersionStoreDb, TempdbVersionGenerator, TempdbTopConsumer).'),
+    ('retention_tempdb_daily_days',  N'400',  'int',  'issues', N'Days kept for the daily tempdb aggregates (TempdbDaily) and autogrowth events.')
+) AS v(n, v, t, c, d)
+WHERE NOT EXISTS (SELECT 1 FROM mon.Setting AS s WHERE s.setting_name = v.n);
+GO
+
+MERGE mon.CheckCatalog AS t
+USING (VALUES
+    ('TEMPDB_VS',     'SERVER', CONVERT(sysname, NULL), N'TEMPDBVS:%',   N'tempdb version store',  302,
+     N'Version store size vs tempdb size, and transactions holding the version store too long (RCSI / snapshot isolation).',
+     N'tempdb_vs_warn_pct / tempdb_vs_crit_pct / vs_tran_warn_minutes / vs_tran_crit_minutes'),
+    ('TEMPDB_GROWTH', 'SERVER', CONVERT(sysname, NULL), N'TEMPDBGROWTH', N'tempdb autogrowth',     304,
+     N'tempdb data / log file autogrowth events per hour (default trace).', N'tempdb_growth_warn_per_hour'),
+    ('RCSI',          'SERVER', CONVERT(sysname, NULL), N'RCSI:%',       N'RCSI switched',         306,
+     N'READ COMMITTED SNAPSHOT switched ON or OFF for a database (the cutover is recorded in mon.RcsiCutover for the before/after report).', NULL)
+) AS s(check_code, scope, column_name, key_pattern, display_name, sort_order, description, threshold_info)
+ON t.check_code = s.check_code
+WHEN MATCHED THEN UPDATE SET scope = s.scope, key_pattern = s.key_pattern, display_name = s.display_name,
+     sort_order = s.sort_order, description = s.description, threshold_info = s.threshold_info
+WHEN NOT MATCHED THEN INSERT (check_code, scope, column_name, key_pattern, display_name, description, threshold_info, sort_order)
+     VALUES (s.check_code, s.scope, s.column_name, s.key_pattern, s.display_name, s.description, s.threshold_info, s.sort_order);
+
+INSERT mon.ServerCheck(check_code, display_name)
+SELECT c.check_code, c.display_name FROM mon.CheckCatalog AS c
+WHERE c.scope = 'SERVER' AND NOT EXISTS (SELECT 1 FROM mon.ServerCheck AS s WHERE s.check_code = c.check_code);
+GO
+
+IF OBJECT_ID(N'mon.TempdbSample', N'U') IS NULL
+BEGIN
+    CREATE TABLE mon.TempdbSample
+    (
+        sample_utc              datetime2(0)  NOT NULL CONSTRAINT PK_mon_TempdbSample PRIMARY KEY,
+        size_mb                 decimal(19,2) NULL,     /* allocated size of the data files */
+        used_mb                 decimal(19,2) NULL,
+        free_mb                 decimal(19,2) NULL,
+        user_obj_mb             decimal(19,2) NULL,     /* temp tables, table variables */
+        internal_obj_mb         decimal(19,2) NULL,     /* sorts, hashes, spools, cursors */
+        version_store_mb        decimal(19,2) NULL,     /* row versions (RCSI / SI / triggers / MARS / online index) */
+        mixed_extent_mb         decimal(19,2) NULL,
+        data_file_count         int           NULL,
+        data_file_min_mb        decimal(19,2) NULL,
+        data_file_max_mb        decimal(19,2) NULL,
+        log_size_mb             decimal(19,2) NULL,
+        log_used_pct            decimal(9,2)  NULL,
+        vs_db_count             int           NULL,     /* databases with version store reserved */
+        vs_active_tran          int           NULL,     /* active snapshot / versioning transactions */
+        vs_longest_tran_s       int           NULL,
+        vs_longest_session_id   int           NULL,
+        vs_longest_login        sysname       NULL,
+        vs_longest_database     sysname       NULL,
+        vs_longest_program      nvarchar(128) NULL,
+        sessions_using_tempdb   int           NULL,     /* sessions holding >= 1 MB */
+        top_session_mb          decimal(19,2) NULL,
+        top_session_id          int           NULL,
+        rcsi_db_count           int           NULL,
+        si_db_count             int           NULL,
+        io_reads                bigint        NULL,     /* cumulative since SQL start: all tempdb files */
+        io_writes               bigint        NULL,
+        io_bytes_read           bigint        NULL,
+        io_bytes_written        bigint        NULL,
+        io_stall_read_ms        bigint        NULL,
+        io_stall_write_ms       bigint        NULL,
+        collection_error        nvarchar(1000) NULL
+    );
+END;
+GO
+
+IF OBJECT_ID(N'mon.TempdbFileSample', N'U') IS NULL
+BEGIN
+    CREATE TABLE mon.TempdbFileSample
+    (
+        sample_utc    datetime2(0)  NOT NULL,
+        file_id       int           NOT NULL,
+        logical_name  sysname       NULL,
+        type_desc     nvarchar(60)  NULL,
+        size_mb       decimal(19,2) NULL,
+        used_mb       decimal(19,2) NULL,
+        max_size_mb   decimal(19,2) NULL,     /* -1 = unlimited */
+        growth_desc   nvarchar(40)  NULL,
+        CONSTRAINT PK_mon_TempdbFileSample PRIMARY KEY (sample_utc, file_id)
+    );
+END;
+GO
+
+IF OBJECT_ID(N'mon.TempdbVersionStoreDb', N'U') IS NULL
+BEGIN
+    CREATE TABLE mon.TempdbVersionStoreDb
+    (
+        sample_utc       datetime2(0)  NOT NULL,
+        database_name    sysname       NOT NULL,
+        database_id      int           NULL,
+        reserved_mb      decimal(19,2) NULL,
+        active_tran      int           NULL,
+        longest_tran_s   int           NULL,
+        is_rcsi_on       bit           NULL,
+        is_si_on         bit           NULL,
+        CONSTRAINT PK_mon_TempdbVersionStoreDb PRIMARY KEY (sample_utc, database_name)
+    );
+END;
+GO
+
+IF OBJECT_ID(N'mon.TempdbVersionGenerator', N'U') IS NULL
+BEGIN
+    CREATE TABLE mon.TempdbVersionGenerator
+    (
+        sample_utc     datetime2(0)  NOT NULL,
+        database_name  sysname       NOT NULL,
+        rowset_id      bigint        NOT NULL,
+        object_name    nvarchar(300) NULL,
+        index_name     sysname       NULL,
+        version_mb     decimal(19,2) NULL,
+        CONSTRAINT PK_mon_TempdbVersionGenerator PRIMARY KEY (sample_utc, database_name, rowset_id)
+    );
+END;
+GO
+
+IF OBJECT_ID(N'mon.TempdbTopConsumer', N'U') IS NULL
+BEGIN
+    CREATE TABLE mon.TempdbTopConsumer
+    (
+        sample_utc        datetime2(0)  NOT NULL,
+        session_id        int           NOT NULL,
+        login_name        sysname       NULL,
+        host_name         nvarchar(128) NULL,
+        program_name      nvarchar(128) NULL,
+        database_name     sysname       NULL,
+        status            nvarchar(30)  NULL,
+        user_obj_mb       decimal(19,2) NULL,
+        internal_obj_mb   decimal(19,2) NULL,
+        total_mb          decimal(19,2) NULL,
+        request_elapsed_s int           NULL,
+        wait_type         nvarchar(60)  NULL,
+        query_hash        binary(8)     NULL,
+        sql_text          nvarchar(2000) NULL,
+        CONSTRAINT PK_mon_TempdbTopConsumer PRIMARY KEY (sample_utc, session_id)
+    );
+END;
+GO
+
+IF OBJECT_ID(N'mon.TempdbGrowthEvent', N'U') IS NULL
+BEGIN
+    CREATE TABLE mon.TempdbGrowthEvent
+    (
+        event_utc     datetime2(3)  NOT NULL,
+        file_name     sysname       NOT NULL,
+        event_type    varchar(10)   NOT NULL,     /* DATA | LOG */
+        growth_mb     decimal(19,2) NULL,
+        duration_ms   int           NULL,
+        CONSTRAINT PK_mon_TempdbGrowthEvent PRIMARY KEY (event_utc, file_name)
+    );
+END;
+GO
+
+IF OBJECT_ID(N'mon.RcsiCutover', N'U') IS NULL
+BEGIN
+    CREATE TABLE mon.RcsiCutover
+    (
+        database_name  sysname       NOT NULL CONSTRAINT PK_mon_RcsiCutover PRIMARY KEY,
+        is_on          bit           NOT NULL,
+        enabled_utc    datetime2(0)  NULL,          /* NULL = already ON when monitoring started: set it with usp_SetRcsiCutover */
+        disabled_utc   datetime2(0)  NULL,
+        change_utc     datetime2(0)  NULL,          /* last ON/OFF switch seen by the collector (raises the RCSI event) */
+        source         varchar(10)   NOT NULL,      /* AUTO | MANUAL | INSTALL */
+        note           nvarchar(400) NULL,
+        modified_utc   datetime2(0)  NOT NULL CONSTRAINT DF_mon_RC_mod DEFAULT SYSUTCDATETIME(),
+        modified_by    sysname       NOT NULL CONSTRAINT DF_mon_RC_by  DEFAULT ORIGINAL_LOGIN()
+    );
+END;
+GO
+
+IF OBJECT_ID(N'mon.TempdbDaily', N'U') IS NULL
+BEGIN
+    CREATE TABLE mon.TempdbDaily
+    (
+        report_date            date          NOT NULL CONSTRAINT PK_mon_TempdbDaily PRIMARY KEY,   /* local date (display_time_zone) */
+        samples                int           NOT NULL,
+        size_max_mb            decimal(19,2) NULL,
+        used_min_mb            decimal(19,2) NULL,
+        used_avg_mb            decimal(19,2) NULL,
+        used_p95_mb            decimal(19,2) NULL,
+        used_max_mb            decimal(19,2) NULL,
+        user_obj_avg_mb        decimal(19,2) NULL,
+        user_obj_max_mb        decimal(19,2) NULL,
+        internal_obj_avg_mb    decimal(19,2) NULL,
+        internal_obj_max_mb    decimal(19,2) NULL,
+        vs_avg_mb              decimal(19,2) NULL,
+        vs_p95_mb              decimal(19,2) NULL,
+        vs_max_mb              decimal(19,2) NULL,
+        vs_tran_max_s          int           NULL,
+        vs_active_tran_max     int           NULL,
+        sessions_max           int           NULL,
+        top_session_max_mb     decimal(19,2) NULL,
+        log_used_max_pct       decimal(9,2)  NULL,
+        io_read_mb             bigint        NULL,     /* sum of per-sample deltas (restart-safe) */
+        io_write_mb            bigint        NULL,
+        io_read_ms_avg         decimal(9,2)  NULL,     /* stall per I/O over the day */
+        io_write_ms_avg        decimal(9,2)  NULL,
+        growth_events          int           NULL,
+        rcsi_db_count_max      int           NULL,
+        computed_utc           datetime2(0)  NOT NULL CONSTRAINT DF_mon_TD_comp DEFAULT SYSUTCDATETIME()
+    );
+END;
+GO
+
+/*
+   Record (or correct) the real RCSI cutover of a database - the before/after report uses it.
+     EXEC OPS.mon.usp_SetRcsiCutover @Database = N'MyDb', @EnabledLocal = '2026-10-20 22:00', @Note = N'change CHG-1234';
+     EXEC OPS.mon.usp_SetRcsiCutover @Database = N'MyDb', @EnabledLocal = NULL;   -- unknown again
+   @EnabledLocal is in display_time_zone (Eastern by default).
+*/
+CREATE OR ALTER PROCEDURE mon.usp_SetRcsiCutover
+    @Database     sysname,
+    @EnabledLocal datetime2(0) = NULL,
+    @Note         nvarchar(400) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @tz nvarchar(100) = ISNULL(mon.fn_Setting('display_time_zone'), N'Eastern Standard Time');
+    DECLARE @utc datetime2(0) = CASE WHEN @EnabledLocal IS NULL THEN NULL
+                                     ELSE CONVERT(datetime2(0), (@EnabledLocal AT TIME ZONE @tz) AT TIME ZONE 'UTC') END;
+    DECLARE @on bit = ISNULL((SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = @Database), 0);
+
+    IF EXISTS (SELECT 1 FROM mon.RcsiCutover WHERE database_name = @Database)
+        UPDATE mon.RcsiCutover
+           SET enabled_utc = @utc, source = 'MANUAL', note = ISNULL(@Note, note), is_on = @on,
+               modified_utc = SYSUTCDATETIME(), modified_by = ORIGINAL_LOGIN()
+         WHERE database_name = @Database;
+    ELSE
+        INSERT mon.RcsiCutover(database_name, is_on, enabled_utc, source, note)
+        VALUES (@Database, @on, @utc, 'MANUAL', @Note);
+
+    SELECT database_name, is_on, mon.fn_UtcToLocal(enabled_utc, @tz) AS enabled_local, mon.fn_UtcToLocal(disabled_utc, @tz) AS disabled_local,
+           source, note, modified_by, mon.fn_UtcToLocal(modified_utc, @tz) AS modified_local
+    FROM mon.RcsiCutover ORDER BY database_name;
+END;
+GO
+
+/* ---------------------------------------------------------------------------
+   COLLECTOR  (every collect_interval_minutes, after usp_CollectPerf)
+   --------------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE mon.usp_CollectTempdb
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT OFF;
+    SET LOCK_TIMEOUT 5000;
+    SET DEADLOCK_PRIORITY LOW;
+
+    IF ISNULL(mon.fn_SettingInt('tempdb_collect_enabled'), 1) = 0 RETURN;
+
+    DECLARE @started datetime2(3) = SYSUTCDATETIME(),
+            @now datetime2(0) = SYSUTCDATETIME(),
+            @errors nvarchar(2000) = NULL,
+            @sql nvarchar(max),
+            @topn int = ISNULL(mon.fn_SettingInt('tempdb_top_consumers'), 10),
+            @minmb int = ISNULL(mon.fn_SettingInt('tempdb_top_min_mb'), 50),
+            @topgen int = ISNULL(mon.fn_SettingInt('tempdb_top_generators'), 10),
+            @capture_sql bit = ISNULL(mon.fn_SettingInt('tempdb_capture_sql'), 1),
+            @scan_m int = ISNULL(mon.fn_SettingInt('tempdb_growth_scan_minutes'), 15),
+            @first bit = CASE WHEN EXISTS (SELECT 1 FROM mon.TempdbSample) THEN 0 ELSE 1 END;
+
+    IF EXISTS (SELECT 1 FROM mon.TempdbSample WHERE sample_utc = @now) RETURN;
+
+    /* ---- 1. files + space split ---- */
+    CREATE TABLE #F (file_id int PRIMARY KEY, logical_name sysname, type_desc nvarchar(60), size_mb decimal(19,2),
+                     used_mb decimal(19,2), max_size_mb decimal(19,2), growth_desc nvarchar(40));
+    DECLARE @size decimal(19,2), @used decimal(19,2), @free decimal(19,2), @uo decimal(19,2), @io decimal(19,2),
+            @vs decimal(19,2), @mx decimal(19,2), @nfiles int, @fmin decimal(19,2), @fmax decimal(19,2),
+            @log_mb decimal(19,2), @log_pct decimal(9,2);
+    BEGIN TRY
+        INSERT #F(file_id, logical_name, type_desc, size_mb, used_mb, max_size_mb, growth_desc)
+        SELECT mf.file_id, mf.name, mf.type_desc, mf.size / 128.0,
+               CASE WHEN mf.type = 0 THEN (u.total_page_count - u.unallocated_extent_page_count) / 128.0 END,
+               CASE WHEN mf.max_size = -1 OR mf.max_size = 268435456 THEN -1 ELSE mf.max_size / 128.0 END,
+               CASE WHEN mf.is_percent_growth = 1 THEN CONCAT(mf.growth, N'%') ELSE CONCAT(mf.growth / 128, N' MB') END
+        FROM sys.master_files AS mf
+        LEFT JOIN tempdb.sys.dm_db_file_space_usage AS u ON u.file_id = mf.file_id
+        WHERE mf.database_id = 2;
+
+        SELECT @size = SUM(u.total_page_count) / 128.0,
+               @used = SUM(u.total_page_count - u.unallocated_extent_page_count) / 128.0,
+               @free = SUM(u.unallocated_extent_page_count) / 128.0,
+               @uo   = SUM(u.user_object_reserved_page_count) / 128.0,
+               @io   = SUM(u.internal_object_reserved_page_count) / 128.0,
+               @vs   = SUM(u.version_store_reserved_page_count) / 128.0,
+               @mx   = SUM(u.mixed_extent_page_count) / 128.0
+        FROM tempdb.sys.dm_db_file_space_usage AS u;
+
+        SELECT @nfiles = COUNT(*), @fmin = MIN(size_mb), @fmax = MAX(size_mb)
+        FROM #F WHERE type_desc = N'ROWS';
+        SELECT @log_mb = SUM(size_mb) FROM #F WHERE type_desc = N'LOG';
+
+        INSERT mon.TempdbFileSample(sample_utc, file_id, logical_name, type_desc, size_mb, used_mb, max_size_mb, growth_desc)
+        SELECT @now, file_id, logical_name, type_desc, size_mb, used_mb, max_size_mb, growth_desc FROM #F;
+    END TRY
+    BEGIN CATCH
+        SET @errors = CONCAT(@errors, N' Space: ', ERROR_MESSAGE());
+    END CATCH;
+
+    BEGIN TRY
+        SELECT @log_pct = CONVERT(decimal(9,2), used_log_space_in_percent) FROM tempdb.sys.dm_db_log_space_usage;
+    END TRY
+    BEGIN CATCH
+        SET @log_pct = NULL;   /* optional */
+    END CATCH;
+
+    /* ---- 2. version store per database + versioning transactions ---- */
+    CREATE TABLE #VS (database_id int PRIMARY KEY, reserved_mb decimal(19,2));
+    CREATE TABLE #AT (session_id int, database_id int NULL, elapsed_s int);
+    DECLARE @vs_db int, @vs_tran int, @vs_long int, @vs_sid int, @vs_login sysname, @vs_db_name sysname, @vs_prog nvarchar(128),
+            @rcsi int, @si int;
+    BEGIN TRY
+        IF OBJECT_ID(N'sys.dm_tran_version_store_space_usage') IS NOT NULL
+            EXEC sys.sp_executesql N'INSERT #VS(database_id, reserved_mb)
+                                     SELECT database_id, reserved_space_kb / 1024.0 FROM sys.dm_tran_version_store_space_usage;';
+
+        INSERT #AT(session_id, database_id, elapsed_s)
+        SELECT a.session_id, s.database_id, a.elapsed_time_seconds
+        FROM sys.dm_tran_active_snapshot_database_transactions AS a
+        LEFT JOIN sys.dm_exec_sessions AS s ON s.session_id = a.session_id;
+
+        SELECT @vs_db = COUNT(*) FROM #VS WHERE reserved_mb > 0;
+        SELECT @vs_tran = COUNT(*), @vs_long = MAX(elapsed_s) FROM #AT;
+
+        SELECT TOP (1) @vs_sid = a.session_id, @vs_login = s.login_name, @vs_db_name = DB_NAME(a.database_id), @vs_prog = s.program_name
+        FROM #AT AS a LEFT JOIN sys.dm_exec_sessions AS s ON s.session_id = a.session_id
+        ORDER BY a.elapsed_s DESC;
+
+        SELECT @rcsi = SUM(CASE WHEN is_read_committed_snapshot_on = 1 THEN 1 ELSE 0 END),
+               @si   = SUM(CASE WHEN snapshot_isolation_state = 1 THEN 1 ELSE 0 END)
+        FROM sys.databases WHERE database_id > 4;
+
+        INSERT mon.TempdbVersionStoreDb(sample_utc, database_name, database_id, reserved_mb, active_tran, longest_tran_s, is_rcsi_on, is_si_on)
+        SELECT @now, d.name, d.database_id, ISNULL(v.reserved_mb, 0), ISNULL(t.n, 0), t.longest,
+               d.is_read_committed_snapshot_on, CASE WHEN d.snapshot_isolation_state = 1 THEN 1 ELSE 0 END
+        FROM sys.databases AS d
+        LEFT JOIN #VS AS v ON v.database_id = d.database_id
+        LEFT JOIN (SELECT database_id, COUNT(*) AS n, MAX(elapsed_s) AS longest FROM #AT GROUP BY database_id) AS t ON t.database_id = d.database_id
+        WHERE ISNULL(v.reserved_mb, 0) > 0 OR ISNULL(t.n, 0) > 0;
+    END TRY
+    BEGIN CATCH
+        SET @errors = CONCAT(@errors, N' Version store: ', ERROR_MESSAGE());
+    END CATCH;
+
+    /* ---- 3. top version generators (objects producing row versions) ---- */
+    BEGIN TRY
+        CREATE TABLE #G (database_id int, rowset_id bigint, version_mb decimal(19,2), object_name nvarchar(300) NULL, index_name sysname NULL);
+        INSERT #G(database_id, rowset_id, version_mb)
+        SELECT TOP (@topgen) g.database_id, g.rowset_id, g.aggregated_record_length_in_bytes / 1048576.0
+        FROM sys.dm_tran_top_version_generators AS g
+        ORDER BY g.aggregated_record_length_in_bytes DESC;
+
+        DECLARE @gdb int, @gname sysname;
+        DECLARE gen CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT g.database_id, d.name
+            FROM #G AS g JOIN sys.databases AS d ON d.database_id = g.database_id
+            WHERE d.state_desc = N'ONLINE' AND d.user_access_desc = N'MULTI_USER';
+        OPEN gen; FETCH NEXT FROM gen INTO @gdb, @gname;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            BEGIN TRY
+                SET @sql = N'UPDATE g SET object_name = QUOTENAME(s.name) + N''.'' + QUOTENAME(o.name), index_name = i.name
+                            FROM #G AS g
+                            JOIN ' + QUOTENAME(@gname) + N'.sys.partitions AS p ON p.hobt_id = g.rowset_id
+                            JOIN ' + QUOTENAME(@gname) + N'.sys.objects AS o ON o.object_id = p.object_id
+                            JOIN ' + QUOTENAME(@gname) + N'.sys.schemas AS s ON s.schema_id = o.schema_id
+                            LEFT JOIN ' + QUOTENAME(@gname) + N'.sys.indexes AS i ON i.object_id = p.object_id AND i.index_id = p.index_id
+                            WHERE g.database_id = @d;';
+                EXEC sys.sp_executesql @sql, N'@d int', @d = @gdb;
+            END TRY
+            BEGIN CATCH
+                /* database not readable: object stays unresolved (rowset id only) */
+            END CATCH;
+            FETCH NEXT FROM gen INTO @gdb, @gname;
+        END;
+        CLOSE gen; DEALLOCATE gen;
+
+        INSERT mon.TempdbVersionGenerator(sample_utc, database_name, rowset_id, object_name, index_name, version_mb)
+        SELECT @now, ISNULL(DB_NAME(g.database_id), CONCAT(N'db ', g.database_id)), g.rowset_id,
+               ISNULL(g.object_name, CONCAT(N'(rowset ', g.rowset_id, N')')), g.index_name, g.version_mb
+        FROM #G AS g
+        WHERE g.version_mb > 0;
+    END TRY
+    BEGIN CATCH
+        SET @errors = CONCAT(@errors, N' Generators: ', ERROR_MESSAGE());
+    END CATCH;
+
+    /* ---- 4. top tempdb consumers (session + running tasks) ---- */
+    DECLARE @sess int, @top_mb decimal(19,2), @top_sid int;
+    BEGIN TRY
+        CREATE TABLE #S (session_id int PRIMARY KEY, user_mb decimal(19,2), int_mb decimal(19,2));
+        INSERT #S(session_id, user_mb, int_mb)
+        SELECT su.session_id,
+               (su.user_objects_alloc_page_count - su.user_objects_dealloc_page_count + ISNULL(t.uo, 0)) / 128.0,
+               (su.internal_objects_alloc_page_count - su.internal_objects_dealloc_page_count + ISNULL(t.io, 0)) / 128.0
+        FROM sys.dm_db_session_space_usage AS su
+        LEFT JOIN (SELECT session_id,
+                          SUM(user_objects_alloc_page_count - user_objects_dealloc_page_count) AS uo,
+                          SUM(internal_objects_alloc_page_count - internal_objects_dealloc_page_count) AS io
+                   FROM sys.dm_db_task_space_usage GROUP BY session_id) AS t ON t.session_id = su.session_id;
+
+        SELECT @sess = COUNT(*) FROM #S WHERE user_mb + int_mb >= 1;
+        SELECT TOP (1) @top_mb = user_mb + int_mb, @top_sid = session_id FROM #S ORDER BY user_mb + int_mb DESC;
+
+        INSERT mon.TempdbTopConsumer(sample_utc, session_id, login_name, host_name, program_name, database_name, status,
+                                     user_obj_mb, internal_obj_mb, total_mb, request_elapsed_s, wait_type, query_hash, sql_text)
+        SELECT TOP (@topn) @now, s.session_id, es.login_name, es.host_name, es.program_name, DB_NAME(es.database_id), es.status,
+               s.user_mb, s.int_mb, s.user_mb + s.int_mb,
+               CASE WHEN r.session_id IS NOT NULL THEN r.total_elapsed_time / 1000 END, r.wait_type, r.query_hash,
+               CASE WHEN @capture_sql = 1
+                    THEN LEFT(COALESCE(
+                              SUBSTRING(st.text, r.statement_start_offset / 2 + 1,
+                                        CASE WHEN r.statement_end_offset = -1 THEN 2000
+                                             ELSE (r.statement_end_offset - r.statement_start_offset) / 2 + 1 END),
+                              st.text, ib.event_info), 2000) END
+        FROM #S AS s
+        LEFT JOIN sys.dm_exec_sessions AS es ON es.session_id = s.session_id
+        LEFT JOIN sys.dm_exec_requests AS r ON r.session_id = s.session_id
+        OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS st
+        OUTER APPLY sys.dm_exec_input_buffer(s.session_id, NULL) AS ib
+        WHERE s.user_mb + s.int_mb >= @minmb
+        ORDER BY s.user_mb + s.int_mb DESC;
+    END TRY
+    BEGIN CATCH
+        SET @errors = CONCAT(@errors, N' Consumers: ', ERROR_MESSAGE());
+    END CATCH;
+
+    /* ---- 5. cumulative tempdb I/O ---- */
+    DECLARE @rd bigint, @wr bigint, @brd bigint, @bwr bigint, @srd bigint, @swr bigint;
+    BEGIN TRY
+        SELECT @rd = SUM(num_of_reads), @wr = SUM(num_of_writes), @brd = SUM(num_of_bytes_read), @bwr = SUM(num_of_bytes_written),
+               @srd = SUM(io_stall_read_ms), @swr = SUM(io_stall_write_ms)
+        FROM sys.dm_io_virtual_file_stats(2, NULL);
+    END TRY
+    BEGIN CATCH
+        SET @errors = CONCAT(@errors, N' IO: ', ERROR_MESSAGE());
+    END CATCH;
+
+    /* ---- 6. the sample row ---- */
+    INSERT mon.TempdbSample(sample_utc, size_mb, used_mb, free_mb, user_obj_mb, internal_obj_mb, version_store_mb, mixed_extent_mb,
+                            data_file_count, data_file_min_mb, data_file_max_mb, log_size_mb, log_used_pct,
+                            vs_db_count, vs_active_tran, vs_longest_tran_s, vs_longest_session_id, vs_longest_login, vs_longest_database, vs_longest_program,
+                            sessions_using_tempdb, top_session_mb, top_session_id, rcsi_db_count, si_db_count,
+                            io_reads, io_writes, io_bytes_read, io_bytes_written, io_stall_read_ms, io_stall_write_ms, collection_error)
+    VALUES (@now, @size, @used, @free, @uo, @io, @vs, @mx, @nfiles, @fmin, @fmax, @log_mb, @log_pct,
+            @vs_db, @vs_tran, @vs_long, @vs_sid, @vs_login, @vs_db_name, @vs_prog,
+            @sess, @top_mb, @top_sid, @rcsi, @si,
+            @rd, @wr, @brd, @bwr, @srd, @swr, LEFT(@errors, 1000));
+
+    /* ---- 7. RCSI cutover detection (per user database) ---- */
+    BEGIN TRY
+        MERGE mon.RcsiCutover AS t
+        USING (SELECT d.name, d.is_read_committed_snapshot_on AS is_on
+               FROM sys.databases AS d WHERE d.database_id > 4 AND d.state_desc = N'ONLINE') AS s
+        ON t.database_name = s.name
+        WHEN NOT MATCHED BY TARGET AND s.is_on = 1 THEN
+            INSERT (database_name, is_on, enabled_utc, change_utc, source, note)
+            VALUES (s.name, 1,
+                    CASE WHEN @first = 1 THEN NULL ELSE @now END,
+                    CASE WHEN @first = 1 THEN NULL ELSE @now END,
+                    CASE WHEN @first = 1 THEN 'INSTALL' ELSE 'AUTO' END,
+                    CASE WHEN @first = 1 THEN N'RCSI was already ON when tempdb monitoring started; no pre-RCSI baseline. Set the real date: EXEC mon.usp_SetRcsiCutover.'
+                         ELSE N'RCSI switched ON (detected by the collector).' END)
+        WHEN MATCHED AND s.is_on = 1 AND t.is_on = 0 THEN
+            UPDATE SET is_on = 1, enabled_utc = @now, disabled_utc = NULL, change_utc = @now,
+                       source = CASE WHEN t.source = 'MANUAL' THEN 'MANUAL' ELSE 'AUTO' END,
+                       note = N'RCSI switched ON (detected by the collector).', modified_utc = @now, modified_by = N'mon.usp_CollectTempdb'
+        WHEN MATCHED AND s.is_on = 0 AND t.is_on = 1 THEN
+            UPDATE SET is_on = 0, disabled_utc = @now, change_utc = @now,
+                       note = N'RCSI switched OFF (detected by the collector).', modified_utc = @now, modified_by = N'mon.usp_CollectTempdb';
+    END TRY
+    BEGIN CATCH
+        SET @errors = CONCAT(@errors, N' RCSI: ', ERROR_MESSAGE());
+    END CATCH;
+
+    /* ---- 8. autogrowth events from the default trace (every tempdb_growth_scan_minutes) ---- */
+    DECLARE @wm datetime2(3) = (SELECT watermark_utc FROM mon.ComponentStatus WHERE component_name = 'TEMPDB_GROWTH');
+    IF @wm IS NULL OR @wm < DATEADD(MINUTE, -@scan_m, @started)
+    BEGIN
+        BEGIN TRY
+            DECLARE @path nvarchar(260) = (SELECT TOP (1) path FROM sys.traces WHERE is_default = 1 AND status = 1);
+            IF @path IS NOT NULL
+            BEGIN
+                /* base file name: log_123.trc -> log.trc reads the whole rollover set */
+                IF CHARINDEX(N'_', REVERSE(@path)) > 0
+                    SET @path = LEFT(@path, LEN(@path) - CHARINDEX(N'_', REVERSE(@path))) + N'.trc';
+                DECLARE @since datetime = (SELECT ISNULL(DATEADD(MINUTE, -1, MAX(event_utc)), DATEADD(DAY, -3, @now)) FROM mon.TempdbGrowthEvent);
+                /* trace times are server-local: shift the lower bound into server time */
+                SET @since = DATEADD(MINUTE, DATEPART(TZOFFSET, SYSDATETIMEOFFSET()), @since);
+
+                INSERT mon.TempdbGrowthEvent(event_utc, file_name, event_type, growth_mb, duration_ms)
+                SELECT x.event_utc, x.file_name, x.event_type, x.growth_mb, x.duration_ms
+                FROM (SELECT CONVERT(datetime2(3), mon.fn_ServerToUtc(t.StartTime)) AS event_utc,
+                             ISNULL(t.FileName, N'?') AS file_name,
+                             CASE t.EventClass WHEN 92 THEN 'DATA' ELSE 'LOG' END AS event_type,
+                             CONVERT(decimal(19,2), t.IntegerData / 128.0) AS growth_mb,
+                             CONVERT(int, t.Duration / 1000) AS duration_ms
+                      FROM sys.fn_trace_gettable(@path, DEFAULT) AS t
+                      WHERE t.EventClass IN (92, 93) AND t.DatabaseName = N'tempdb' AND t.StartTime > @since) AS x
+                WHERE NOT EXISTS (SELECT 1 FROM mon.TempdbGrowthEvent AS e WHERE e.event_utc = x.event_utc AND e.file_name = x.file_name);
+            END;
+            EXEC mon.usp_SetComponentStatus 'TEMPDB_GROWTH', 1, @started;
+        END TRY
+        BEGIN CATCH
+            DECLARE @gen int = ERROR_NUMBER(), @gem nvarchar(2000) = ERROR_MESSAGE();
+            EXEC mon.usp_SetComponentStatus 'TEMPDB_GROWTH', 0, @started, @gen, @gem;
+        END CATCH;
+        UPDATE mon.ComponentStatus SET watermark_utc = @started WHERE component_name = 'TEMPDB_GROWTH';
+    END;
+
+    IF @errors IS NULL
+        EXEC mon.usp_SetComponentStatus 'TEMPDB', 1, @started;
+    ELSE
+        EXEC mon.usp_SetComponentStatus 'TEMPDB', 0, @started, 50003, @errors;
+END;
+GO
+
+/* ---------------------------------------------------------------------------
+   DAILY AGGREGATES  (hourly job; fills every complete local day that has samples
+   but no mon.TempdbDaily row yet; @Date re-computes one day)
+   --------------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE mon.usp_SnapshotTempdbDaily
+    @Date date = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @tz nvarchar(100) = ISNULL(mon.fn_Setting('display_time_zone'), N'Eastern Standard Time');
+    DECLARE @today date = CONVERT(date, mon.fn_UtcToLocal(SYSUTCDATETIME(), @tz));
+
+    IF @Date IS NOT NULL
+        DELETE FROM mon.TempdbDaily WHERE report_date = @Date;
+    ELSE
+        /* a row computed while its day was still running (preview / manual run) is recomputed once the day is over */
+        DELETE d FROM mon.TempdbDaily AS d
+        WHERE d.report_date < @today
+          AND d.computed_utc < CONVERT(datetime2(0), (CONVERT(datetime2(0), DATEADD(DAY, 1, d.report_date)) AT TIME ZONE @tz) AT TIME ZONE 'UTC');
+
+    ;WITH L AS
+    (
+        SELECT s.*, CONVERT(date, (s.sample_utc AT TIME ZONE 'UTC') AT TIME ZONE @tz) AS d
+        FROM mon.TempdbSample AS s
+        WHERE s.sample_utc >= DATEADD(DAY, -45, SYSUTCDATETIME())
+    ), D AS
+    (
+        SELECT L.d FROM L
+        WHERE (@Date IS NULL AND L.d < @today) OR L.d = @Date
+        GROUP BY L.d
+        HAVING NOT EXISTS (SELECT 1 FROM mon.TempdbDaily AS t WHERE t.report_date = L.d)
+    ), P AS
+    (
+        SELECT L.d,
+               PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY L.used_mb)          OVER (PARTITION BY L.d) AS used_p95,
+               PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY L.version_store_mb) OVER (PARTITION BY L.d) AS vs_p95,
+               L.io_bytes_read  - LAG(L.io_bytes_read)  OVER (PARTITION BY L.d ORDER BY L.sample_utc) AS d_brd,
+               L.io_bytes_written - LAG(L.io_bytes_written) OVER (PARTITION BY L.d ORDER BY L.sample_utc) AS d_bwr,
+               L.io_reads  - LAG(L.io_reads)  OVER (PARTITION BY L.d ORDER BY L.sample_utc) AS d_rd,
+               L.io_writes - LAG(L.io_writes) OVER (PARTITION BY L.d ORDER BY L.sample_utc) AS d_wr,
+               L.io_stall_read_ms  - LAG(L.io_stall_read_ms)  OVER (PARTITION BY L.d ORDER BY L.sample_utc) AS d_srd,
+               L.io_stall_write_ms - LAG(L.io_stall_write_ms) OVER (PARTITION BY L.d ORDER BY L.sample_utc) AS d_swr,
+               L.sample_utc, L.size_mb, L.used_mb, L.user_obj_mb, L.internal_obj_mb, L.version_store_mb, L.vs_longest_tran_s,
+               L.vs_active_tran, L.sessions_using_tempdb, L.top_session_mb, L.log_used_pct, L.rcsi_db_count
+        FROM L
+        WHERE L.d IN (SELECT d FROM D)
+    )
+    INSERT mon.TempdbDaily(report_date, samples, size_max_mb, used_min_mb, used_avg_mb, used_p95_mb, used_max_mb,
+                           user_obj_avg_mb, user_obj_max_mb, internal_obj_avg_mb, internal_obj_max_mb,
+                           vs_avg_mb, vs_p95_mb, vs_max_mb, vs_tran_max_s, vs_active_tran_max, sessions_max, top_session_max_mb,
+                           log_used_max_pct, io_read_mb, io_write_mb, io_read_ms_avg, io_write_ms_avg, growth_events, rcsi_db_count_max)
+    SELECT P.d, COUNT(*), MAX(P.size_mb), MIN(P.used_mb), AVG(P.used_mb), MAX(P.used_p95), MAX(P.used_mb),
+           AVG(P.user_obj_mb), MAX(P.user_obj_mb), AVG(P.internal_obj_mb), MAX(P.internal_obj_mb),
+           AVG(P.version_store_mb), MAX(P.vs_p95), MAX(P.version_store_mb), MAX(P.vs_longest_tran_s), MAX(P.vs_active_tran),
+           MAX(P.sessions_using_tempdb), MAX(P.top_session_mb), MAX(P.log_used_pct),
+           SUM(CASE WHEN P.d_brd > 0 THEN P.d_brd ELSE 0 END) / 1048576,
+           SUM(CASE WHEN P.d_bwr > 0 THEN P.d_bwr ELSE 0 END) / 1048576,
+           CONVERT(decimal(9,2), SUM(CASE WHEN P.d_srd > 0 THEN P.d_srd ELSE 0 END) * 1.0 / NULLIF(SUM(CASE WHEN P.d_rd > 0 THEN P.d_rd ELSE 0 END), 0)),
+           CONVERT(decimal(9,2), SUM(CASE WHEN P.d_swr > 0 THEN P.d_swr ELSE 0 END) * 1.0 / NULLIF(SUM(CASE WHEN P.d_wr > 0 THEN P.d_wr ELSE 0 END), 0)),
+           (SELECT COUNT(*) FROM mon.TempdbGrowthEvent AS g
+             WHERE CONVERT(date, (g.event_utc AT TIME ZONE 'UTC') AT TIME ZONE @tz) = P.d),
+           MAX(P.rcsi_db_count)
+    FROM P
+    GROUP BY P.d;
+END;
+GO
+
+/*
+   What does tempdb look like, and what happened before / after RCSI?  (SSMS, 6 result sets)
+     EXEC OPS.mon.usp_ShowTempdb;              -- last 30 days
+     EXEC OPS.mon.usp_ShowTempdb @Days = 7;
+*/
+CREATE OR ALTER PROCEDURE mon.usp_ShowTempdb
+    @Days int = 30
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @tz nvarchar(100) = ISNULL(mon.fn_Setting('display_time_zone'), N'Eastern Standard Time');
+    DECLARE @since datetime2(0) = DATEADD(DAY, -@Days, SYSUTCDATETIME());
+
+    /* 1) now */
+    SELECT TOP (1) mon.fn_UtcToLocal(s.sample_utc, @tz) AS [Sample (local)],
+           s.size_mb AS [tempdb MB], s.used_mb AS [Used MB], s.free_mb AS [Free MB],
+           s.user_obj_mb AS [User objects MB], s.internal_obj_mb AS [Internal MB], s.version_store_mb AS [Version store MB],
+           s.data_file_count AS [Data files], s.data_file_min_mb AS [Smallest file MB], s.data_file_max_mb AS [Largest file MB],
+           s.log_size_mb AS [Log MB], s.log_used_pct AS [Log used %],
+           s.vs_active_tran AS [Versioning trans], s.vs_longest_tran_s AS [Longest tran s], s.vs_longest_session_id AS [Longest session],
+           s.vs_longest_login AS [Longest login], s.vs_longest_database AS [Longest db],
+           s.sessions_using_tempdb AS [Sessions >= 1 MB], s.top_session_mb AS [Top session MB], s.top_session_id AS [Top session],
+           s.rcsi_db_count AS [RCSI dbs], s.si_db_count AS [SI dbs], s.collection_error AS [Collection error]
+    FROM mon.TempdbSample AS s ORDER BY s.sample_utc DESC;
+
+    /* 2) RCSI cutovers */
+    SELECT c.database_name AS [Database], c.is_on AS [RCSI on], mon.fn_UtcToLocal(c.enabled_utc, @tz) AS [Enabled (local)],
+           mon.fn_UtcToLocal(c.disabled_utc, @tz) AS [Disabled (local)], c.source AS [Source], c.note AS [Note],
+           c.modified_by AS [By], mon.fn_UtcToLocal(c.modified_utc, @tz) AS [Modified (local)]
+    FROM mon.RcsiCutover AS c ORDER BY c.database_name;
+
+    /* 3) daily */
+    SELECT d.report_date AS [Day], d.samples AS [Samples], d.size_max_mb AS [tempdb MB], d.used_avg_mb AS [Used avg], d.used_p95_mb AS [Used p95],
+           d.used_max_mb AS [Used max], d.user_obj_max_mb AS [User obj max], d.internal_obj_max_mb AS [Internal max],
+           d.vs_avg_mb AS [VS avg], d.vs_p95_mb AS [VS p95], d.vs_max_mb AS [VS max], d.vs_tran_max_s AS [Longest tran s],
+           d.vs_active_tran_max AS [Versioning trans max], d.sessions_max AS [Sessions max], d.top_session_max_mb AS [Top session max MB],
+           d.log_used_max_pct AS [Log used max %], d.io_read_mb AS [Read MB], d.io_write_mb AS [Write MB],
+           d.io_read_ms_avg AS [Read ms], d.io_write_ms_avg AS [Write ms], d.growth_events AS [Autogrowths], d.rcsi_db_count_max AS [RCSI dbs]
+    FROM mon.TempdbDaily AS d WHERE d.report_date >= CONVERT(date, @since) ORDER BY d.report_date DESC;
+
+    /* 4) version store by database (last 24 h) */
+    SELECT v.database_name AS [Database], MAX(CONVERT(tinyint, v.is_rcsi_on)) AS [RCSI], MAX(CONVERT(tinyint, v.is_si_on)) AS [SI],
+           MAX(v.reserved_mb) AS [VS max MB], AVG(v.reserved_mb) AS [VS avg MB], MAX(v.active_tran) AS [Versioning trans max],
+           MAX(v.longest_tran_s) AS [Longest tran s], COUNT(*) AS [Samples]
+    FROM mon.TempdbVersionStoreDb AS v WHERE v.sample_utc >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+    GROUP BY v.database_name ORDER BY [VS max MB] DESC;
+
+    /* 5) top version generators (last 24 h) */
+    SELECT TOP (30) g.database_name AS [Database], g.object_name AS [Object], g.index_name AS [Index],
+           MAX(g.version_mb) AS [Max MB], AVG(g.version_mb) AS [Avg MB], COUNT(*) AS [Samples],
+           mon.fn_UtcToLocal(MAX(g.sample_utc), @tz) AS [Last seen (local)]
+    FROM mon.TempdbVersionGenerator AS g WHERE g.sample_utc >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+    GROUP BY g.database_name, g.object_name, g.index_name ORDER BY [Max MB] DESC;
+
+    /* 6) top consumers (last 24 h) */
+    SELECT TOP (50) mon.fn_UtcToLocal(c.sample_utc, @tz) AS [Sample (local)], c.session_id AS [Session], c.login_name AS [Login],
+           c.host_name AS [Host], c.program_name AS [Program], c.database_name AS [Database], c.status AS [Status],
+           c.total_mb AS [tempdb MB], c.user_obj_mb AS [User obj MB], c.internal_obj_mb AS [Internal MB],
+           c.request_elapsed_s AS [Running s], c.wait_type AS [Wait], c.sql_text AS [Statement]
+    FROM mon.TempdbTopConsumer AS c WHERE c.sample_utc >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+    ORDER BY c.total_mb DESC;
+END;
+GO
 
 /* =============================================================================
    SECTION 7  -  HEALTH VIEWS
@@ -3962,6 +4700,64 @@ BEGIN
 
             IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'PERF')
                 INSERT #Scope VALUES ('PERF');
+
+            /* ======================= TEMPDB VERSION STORE / AUTOGROWTH / RCSI [5.8] ======================= */
+            DECLARE @vs_warn int = ISNULL(mon.fn_SettingInt('tempdb_vs_warn_pct'), 50),
+                    @vs_crit int = ISNULL(mon.fn_SettingInt('tempdb_vs_crit_pct'), 75),
+                    @tr_warn int = ISNULL(mon.fn_SettingInt('vs_tran_warn_minutes'), 30),
+                    @tr_crit int = ISNULL(mon.fn_SettingInt('vs_tran_crit_minutes'), 120),
+                    @gr_warn int = ISNULL(mon.fn_SettingInt('tempdb_growth_warn_per_hour'), 10);
+
+            INSERT #Issue(issue_key, category, severity, is_event, title, detail)
+            SELECT TOP (1) N'TEMPDBVS:SIZE', 'TEMPDB',
+                   CASE WHEN t.version_store_mb * 100.0 / NULLIF(t.size_mb, 0) >= @vs_crit THEN 'CRITICAL' ELSE 'WARNING' END, 0,
+                   CONCAT(N'tempdb version store ', CONVERT(int, t.version_store_mb * 100.0 / NULLIF(t.size_mb, 0)), N'% of tempdb (',
+                          CONVERT(decimal(19,1), t.version_store_mb / 1024.0), N' GB)'),
+                   CONCAT(N'tempdb ', CONVERT(decimal(19,1), t.size_mb / 1024.0), N' GB allocated, ', CONVERT(decimal(19,1), t.used_mb / 1024.0),
+                          N' GB used; ', ISNULL(t.vs_active_tran, 0), N' versioning transaction(s), longest ', mon.fn_Duration(t.vs_longest_tran_s),
+                          CASE WHEN t.vs_longest_session_id IS NOT NULL
+                               THEN CONCAT(N' (session ', t.vs_longest_session_id, N', ', ISNULL(t.vs_longest_login, N'?'), N', db ', ISNULL(t.vs_longest_database, N'?'), N')') ELSE N'' END,
+                          N'; ', ISNULL(t.rcsi_db_count, 0), N' RCSI database(s). Long transactions keep every version alive: find them in EXEC OPS.mon.usp_ShowTempdb.')
+            FROM mon.TempdbSample AS t
+            WHERE t.sample_utc >= DATEADD(MINUTE, -10, @now)
+              AND t.version_store_mb * 100.0 / NULLIF(t.size_mb, 0) >= @vs_warn
+            ORDER BY t.sample_utc DESC;
+
+            INSERT #Issue(issue_key, category, severity, is_event, database_name, title, detail)
+            SELECT TOP (1) N'TEMPDBVS:TRAN', 'TEMPDB',
+                   CASE WHEN t.vs_longest_tran_s >= @tr_crit * 60 THEN 'CRITICAL' ELSE 'WARNING' END, 0, t.vs_longest_database,
+                   CONCAT(N'Transaction holding the version store for ', mon.fn_Duration(t.vs_longest_tran_s), N' - session ',
+                          t.vs_longest_session_id, N' (', ISNULL(t.vs_longest_login, N'?'), N')'),
+                   CONCAT(N'Database ', ISNULL(t.vs_longest_database, N'?'), N', program ', ISNULL(t.vs_longest_program, N'?'),
+                          N'. While it is open the version store cannot be cleaned up behind it (currently ',
+                          CONVERT(decimal(19,1), t.version_store_mb / 1024.0), N' GB, ', ISNULL(t.vs_active_tran, 0),
+                          N' versioning transactions). Check sys.dm_tran_active_snapshot_database_transactions; an idle session with an open transaction should be committed or killed by the owner.')
+            FROM mon.TempdbSample AS t
+            WHERE t.sample_utc >= DATEADD(MINUTE, -10, @now)
+              AND t.vs_longest_tran_s >= @tr_warn * 60
+            ORDER BY t.sample_utc DESC;
+
+            INSERT #Issue(issue_key, category, severity, is_event, title, detail)
+            SELECT N'TEMPDBGROWTH', 'TEMPDB', 'WARNING', 0,
+                   CONCAT(N'tempdb autogrew ', COUNT(*), N' times in the last hour (+', CONVERT(decimal(19,1), SUM(g.growth_mb) / 1024.0), N' GB)'),
+                   CONCAT(N'Files: ', STUFF((SELECT DISTINCT CONCAT(N', ', x.file_name) FROM mon.TempdbGrowthEvent AS x
+                                               WHERE x.event_utc >= DATEADD(HOUR, -1, @now) FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N''),
+                          N'. Pre-size tempdb (equal data files) so growth happens off-peak, not during the workload.')
+            FROM mon.TempdbGrowthEvent AS g
+            WHERE g.event_utc >= DATEADD(HOUR, -1, @now)
+            HAVING COUNT(*) >= @gr_warn;
+
+            INSERT #Issue(issue_key, category, severity, is_event, database_name, title, detail, event_utc)
+            SELECT CONCAT(N'RCSI:', c.database_name, N':', CONVERT(varchar(19), c.change_utc, 126)), 'TEMPDB', 'WARNING', 1, c.database_name,
+                   CONCAT(N'READ COMMITTED SNAPSHOT switched ', CASE WHEN c.is_on = 1 THEN N'ON' ELSE N'OFF' END, N' for ', c.database_name),
+                   CONCAT(N'Detected ', mon.fn_FmtLocal(c.change_utc, @tz), N'. The cutover is recorded in mon.RcsiCutover; the daily "MON - TempDB RCSI" email compares tempdb before and after it. ',
+                          N'Wrong time? EXEC OPS.mon.usp_SetRcsiCutover @Database = N''', c.database_name, N''', @EnabledLocal = ''YYYY-MM-DD HH:MM'';'),
+                   c.change_utc
+            FROM mon.RcsiCutover AS c
+            WHERE c.change_utc >= DATEADD(HOUR, -@lookback, @now);
+
+            IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'TEMPDB')
+                INSERT #Scope VALUES ('TEMPDB');
             IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'PERF')
                AND EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'DATABASE_STATE')
                AND NOT EXISTS (SELECT 1 FROM #EvalError WHERE check_name = 'DATABASE')
@@ -6342,8 +7138,10 @@ BEGIN
            CASE WHEN r.setting_name IS NULL THEN N'kept (configuration / current state)'
                 ELSE CONCAT(COALESCE(TRY_CONVERT(int, NULLIF(s.setting_value, N'')),
                                      CASE r.setting_name WHEN 'retention_audit_days' THEN 4 * @days
-                                                         WHEN 'blocking_sample_retention_days' THEN 30 ELSE @days END), N' days (', r.setting_name,
-                            CASE WHEN NULLIF(s.setting_value, N'') IS NULL AND r.setting_name NOT IN ('history_retention_days', 'blocking_sample_retention_days')
+                                                         WHEN 'blocking_sample_retention_days' THEN 30
+                                                         WHEN 'retention_tempdb_days' THEN 30
+                                                         WHEN 'retention_tempdb_daily_days' THEN 400 ELSE @days END), N' days (', r.setting_name,
+                            CASE WHEN NULLIF(s.setting_value, N'') IS NULL AND r.setting_name NOT IN ('history_retention_days', 'blocking_sample_retention_days', 'retention_tempdb_days', 'retention_tempdb_daily_days')
                                  THEN N' = default' ELSE N'' END, N')') END AS [Retention],
            SUM(CASE WHEN p.index_id IN (0, 1) THEN p.row_count ELSE 0 END) AS [Rows],
            CONVERT(decimal(19,1), SUM(p.reserved_page_count) * 8 / 1024.0) AS [Reserved MB]
@@ -6353,6 +7151,10 @@ BEGIN
         (N'PerfSample', 'retention_perf_days', N'performance'), (N'CpuSample', 'retention_perf_days', N'performance'),
         (N'StorageSample', 'retention_perf_days', N'performance'), (N'WaitStatsSnapshot', 'retention_perf_days', N'performance'),
         (N'FileStatsSnapshot', 'retention_perf_days', N'performance'),
+        (N'TempdbSample', 'retention_tempdb_days', N'tempdb'), (N'TempdbFileSample', 'retention_tempdb_days', N'tempdb'),
+        (N'TempdbVersionStoreDb', 'retention_tempdb_days', N'tempdb'), (N'TempdbVersionGenerator', 'retention_tempdb_days', N'tempdb'),
+        (N'TempdbTopConsumer', 'retention_tempdb_days', N'tempdb'), (N'TempdbGrowthEvent', 'retention_tempdb_daily_days', N'tempdb'),
+        (N'TempdbDaily', 'retention_tempdb_daily_days', N'tempdb'),
         (N'TlogBackup', 'retention_backup_days', N'backups'), (N'RdsTask', 'retention_backup_days', N'backups'),
         (N'OlaCommand', 'retention_backup_days', N'backups'), (N'BackupInventoryDaily', 'retention_backup_days', N'backups'),
         (N'Issue', 'retention_issue_days', N'issues (resolved only)'), (N'IssueChange', 'retention_issue_days', N'issues (resolved only)'),
@@ -6367,6 +7169,494 @@ BEGIN
     WHERE SCHEMA_NAME(t.schema_id) = N'mon'
     GROUP BY t.name, r.area, r.setting_name, s.setting_value
     ORDER BY [Reserved MB] DESC, t.name;
+END;
+GO
+/* =============================================================================
+   SECTION 12c  -  "MON - TempDB RCSI" EMAIL   [rev 5.8]
+   Separate daily email (tempdb_report_hours_local, default 08:00 local):
+     - yesterday vs the previous day vs a 7-day baseline (avg / p95 / max per metric)
+     - BEFORE vs AFTER the RCSI cutover (mon.RcsiCutover; rcsi_compare_days before, everything after)
+     - version store per database, top row-version generators, top tempdb consumers,
+       hourly profile, tempdb files + autogrowth, tempdb I/O
+     EXEC OPS.mon.usp_SendTempdbReport @PreviewOnly = 1;                -- yesterday, html only
+     EXEC OPS.mon.usp_SendTempdbReport @Date = '2026-10-20';            -- a specific local day
+     EXEC OPS.mon.usp_SendTempdbReport @Force = 1;                      -- send now
+   ============================================================================= */
+USE [OPS];
+GO
+
+CREATE OR ALTER FUNCTION mon.fn_FmtMb(@mb decimal(19,2))
+RETURNS nvarchar(30)
+AS
+BEGIN
+    RETURN CASE WHEN @mb IS NULL THEN N'-'
+                WHEN ABS(@mb) >= 1048576 THEN CONCAT(CONVERT(decimal(19,2), @mb / 1048576.0), N' TB')
+                WHEN ABS(@mb) >= 1024 THEN CONCAT(CONVERT(decimal(19,2), @mb / 1024.0), N' GB')
+                WHEN ABS(@mb) >= 10 THEN CONCAT(CONVERT(int, ROUND(@mb, 0)), N' MB')
+                ELSE CONCAT(CONVERT(decimal(9,1), @mb), N' MB') END;
+END;
+GO
+
+/* Relative change as a colored badge. @bad_up = 1: growth is bad (tempdb used, version store); 0 = neutral (blue). */
+CREATE OR ALTER FUNCTION mon.fn_DeltaPill(@new decimal(19,2), @old decimal(19,2), @bad_up bit)
+RETURNS nvarchar(max)
+AS
+BEGIN
+    IF @new IS NULL OR @old IS NULL RETURN mon.fn_Pill(N'n/a', 'NA');
+    IF @old = 0 AND @new = 0 RETURN mon.fn_Pill(N'0%', 'NA');
+    IF @old = 0 RETURN mon.fn_Pill(N'new', CASE WHEN @bad_up = 1 THEN 'WARN' ELSE 'INFO' END);
+    DECLARE @pct decimal(9,1) = (@new - @old) * 100.0 / @old;
+    DECLARE @txt nvarchar(20) = CONCAT(CASE WHEN @pct > 0 THEN N'+' ELSE N'' END, CONVERT(int, ROUND(@pct, 0)), N'%');
+    IF ABS(@pct) < 5 RETURN mon.fn_Pill(@txt, 'NA');
+    IF @bad_up = 0 RETURN mon.fn_Pill(@txt, 'INFO');
+    RETURN mon.fn_Pill(@txt, CASE WHEN @pct >= 50 THEN 'CRIT' WHEN @pct >= 20 THEN 'WARN' WHEN @pct <= -20 THEN 'OK' ELSE 'NA' END);
+END;
+GO
+
+/* Horizontal bar (0-100 %) that renders in Outlook: a two-cell table. */
+CREATE OR ALTER FUNCTION mon.fn_Bar(@pct int, @color varchar(7), @label nvarchar(40))
+RETURNS nvarchar(max)
+AS
+BEGIN
+    IF @pct IS NULL SET @pct = 0;
+    IF @pct < 0 SET @pct = 0;
+    IF @pct > 100 SET @pct = 100;
+    DECLARE @w int = CASE WHEN @pct = 0 THEN 1 ELSE @pct END;
+    RETURN CONCAT(CONVERT(nvarchar(max), N'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse"><tr>'),
+                  N'<td width="', @w, N'%" bgcolor="', @color, N'" style="background:', @color, N';height:12px;line-height:12px;font-size:1px">&nbsp;</td>',
+                  N'<td width="', 100 - @w, N'%" style="font-size:11px;padding-left:6px;white-space:nowrap;color:#374151">', mon.fn_HtmlEncode(@label), N'</td>',
+                  N'</tr></table>');
+END;
+GO
+
+CREATE OR ALTER PROCEDURE mon.usp_SendTempdbReport
+    @Date        date = NULL,          /* local day to report; default yesterday */
+    @PreviewOnly bit  = 0,
+    @Force       bit  = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT OFF;
+
+    DECLARE @now datetime2(0) = SYSUTCDATETIME(), @started datetime2(3) = SYSUTCDATETIME();
+    DECLARE @profile sysname = mon.fn_Setting('mail_profile'),
+            @recipients nvarchar(4000) = COALESCE(NULLIF(mon.fn_Setting('tempdb_report_recipients'), N''), mon.fn_Setting('report_recipients')),
+            @server nvarchar(128) = ISNULL(mon.fn_Setting('server_label'), @@SERVERNAME),
+            @tz nvarchar(100) = ISNULL(mon.fn_Setting('display_time_zone'), N'Eastern Standard Time'),
+            @tzl nvarchar(20) = ISNULL(mon.fn_Setting('display_time_zone_label'), N'ET'),
+            @cmp_days int = ISNULL(mon.fn_SettingInt('rcsi_compare_days'), 7),
+            @vs_warn int = ISNULL(mon.fn_SettingInt('tempdb_vs_warn_pct'), 50),
+            @vs_crit int = ISNULL(mon.fn_SettingInt('tempdb_vs_crit_pct'), 75),
+            @tr_warn int = ISNULL(mon.fn_SettingInt('vs_tran_warn_minutes'), 30),
+            @tr_crit int = ISNULL(mon.fn_SettingInt('vs_tran_crit_minutes'), 120),
+            @gr_warn int = ISNULL(mon.fn_SettingInt('tempdb_growth_warn_per_hour'), 10),
+            @rows_cap int = ISNULL(mon.fn_SettingInt('email_max_rows_per_section'), 40);
+    DECLARE @local_now datetime2(0) = mon.fn_UtcToLocal(@now, @tz);
+    IF @Date IS NULL SET @Date = DATEADD(DAY, -1, CONVERT(date, @local_now));
+
+    IF @Force = 0 AND @PreviewOnly = 0 AND ISNULL(mon.fn_SettingInt('tempdb_report_enabled'), 1) = 0 RETURN;
+
+    /* local day -> UTC window */
+    DECLARE @d0 datetime2(0) = CONVERT(datetime2(0), (CONVERT(datetime2(0), @Date) AT TIME ZONE @tz) AT TIME ZONE 'UTC'),
+            @d1 datetime2(0) = CONVERT(datetime2(0), (CONVERT(datetime2(0), DATEADD(DAY, 1, @Date)) AT TIME ZONE @tz) AT TIME ZONE 'UTC');
+    DECLARE @prev date = DATEADD(DAY, -1, @Date);
+
+    /* make sure the day (and any missing earlier day) is aggregated */
+    BEGIN TRY EXEC mon.usp_SnapshotTempdbDaily; END TRY BEGIN CATCH END CATCH;
+    IF NOT EXISTS (SELECT 1 FROM mon.TempdbDaily WHERE report_date = @Date)
+       AND EXISTS (SELECT 1 FROM mon.TempdbSample WHERE sample_utc >= @d0 AND sample_utc < @d1)
+    BEGIN
+        BEGIN TRY EXEC mon.usp_SnapshotTempdbDaily @Date = @Date; END TRY BEGIN CATCH END CATCH;
+    END;
+
+    DECLARE @n_samples int = (SELECT ISNULL(samples, 0) FROM mon.TempdbDaily WHERE report_date = @Date);
+    IF ISNULL(@n_samples, 0) = 0
+    BEGIN
+        IF @PreviewOnly = 1
+            SELECT CONCAT(N'[', @server, N'] MON - TempDB RCSI ', CONVERT(nvarchar(10), @Date, 120), N' | no samples') AS subject, N'' AS html_body, 0 AS body_kb;
+        ELSE
+            INSERT mon.Notification(notification_type, created_utc, report_date_local, change_count)
+            VALUES ('TEMPDB_SKIPPED', @now, @Date, 0);
+        RETURN;
+    END;
+
+    /* ---------------- 1. daily comparison: yesterday / previous day / 7-day baseline ---------------- */
+    CREATE TABLE #M (sort int, metric nvarchar(60), unit char(3), bad_up bit,
+                     y_avg decimal(19,2) NULL, y_p95 decimal(19,2) NULL, y_max decimal(19,2) NULL,
+                     p_avg decimal(19,2) NULL, p_p95 decimal(19,2) NULL, p_max decimal(19,2) NULL,
+                     b_max decimal(19,2) NULL, b_days int NULL);
+    ;WITH Y AS (SELECT * FROM mon.TempdbDaily WHERE report_date = @Date),
+          P AS (SELECT * FROM mon.TempdbDaily WHERE report_date = @prev),
+          B AS (SELECT COUNT(*) AS n, AVG(used_max_mb) AS used_max, AVG(used_p95_mb) AS used_p95, AVG(vs_max_mb) AS vs_max,
+                       AVG(user_obj_max_mb) AS uo_max, AVG(internal_obj_max_mb) AS io_max, AVG(size_max_mb) AS size_max,
+                       AVG(CONVERT(decimal(19,2), vs_tran_max_s)) AS tran_max, AVG(CONVERT(decimal(19,2), vs_active_tran_max)) AS atr_max,
+                       AVG(CONVERT(decimal(19,2), sessions_max)) AS sess_max, AVG(top_session_max_mb) AS top_max,
+                       AVG(log_used_max_pct) AS log_max, AVG(CONVERT(decimal(19,2), io_write_mb)) AS wr_mb, AVG(CONVERT(decimal(19,2), io_read_mb)) AS rd_mb,
+                       AVG(io_write_ms_avg) AS wr_ms, AVG(io_read_ms_avg) AS rd_ms, AVG(CONVERT(decimal(19,2), growth_events)) AS growth
+                FROM mon.TempdbDaily WHERE report_date BETWEEN DATEADD(DAY, -8, @Date) AND DATEADD(DAY, -2, @Date))
+    INSERT #M(sort, metric, unit, bad_up, y_avg, y_p95, y_max, p_avg, p_p95, p_max, b_max, b_days)
+    SELECT v.sort, v.metric, v.unit, v.bad_up, v.y_avg, v.y_p95, v.y_max, v.p_avg, v.p_p95, v.p_max, v.b_max, B.n
+    FROM Y LEFT JOIN P ON 1 = 1 CROSS JOIN B
+    CROSS APPLY (VALUES
+        (10, N'tempdb used',             'MB ', 1, Y.used_avg_mb, Y.used_p95_mb, Y.used_max_mb, P.used_avg_mb, P.used_p95_mb, P.used_max_mb, B.used_max),
+        (20, N'Version store',           'MB ', 1, Y.vs_avg_mb, Y.vs_p95_mb, Y.vs_max_mb, P.vs_avg_mb, P.vs_p95_mb, P.vs_max_mb, B.vs_max),
+        (30, N'User objects',            'MB ', 1, Y.user_obj_avg_mb, NULL, Y.user_obj_max_mb, P.user_obj_avg_mb, NULL, P.user_obj_max_mb, B.uo_max),
+        (40, N'Internal objects',        'MB ', 1, Y.internal_obj_avg_mb, NULL, Y.internal_obj_max_mb, P.internal_obj_avg_mb, NULL, P.internal_obj_max_mb, B.io_max),
+        (50, N'tempdb size (allocated)', 'MB ', 1, NULL, NULL, Y.size_max_mb, NULL, NULL, P.size_max_mb, B.size_max),
+        (60, N'Longest versioning tran', 'SEC', 1, NULL, NULL, Y.vs_tran_max_s, NULL, NULL, P.vs_tran_max_s, B.tran_max),
+        (70, N'Versioning transactions', 'NUM', 1, NULL, NULL, Y.vs_active_tran_max, NULL, NULL, P.vs_active_tran_max, B.atr_max),
+        (80, N'Sessions using tempdb (>= 1 MB)', 'NUM', 0, NULL, NULL, Y.sessions_max, NULL, NULL, P.sessions_max, B.sess_max),
+        (90, N'Largest single session', 'MB ', 1, NULL, NULL, Y.top_session_max_mb, NULL, NULL, P.top_session_max_mb, B.top_max),
+        (100, N'tempdb log used %',      'PCT', 1, NULL, NULL, Y.log_used_max_pct, NULL, NULL, P.log_used_max_pct, B.log_max),
+        (110, N'Written to tempdb (day total)', 'MB ', 0, NULL, NULL, Y.io_write_mb, NULL, NULL, P.io_write_mb, B.wr_mb),
+        (120, N'Read from tempdb (day total)',  'MB ', 0, NULL, NULL, Y.io_read_mb, NULL, NULL, P.io_read_mb, B.rd_mb),
+        (130, N'tempdb write latency (avg)',    'MS ', 1, NULL, NULL, Y.io_write_ms_avg, NULL, NULL, P.io_write_ms_avg, B.wr_ms),
+        (140, N'tempdb read latency (avg)',     'MS ', 1, NULL, NULL, Y.io_read_ms_avg, NULL, NULL, P.io_read_ms_avg, B.rd_ms),
+        (150, N'Autogrowth events',      'NUM', 1, NULL, NULL, Y.growth_events, NULL, NULL, P.growth_events, B.growth)
+    ) AS v(sort, metric, unit, bad_up, y_avg, y_p95, y_max, p_avg, p_p95, p_max, b_max);
+
+    DECLARE @b_days int = ISNULL((SELECT MAX(b_days) FROM #M), 0);
+
+    DECLARE @cmp_rows nvarchar(max) = N'';
+    SELECT @cmp_rows = @cmp_rows + CONCAT(N'<tr>',
+        mon.fn_Td(mon.fn_HtmlEncode(m.metric), NULL),
+        mon.fn_Td(mon.fn_Nw(x.y), CASE WHEN m.sort = 20 AND y_max_pct >= @vs_crit THEN 'CRIT' WHEN m.sort = 20 AND y_max_pct >= @vs_warn THEN 'WARN'
+                                       WHEN m.sort = 60 AND m.y_max >= @tr_crit * 60 THEN 'CRIT' WHEN m.sort = 60 AND m.y_max >= @tr_warn * 60 THEN 'WARN'
+                                       ELSE NULL END),
+        mon.fn_Td(mon.fn_Nw(x.p), NULL),
+        mon.fn_Td(mon.fn_DeltaPill(m.y_max, m.p_max, m.bad_up), NULL),
+        mon.fn_Td(mon.fn_Nw(x.b), NULL),
+        mon.fn_Td(mon.fn_DeltaPill(m.y_max, m.b_max, m.bad_up), NULL),
+        N'</tr>')
+    FROM #M AS m
+    CROSS APPLY (SELECT CONVERT(decimal(9,1), m.y_max * 100.0 / NULLIF((SELECT size_max_mb FROM mon.TempdbDaily WHERE report_date = @Date), 0)) AS y_max_pct) AS pc
+    CROSS APPLY (SELECT
+        CASE m.unit WHEN 'MB ' THEN CONCAT(CASE WHEN m.y_avg IS NOT NULL THEN CONCAT(N'avg ', mon.fn_FmtMb(m.y_avg), N' &middot; ') ELSE N'' END,
+                                           CASE WHEN m.y_p95 IS NOT NULL THEN CONCAT(N'p95 ', mon.fn_FmtMb(m.y_p95), N' &middot; ') ELSE N'' END,
+                                           N'<b>max ', mon.fn_FmtMb(m.y_max), N'</b>')
+                    WHEN 'SEC' THEN CONCAT(N'<b>', mon.fn_Duration(CONVERT(bigint, m.y_max)), N'</b>')
+                    WHEN 'MS ' THEN CONCAT(N'<b>', ISNULL(CONVERT(nvarchar(20), CONVERT(decimal(9,1), m.y_max)), N'-'), N' ms</b>')
+                    WHEN 'PCT' THEN CONCAT(N'<b>', ISNULL(CONVERT(nvarchar(20), CONVERT(decimal(9,1), m.y_max)), N'-'), N'%</b>')
+                    ELSE CONCAT(N'<b>', ISNULL(CONVERT(nvarchar(20), CONVERT(int, m.y_max)), N'-'), N'</b>') END AS y,
+        CASE WHEN m.p_max IS NULL THEN N'-'
+             WHEN m.unit = 'MB ' THEN CONCAT(CASE WHEN m.p_avg IS NOT NULL THEN CONCAT(N'avg ', mon.fn_FmtMb(m.p_avg), N' &middot; ') ELSE N'' END,
+                                            CASE WHEN m.p_p95 IS NOT NULL THEN CONCAT(N'p95 ', mon.fn_FmtMb(m.p_p95), N' &middot; ') ELSE N'' END,
+                                            N'max ', mon.fn_FmtMb(m.p_max))
+             WHEN m.unit = 'SEC' THEN mon.fn_Duration(CONVERT(bigint, m.p_max))
+             WHEN m.unit = 'MS ' THEN CONCAT(CONVERT(decimal(9,1), m.p_max), N' ms')
+             WHEN m.unit = 'PCT' THEN CONCAT(CONVERT(decimal(9,1), m.p_max), N'%')
+             ELSE CONVERT(nvarchar(20), CONVERT(int, m.p_max)) END AS p,
+        CASE WHEN m.b_max IS NULL THEN N'-'
+             WHEN m.unit = 'MB ' THEN mon.fn_FmtMb(m.b_max)
+             WHEN m.unit = 'SEC' THEN mon.fn_Duration(CONVERT(bigint, m.b_max))
+             WHEN m.unit = 'MS ' THEN CONCAT(CONVERT(decimal(9,1), m.b_max), N' ms')
+             WHEN m.unit = 'PCT' THEN CONCAT(CONVERT(decimal(9,1), m.b_max), N'%')
+             ELSE CONVERT(nvarchar(20), CONVERT(decimal(9,1), m.b_max)) END AS b) AS x
+    ORDER BY m.sort;
+
+    /* ---------------- 2. BEFORE vs AFTER RCSI ---------------- */
+    DECLARE @cut_first datetime2(0), @cut_last datetime2(0), @cut_dbs nvarchar(1000) = N'', @unknown_dbs nvarchar(1000) = N'', @cut_n int = 0, @on_n int = 0;
+    SELECT @cut_first = MIN(enabled_utc), @cut_last = MAX(enabled_utc), @cut_n = COUNT(enabled_utc),
+           @on_n = SUM(CASE WHEN is_on = 1 THEN 1 ELSE 0 END)
+    FROM mon.RcsiCutover;
+    SELECT @cut_dbs = @cut_dbs + CONCAT(CASE WHEN @cut_dbs <> N'' THEN N', ' ELSE N'' END, c.database_name, N' (', mon.fn_FmtLocal(c.enabled_utc, @tz),
+                                        CASE WHEN c.is_on = 0 THEN N', OFF again' ELSE N'' END, N')')
+    FROM mon.RcsiCutover AS c WHERE c.enabled_utc IS NOT NULL ORDER BY c.enabled_utc, c.database_name;
+    SELECT @unknown_dbs = @unknown_dbs + CONCAT(CASE WHEN @unknown_dbs <> N'' THEN N', ' ELSE N'' END, c.database_name)
+    FROM mon.RcsiCutover AS c WHERE c.enabled_utc IS NULL AND c.is_on = 1 ORDER BY c.database_name;
+
+    DECLARE @first_sample datetime2(0) = (SELECT MIN(sample_utc) FROM mon.TempdbSample);
+    DECLARE @ba_rows nvarchar(max) = N'', @ba_subtitle nvarchar(1000), @ba_subject nvarchar(200) = N'';
+
+    CREATE TABLE #W (w char(1) PRIMARY KEY, days decimal(9,1), samples int,
+                     used_avg decimal(19,2), used_p95 decimal(19,2), used_max decimal(19,2),
+                     vs_avg decimal(19,2), vs_p95 decimal(19,2), vs_max decimal(19,2),
+                     uo_max decimal(19,2), io_max decimal(19,2), tran_max int, atr_max int, sess_max int, top_max decimal(19,2),
+                     wr_mb_day decimal(19,2), wr_ms decimal(9,2), growth_day decimal(9,2));
+    IF @cut_first IS NOT NULL
+    BEGIN
+        DECLARE @b0 datetime2(0) = DATEADD(DAY, -@cmp_days, @cut_first),
+                @b1 datetime2(0) = @cut_first,
+                @a0 datetime2(0) = @cut_last,
+                @a1 datetime2(0) = @d1;   /* up to the end of the reported day */
+        IF @b0 < @first_sample SET @b0 = @first_sample;
+
+        /* raw samples (30 days) when available, otherwise the daily table */
+        ;WITH X AS (SELECT v.w, v.t0, v.t1 FROM (VALUES ('B', @b0, @b1), ('A', @a0, @a1)) AS v(w, t0, t1)),
+        S AS
+        (
+            SELECT X.w, X.t0, X.t1, s.sample_utc, s.used_mb, s.version_store_mb, s.user_obj_mb, s.internal_obj_mb,
+                   s.vs_longest_tran_s, s.vs_active_tran, s.sessions_using_tempdb, s.top_session_mb,
+                   PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY s.used_mb)          OVER (PARTITION BY X.w) AS used_p95,
+                   PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY s.version_store_mb) OVER (PARTITION BY X.w) AS vs_p95,
+                   s.io_bytes_written  - LAG(s.io_bytes_written)  OVER (PARTITION BY X.w ORDER BY s.sample_utc) AS d_bwr,
+                   s.io_writes         - LAG(s.io_writes)         OVER (PARTITION BY X.w ORDER BY s.sample_utc) AS d_wr,
+                   s.io_stall_write_ms - LAG(s.io_stall_write_ms) OVER (PARTITION BY X.w ORDER BY s.sample_utc) AS d_swr
+            FROM X
+            JOIN mon.TempdbSample AS s ON s.sample_utc >= X.t0 AND s.sample_utc < X.t1
+        )
+        INSERT #W(w, days, samples, used_avg, used_p95, used_max, vs_avg, vs_p95, vs_max, uo_max, io_max, tran_max, atr_max, sess_max, top_max, wr_mb_day, wr_ms, growth_day)
+        SELECT S.w, CONVERT(decimal(9,1), DATEDIFF(MINUTE, S.t0, S.t1) / 1440.0), COUNT(*),
+               AVG(S.used_mb), MAX(S.used_p95), MAX(S.used_mb), AVG(S.version_store_mb), MAX(S.vs_p95), MAX(S.version_store_mb),
+               MAX(S.user_obj_mb), MAX(S.internal_obj_mb), MAX(S.vs_longest_tran_s), MAX(S.vs_active_tran), MAX(S.sessions_using_tempdb), MAX(S.top_session_mb),
+               CONVERT(decimal(19,2), SUM(CASE WHEN S.d_bwr > 0 THEN S.d_bwr ELSE 0 END) / 1048576.0 / NULLIF(DATEDIFF(MINUTE, S.t0, S.t1) / 1440.0, 0)),
+               CONVERT(decimal(9,2), SUM(CASE WHEN S.d_swr > 0 THEN S.d_swr ELSE 0 END) * 1.0 / NULLIF(SUM(CASE WHEN S.d_wr > 0 THEN S.d_wr ELSE 0 END), 0)),
+               CONVERT(decimal(9,2), (SELECT COUNT(*) FROM mon.TempdbGrowthEvent AS g WHERE g.event_utc >= S.t0 AND g.event_utc < S.t1) / NULLIF(DATEDIFF(MINUTE, S.t0, S.t1) / 1440.0, 0))
+        FROM S
+        GROUP BY S.w, S.t0, S.t1;
+
+        /* before-window older than the raw retention: use the daily aggregates */
+        IF NOT EXISTS (SELECT 1 FROM #W WHERE w = 'B')
+            INSERT #W(w, days, samples, used_avg, used_p95, used_max, vs_avg, vs_p95, vs_max, uo_max, io_max, tran_max, atr_max, sess_max, top_max, wr_mb_day, wr_ms, growth_day)
+            SELECT 'B', COUNT(*), SUM(samples), AVG(used_avg_mb), MAX(used_p95_mb), MAX(used_max_mb), AVG(vs_avg_mb), MAX(vs_p95_mb), MAX(vs_max_mb),
+                   MAX(user_obj_max_mb), MAX(internal_obj_max_mb), MAX(vs_tran_max_s), MAX(vs_active_tran_max), MAX(sessions_max), MAX(top_session_max_mb),
+                   AVG(CONVERT(decimal(19,2), io_write_mb)), AVG(io_write_ms_avg), AVG(CONVERT(decimal(9,2), growth_events))
+            FROM mon.TempdbDaily
+            WHERE report_date >= CONVERT(date, mon.fn_UtcToLocal(@b0, @tz)) AND report_date < CONVERT(date, mon.fn_UtcToLocal(@b1, @tz))
+            HAVING COUNT(*) > 0;
+
+        SELECT @ba_rows = @ba_rows + CONCAT(N'<tr>',
+            mon.fn_Td(mon.fn_HtmlEncode(v.metric), NULL),
+            mon.fn_Td(mon.fn_Nw(v.b_txt), NULL),
+            mon.fn_Td(mon.fn_Nw(v.a_txt), NULL),
+            mon.fn_Td(mon.fn_DeltaPill(v.a_val, v.b_val, v.bad_up), NULL),
+            N'</tr>')
+        FROM (SELECT * FROM #W WHERE w = 'B') AS B
+        FULL JOIN (SELECT * FROM #W WHERE w = 'A') AS A ON 1 = 1
+        CROSS APPLY (VALUES
+            (10, N'tempdb used - avg', 1, B.used_avg, A.used_avg, mon.fn_FmtMb(B.used_avg), mon.fn_FmtMb(A.used_avg)),
+            (11, N'tempdb used - p95', 1, B.used_p95, A.used_p95, mon.fn_FmtMb(B.used_p95), mon.fn_FmtMb(A.used_p95)),
+            (12, N'tempdb used - max', 1, B.used_max, A.used_max, mon.fn_FmtMb(B.used_max), mon.fn_FmtMb(A.used_max)),
+            (20, N'Version store - avg', 1, B.vs_avg, A.vs_avg, mon.fn_FmtMb(B.vs_avg), mon.fn_FmtMb(A.vs_avg)),
+            (21, N'Version store - p95', 1, B.vs_p95, A.vs_p95, mon.fn_FmtMb(B.vs_p95), mon.fn_FmtMb(A.vs_p95)),
+            (22, N'Version store - max', 1, B.vs_max, A.vs_max, mon.fn_FmtMb(B.vs_max), mon.fn_FmtMb(A.vs_max)),
+            (30, N'User objects - max', 1, B.uo_max, A.uo_max, mon.fn_FmtMb(B.uo_max), mon.fn_FmtMb(A.uo_max)),
+            (31, N'Internal objects - max', 1, B.io_max, A.io_max, mon.fn_FmtMb(B.io_max), mon.fn_FmtMb(A.io_max)),
+            (40, N'Longest versioning tran', 1, CONVERT(decimal(19,2), B.tran_max), CONVERT(decimal(19,2), A.tran_max), mon.fn_Duration(B.tran_max), mon.fn_Duration(A.tran_max)),
+            (41, N'Versioning transactions - max', 1, CONVERT(decimal(19,2), B.atr_max), CONVERT(decimal(19,2), A.atr_max), ISNULL(CONVERT(nvarchar(20), B.atr_max), N'-'), ISNULL(CONVERT(nvarchar(20), A.atr_max), N'-')),
+            (50, N'Sessions using tempdb - max', 0, CONVERT(decimal(19,2), B.sess_max), CONVERT(decimal(19,2), A.sess_max), ISNULL(CONVERT(nvarchar(20), B.sess_max), N'-'), ISNULL(CONVERT(nvarchar(20), A.sess_max), N'-')),
+            (51, N'Largest single session', 1, B.top_max, A.top_max, mon.fn_FmtMb(B.top_max), mon.fn_FmtMb(A.top_max)),
+            (60, N'Written to tempdb per day', 0, B.wr_mb_day, A.wr_mb_day, mon.fn_FmtMb(B.wr_mb_day), mon.fn_FmtMb(A.wr_mb_day)),
+            (61, N'tempdb write latency', 1, B.wr_ms, A.wr_ms, CONCAT(ISNULL(CONVERT(nvarchar(20), B.wr_ms), N'-'), N' ms'), CONCAT(ISNULL(CONVERT(nvarchar(20), A.wr_ms), N'-'), N' ms')),
+            (70, N'Autogrowth events per day', 1, B.growth_day, A.growth_day, ISNULL(CONVERT(nvarchar(20), B.growth_day), N'-'), ISNULL(CONVERT(nvarchar(20), A.growth_day), N'-'))
+        ) AS v(sort, metric, bad_up, b_val, a_val, b_txt, a_txt)
+        ORDER BY v.sort;
+
+        DECLARE @bd decimal(9,1) = (SELECT days FROM #W WHERE w = 'B'), @ad decimal(9,1) = (SELECT days FROM #W WHERE w = 'A'),
+                @bn int = (SELECT samples FROM #W WHERE w = 'B'), @an int = (SELECT samples FROM #W WHERE w = 'A');
+        SET @ba_subtitle = CONCAT(N'Cutover: ', mon.fn_HtmlEncode(@cut_dbs), N'. ',
+            N'BEFORE = ', ISNULL(CONVERT(nvarchar(20), @bd), N'0'), N' day(s) / ', ISNULL(@bn, 0), N' samples before the first cutover (',
+            mon.fn_FmtLocal(@b0, @tz), N' - ', mon.fn_FmtLocal(@b1, @tz), N' ', @tzl, N'); ',
+            N'AFTER = ', ISNULL(CONVERT(nvarchar(20), @ad), N'0'), N' day(s) / ', ISNULL(@an, 0), N' samples since the last cutover (',
+            mon.fn_FmtLocal(@a0, @tz), N' - ', mon.fn_FmtLocal(@a1, @tz), N' ', @tzl, N').',
+            CASE WHEN @unknown_dbs <> N'' THEN CONCAT(N' Already ON before monitoring started (date unknown): ', mon.fn_HtmlEncode(@unknown_dbs), N'.') ELSE N'' END);
+        IF @ba_rows = N'' SET @ba_rows = mon.fn_EmptyRow(4, N'No samples in the comparison windows yet.');
+        SELECT @ba_subject = CONCAT(N' | after RCSI: used p95 ', mon.fn_FmtMb(A.used_p95), N' vs ', mon.fn_FmtMb(B.used_p95), N' before')
+        FROM (SELECT * FROM #W WHERE w = 'A') AS A CROSS JOIN (SELECT * FROM #W WHERE w = 'B') AS B;
+    END
+    ELSE
+    BEGIN
+        SET @ba_subtitle = CONCAT(N'No RCSI cutover recorded yet - collecting the baseline since ', mon.fn_FmtLocal(@first_sample, @tz), N' ', @tzl,
+            N' (', CONVERT(decimal(9,1), DATEDIFF(MINUTE, @first_sample, @now) / 1440.0), N' days). ',
+            N'The cutover is detected automatically when a database switches to READ COMMITTED SNAPSHOT (or record it with usp_SetRcsiCutover, see footer).',
+            CASE WHEN @unknown_dbs <> N'' THEN CONCAT(N' Databases already ON before monitoring started (no pre-RCSI baseline): ', mon.fn_HtmlEncode(@unknown_dbs), N'.') ELSE N'' END);
+        SET @ba_rows = mon.fn_EmptyRow(4, N'Before/after comparison appears here once RCSI has been switched on.');
+    END;
+
+    /* ---------------- 3. version store by database (reported day) ---------------- */
+    DECLARE @vsdb_rows nvarchar(max) = N'';
+    SELECT TOP (@rows_cap) @vsdb_rows = @vsdb_rows + CONCAT(N'<tr>',
+        mon.fn_Td(mon.fn_HtmlEncode(v.database_name), NULL),
+        mon.fn_Td(CASE WHEN v.rcsi = 1 THEN mon.fn_Pill(N'RCSI', 'INFO') ELSE N'' END + CASE WHEN v.si = 1 THEN CONCAT(N' ', mon.fn_Pill(N'SI', 'INFO')) ELSE N'' END, NULL),
+        mon.fn_Td(mon.fn_Nw(CONCAT(N'<b>', mon.fn_FmtMb(v.vs_max), N'</b>')), NULL),
+        mon.fn_Td(mon.fn_Nw(mon.fn_FmtMb(v.vs_avg)), NULL),
+        mon.fn_Td(mon.fn_DeltaPill(v.vs_max, p.vs_max, 1), NULL),
+        mon.fn_Td(CONVERT(nvarchar(20), v.atr_max), NULL),
+        mon.fn_Td(mon.fn_Nw(mon.fn_Duration(v.tran_max)), CASE WHEN v.tran_max >= @tr_crit * 60 THEN 'CRIT' WHEN v.tran_max >= @tr_warn * 60 THEN 'WARN' ELSE NULL END),
+        mon.fn_Td(mon.fn_Small(CONCAT(v.n, N' of ', @n_samples)), NULL),
+        N'</tr>')
+    FROM (SELECT database_name, MAX(CONVERT(tinyint, is_rcsi_on)) AS rcsi, MAX(CONVERT(tinyint, is_si_on)) AS si,
+                 MAX(reserved_mb) AS vs_max, AVG(reserved_mb) AS vs_avg, MAX(active_tran) AS atr_max, MAX(longest_tran_s) AS tran_max, COUNT(*) AS n
+          FROM mon.TempdbVersionStoreDb WHERE sample_utc >= @d0 AND sample_utc < @d1 GROUP BY database_name) AS v
+    LEFT JOIN (SELECT database_name, MAX(reserved_mb) AS vs_max
+               FROM mon.TempdbVersionStoreDb WHERE sample_utc >= DATEADD(DAY, -1, @d0) AND sample_utc < @d0 GROUP BY database_name) AS p ON p.database_name = v.database_name
+    ORDER BY v.vs_max DESC, v.database_name;
+    IF @vsdb_rows = N'' SET @vsdb_rows = mon.fn_EmptyRow(8, N'No database held row versions on this day.');
+
+    /* ---------------- 4. top row-version generators ---------------- */
+    DECLARE @gen_rows nvarchar(max) = N'';
+    SELECT TOP (@rows_cap) @gen_rows = @gen_rows + CONCAT(N'<tr>',
+        mon.fn_Td(mon.fn_HtmlEncode(g.database_name), NULL),
+        mon.fn_Td(CONCAT(N'<code>', mon.fn_HtmlEncode(g.object_name), N'</code>', CASE WHEN g.index_name IS NOT NULL THEN CONCAT(N' ', mon.fn_Small(mon.fn_HtmlEncode(g.index_name))) ELSE N'' END), NULL),
+        mon.fn_Td(mon.fn_Nw(CONCAT(N'<b>', mon.fn_FmtMb(g.mx), N'</b>')), NULL),
+        mon.fn_Td(mon.fn_Nw(mon.fn_FmtMb(g.av)), NULL),
+        mon.fn_Td(mon.fn_Small(CONCAT(g.n, N' of ', @n_samples)), NULL),
+        N'</tr>')
+    FROM (SELECT database_name, object_name, index_name, MAX(version_mb) AS mx, AVG(version_mb) AS av, COUNT(*) AS n
+          FROM mon.TempdbVersionGenerator WHERE sample_utc >= @d0 AND sample_utc < @d1
+          GROUP BY database_name, object_name, index_name) AS g
+    ORDER BY g.mx DESC, g.database_name, g.object_name;
+    IF @gen_rows = N'' SET @gen_rows = mon.fn_EmptyRow(5, N'No row-version generators observed on this day.');
+
+    /* ---------------- 5. top tempdb consumers ---------------- */
+    DECLARE @top_rows nvarchar(max) = N'';
+    SELECT TOP (@rows_cap) @top_rows = @top_rows + CONCAT(N'<tr>',
+        mon.fn_Td(CONCAT(mon.fn_HtmlEncode(ISNULL(c.login_name, N'?')), N'<br>', mon.fn_Small(CONCAT(mon.fn_HtmlEncode(ISNULL(c.host_name, N'')), N' &middot; ', mon.fn_HtmlEncode(LEFT(ISNULL(c.program_name, N''), 60))))), NULL),
+        mon.fn_Td(mon.fn_HtmlEncode(ISNULL(c.database_name, N'')), NULL),
+        mon.fn_Td(mon.fn_Nw(CONCAT(N'<b>', mon.fn_FmtMb(c.mx), N'</b>')), CASE WHEN c.mx >= 10240 THEN 'WARN' ELSE NULL END),
+        mon.fn_Td(mon.fn_Nw(CONCAT(mon.fn_FmtMb(c.uo), N' / ', mon.fn_FmtMb(c.io))), NULL),
+        mon.fn_Td(mon.fn_Small(CONCAT(c.n, N' sample(s), ', c.sessions, N' session(s)')), NULL),
+        mon.fn_Td(CASE WHEN c.sql_text IS NULL THEN mon.fn_Small(N'(no statement captured)') ELSE CONCAT(N'<code>', mon.fn_OneLine(c.sql_text, 220), N'</code>') END, NULL),
+        N'</tr>')
+    FROM (SELECT login_name, host_name, program_name, database_name, query_hash,
+                 MAX(total_mb) AS mx, MAX(user_obj_mb) AS uo, MAX(internal_obj_mb) AS io, COUNT(*) AS n, COUNT(DISTINCT session_id) AS sessions,
+                 MAX(sql_text) AS sql_text
+          FROM mon.TempdbTopConsumer WHERE sample_utc >= @d0 AND sample_utc < @d1
+          GROUP BY login_name, host_name, program_name, database_name, query_hash) AS c
+    ORDER BY c.mx DESC;
+    IF @top_rows = N'' SET @top_rows = mon.fn_EmptyRow(6, CONCAT(N'No session held more than ', ISNULL(mon.fn_SettingInt('tempdb_top_min_mb'), 50), N' MB of tempdb on this day.'));
+
+    /* ---------------- 6. hourly profile ---------------- */
+    DECLARE @hour_rows nvarchar(max) = N'', @size_max decimal(19,2) = (SELECT size_max_mb FROM mon.TempdbDaily WHERE report_date = @Date);
+    SELECT @hour_rows = @hour_rows + CONCAT(N'<tr>',
+        mon.fn_Td(mon.fn_Nw(CONCAT(RIGHT(CONCAT(N'0', h.hr), 2), N':00')), NULL),
+        N'<td class="c" valign="top" width="34%">', mon.fn_Bar(CONVERT(int, h.used_max * 100.0 / NULLIF(@size_max, 0)), '#2563EB', mon.fn_FmtMb(h.used_max)), N'</td>',
+        N'<td class="c" valign="top" width="34%">', mon.fn_Bar(CONVERT(int, h.vs_max * 100.0 / NULLIF(@size_max, 0)), '#F59E0B', mon.fn_FmtMb(h.vs_max)), N'</td>',
+        mon.fn_Td(CONVERT(nvarchar(20), h.atr_max), NULL),
+        mon.fn_Td(mon.fn_Nw(mon.fn_Duration(h.tran_max)), CASE WHEN h.tran_max >= @tr_warn * 60 THEN 'WARN' ELSE NULL END),
+        mon.fn_Td(CONVERT(nvarchar(20), h.sess_max), NULL),
+        N'</tr>')
+    FROM (SELECT DATEPART(HOUR, (s.sample_utc AT TIME ZONE 'UTC') AT TIME ZONE @tz) AS hr,
+                 MAX(s.used_mb) AS used_max, MAX(s.version_store_mb) AS vs_max, MAX(s.vs_active_tran) AS atr_max,
+                 MAX(s.vs_longest_tran_s) AS tran_max, MAX(s.sessions_using_tempdb) AS sess_max
+          FROM mon.TempdbSample AS s WHERE s.sample_utc >= @d0 AND s.sample_utc < @d1
+          GROUP BY DATEPART(HOUR, (s.sample_utc AT TIME ZONE 'UTC') AT TIME ZONE @tz)) AS h
+    ORDER BY h.hr;
+    IF @hour_rows = N'' SET @hour_rows = mon.fn_EmptyRow(6, N'No samples on this day.');
+
+    /* ---------------- 7. files + autogrowth ---------------- */
+    DECLARE @file_rows nvarchar(max) = N'', @last_sample datetime2(0) = (SELECT MAX(sample_utc) FROM mon.TempdbFileSample WHERE sample_utc < @d1);
+    SELECT @file_rows = @file_rows + CONCAT(N'<tr>',
+        mon.fn_Td(mon.fn_HtmlEncode(f.logical_name), NULL),
+        mon.fn_Td(mon.fn_HtmlEncode(f.type_desc), NULL),
+        mon.fn_Td(mon.fn_Nw(mon.fn_FmtMb(f.size_mb)), NULL),
+        mon.fn_Td(mon.fn_Nw(CASE WHEN f.used_mb IS NULL THEN N'-' ELSE CONCAT(mon.fn_FmtMb(f.used_mb), N' (', CONVERT(int, f.used_mb * 100.0 / NULLIF(f.size_mb, 0)), N'%)') END), NULL),
+        mon.fn_Td(mon.fn_Nw(CASE WHEN f.max_size_mb = -1 THEN N'unlimited' ELSE mon.fn_FmtMb(f.max_size_mb) END), NULL),
+        mon.fn_Td(mon.fn_HtmlEncode(f.growth_desc), NULL),
+        mon.fn_Td(CASE WHEN g.n IS NULL THEN N'0' ELSE CONCAT(N'<b>', g.n, N'</b> (+', mon.fn_FmtMb(g.mb), N')') END, CASE WHEN g.n >= @gr_warn THEN 'WARN' ELSE NULL END),
+        N'</tr>')
+    FROM mon.TempdbFileSample AS f
+    LEFT JOIN (SELECT file_name, COUNT(*) AS n, SUM(growth_mb) AS mb FROM mon.TempdbGrowthEvent WHERE event_utc >= @d0 AND event_utc < @d1 GROUP BY file_name) AS g
+           ON g.file_name = f.logical_name
+    WHERE f.sample_utc = @last_sample
+    ORDER BY f.type_desc DESC, f.file_id;
+    IF @file_rows = N'' SET @file_rows = mon.fn_EmptyRow(7, N'No file sample for this day.');
+
+    /* ---------------- KPIs + subject ---------------- */
+    DECLARE @y_used decimal(19,2), @y_vs decimal(19,2), @y_tran int, @y_growth int, @y_size decimal(19,2), @y_sess int, @p_used decimal(19,2), @p_vs decimal(19,2);
+    SELECT @y_used = used_max_mb, @y_vs = vs_max_mb, @y_tran = vs_tran_max_s, @y_growth = growth_events, @y_size = size_max_mb, @y_sess = sessions_max
+    FROM mon.TempdbDaily WHERE report_date = @Date;
+    SELECT @p_used = used_max_mb, @p_vs = vs_max_mb FROM mon.TempdbDaily WHERE report_date = @prev;
+    DECLARE @vs_pct int = CONVERT(int, @y_vs * 100.0 / NULLIF(@y_size, 0));
+    DECLARE @level varchar(4) = CASE WHEN @vs_pct >= @vs_crit OR @y_tran >= @tr_crit * 60 THEN 'CRIT'
+                                     WHEN @vs_pct >= @vs_warn OR @y_tran >= @tr_warn * 60 OR @y_growth >= @gr_warn THEN 'WARN' ELSE 'OK' END;
+    DECLARE @color varchar(7) = CASE @level WHEN 'CRIT' THEN '#DC2626' WHEN 'WARN' THEN '#D97706' ELSE '#1E3A5F' END;
+
+    DECLARE @nfiles int = (SELECT TOP (1) data_file_count FROM mon.TempdbSample WHERE sample_utc < @d1 ORDER BY sample_utc DESC),
+            @ndb int = (SELECT COUNT(*) FROM sys.databases WHERE database_id > 4);
+    DECLARE @kpis nvarchar(max) = mon.fn_KpiRow(CONCAT(
+        mon.fn_Kpi(mon.fn_FmtMb(@y_used), N'tempdb used max', CONCAT(N'prev ', mon.fn_FmtMb(@p_used)), CASE WHEN @p_used > 0 AND @y_used >= @p_used * 1.5 THEN 'WARN' ELSE NULL END),
+        mon.fn_Kpi(mon.fn_FmtMb(@y_vs), N'version store max', CONCAT(ISNULL(CONVERT(nvarchar(10), @vs_pct), N'-'), N'% of tempdb'), CASE WHEN @vs_pct >= @vs_crit THEN 'CRIT' WHEN @vs_pct >= @vs_warn THEN 'WARN' ELSE NULL END),
+        mon.fn_Kpi(mon.fn_Duration(@y_tran), N'longest versioning tran', N'max of the day', CASE WHEN @y_tran >= @tr_crit * 60 THEN 'CRIT' WHEN @y_tran >= @tr_warn * 60 THEN 'WARN' ELSE NULL END),
+        mon.fn_Kpi(ISNULL(CONVERT(nvarchar(10), @y_growth), N'0'), N'autogrowths', N'tempdb files', CASE WHEN @y_growth >= @gr_warn THEN 'WARN' WHEN @y_growth > 0 THEN 'INFO' ELSE NULL END),
+        mon.fn_Kpi(mon.fn_FmtMb(@y_size), N'tempdb size', CONCAT(@nfiles, N' data files'), NULL),
+        mon.fn_Kpi(CONCAT(@on_n, N'/', @ndb), N'RCSI databases', CASE WHEN @cut_n > 0 THEN CONCAT(N'cutover ', mon.fn_FmtLocal(@cut_last, @tz)) ELSE N'no cutover yet' END, CASE WHEN @on_n > 0 THEN 'INFO' ELSE NULL END)));
+
+    DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @server, N'] MON - TempDB RCSI ', CONVERT(nvarchar(10), @Date, 120),
+        N' | used max ', mon.fn_FmtMb(@y_used), CASE WHEN @p_used > 0 THEN CONCAT(N' (', CASE WHEN @y_used >= @p_used THEN N'+' ELSE N'' END, CONVERT(int, (@y_used - @p_used) * 100.0 / @p_used), N'%)') ELSE N'' END,
+        N' | version store max ', mon.fn_FmtMb(@y_vs), @ba_subject), 255);
+
+    DECLARE @body nvarchar(max) = CONCAT(
+        @kpis,
+        mon.fn_Section(CONCAT(N'Day ', CONVERT(nvarchar(10), @Date, 120), N' vs previous day vs 7-day baseline'),
+                       CONCAT(@n_samples, N' samples every ', ISNULL(mon.fn_SettingInt('collect_interval_minutes'), 5), N' min. Baseline = average of the daily maxima of the ',
+                              @b_days, N' day(s) before the previous day. Deltas compare the daily MAX.'),
+                       N'Metric|Reported day|Previous day|vs previous|7-day baseline|vs baseline', @cmp_rows),
+        mon.fn_Section(N'Before vs after RCSI', @ba_subtitle, N'Metric|Before|After|Change', @ba_rows),
+        mon.fn_Section(N'Version store by database', N'Row versions held per database on the reported day (sys.dm_tran_version_store_space_usage); versioning transactions = sys.dm_tran_active_snapshot_database_transactions.',
+                       N'Database|Mode|VS max|VS avg|vs previous day|Versioning trans (max)|Longest tran|Seen', @vsdb_rows),
+        mon.fn_Section(N'Top row-version generators', N'Objects whose rows were versioned (sys.dm_tran_top_version_generators): these are the UPDATE / DELETE targets that fill the version store.',
+                       N'Database|Object|Max|Avg|Seen', @gen_rows),
+        mon.fn_Section(N'Top tempdb consumers', CONCAT(N'Sessions holding at least ', ISNULL(mon.fn_SettingInt('tempdb_top_min_mb'), 50), N' MB of tempdb (session + running tasks), grouped by login / host / program / database / query.'),
+                       N'Login / host / program|Database|Max tempdb|User / internal|Seen|Statement', @top_rows),
+        mon.fn_Section(N'Hourly profile', CONCAT(N'Maximum per hour (', @tzl, N'); bars relative to the allocated tempdb size ', mon.fn_FmtMb(@size_max), N'. Blue = used, amber = version store.'),
+                       N'Hour|tempdb used|Version store|Versioning trans|Longest tran|Sessions', @hour_rows),
+        mon.fn_Section(N'tempdb files', CONCAT(N'As of ', mon.fn_FmtLocal(@last_sample, @tz), N' ', @tzl, N'. Autogrowth events on the reported day from the default trace.'),
+                       N'File|Type|Size|Used|Max size|Growth|Autogrowths', @file_rows));
+
+    DECLARE @footer nvarchar(max) = CONCAT(
+        N'<b>MON - TempDB RCSI</b> is sent daily at ', ISNULL(NULLIF(mon.fn_Setting('tempdb_report_hours_local'), N''), N'8'), N':00 ', @tzl,
+        N' (settings tempdb_report_*). Raw 5-minute samples are kept ', ISNULL(mon.fn_SettingInt('retention_tempdb_days'), 30),
+        N' days, daily aggregates ', ISNULL(mon.fn_SettingInt('retention_tempdb_daily_days'), 400), N' days.<br>',
+        N'Record the real cutover: <code>EXEC OPS.mon.usp_SetRcsiCutover @Database = N''MyDb'', @EnabledLocal = ''YYYY-MM-DD HH:MM'';</code> &middot; ',
+        N'SSMS: <code>EXEC OPS.mon.usp_ShowTempdb;</code> &middot; re-send: <code>EXEC OPS.mon.usp_SendTempdbReport @Date = ''', CONVERT(nvarchar(10), @Date, 120), N''', @Force = 1;</code><br>',
+        N'Checks TEMPDB_VS (version store ', @vs_warn, N'% / ', @vs_crit, N'% of tempdb; versioning transaction ', @tr_warn, N' / ', @tr_crit, N' min), TEMPDB_GROWTH (',
+        @gr_warn, N' autogrowths / h) and RCSI (switch detected) raise issues through the normal alert mail; switch them in mon.ServerCheck.');
+
+    DECLARE @html nvarchar(max) = mon.fn_EmailShell(@color, CONCAT(@server, N' - MON - TempDB RCSI'),
+        CONCAT(N'tempdb & version store - ', CONVERT(nvarchar(10), @Date, 120)),
+        CONCAT(N'Generated ', CONVERT(nvarchar(16), @local_now, 120), N' ', @tzl, N' &middot; ',
+               CASE @level WHEN 'CRIT' THEN N'thresholds exceeded' WHEN 'WARN' THEN N'warning thresholds reached' ELSE N'within thresholds' END,
+               CASE WHEN @cut_n > 0 THEN CONCAT(N' &middot; RCSI on ', @on_n, N' database(s)') ELSE N' &middot; pre-RCSI baseline' END),
+        @body, @footer);
+
+    IF @PreviewOnly = 1
+    BEGIN
+        SELECT @subject AS subject, @html AS html_body, DATALENGTH(@html) / 2048 AS body_kb;
+        RETURN;
+    END;
+
+    DECLARE @mailitem_id int;
+    BEGIN TRY
+        EXEC msdb.dbo.sp_send_dbmail
+             @profile_name = @profile, @recipients = @recipients,
+             @subject = @subject, @body = @html, @body_format = 'HTML',
+             @importance = 'Normal', @mailitem_id = @mailitem_id OUTPUT;
+        INSERT mon.Notification(notification_type, created_utc, report_date_local, subject, recipients, mailitem_id, send_ok, body_kb)
+        VALUES ('TEMPDB_REPORT', @now, @Date, @subject, @recipients, @mailitem_id, 1, DATALENGTH(@html) / 2048);
+        EXEC mon.usp_SetComponentStatus 'TEMPDB_MAIL', 1, @started;
+    END TRY
+    BEGIN CATCH
+        DECLARE @em nvarchar(2000) = ERROR_MESSAGE(), @en int = ERROR_NUMBER();
+        INSERT mon.Notification(notification_type, created_utc, report_date_local, subject, recipients, send_ok, error_message)
+        VALUES ('TEMPDB_REPORT', @now, @Date, @subject, @recipients, 0, @em);
+        EXEC mon.usp_SetComponentStatus 'TEMPDB_MAIL', 0, @started, @en, @em;
+    END CATCH;
+END;
+GO
+
+/* Scheduler: called by the hourly job (MON - Digest & Watchdog, :02). */
+CREATE OR ALTER PROCEDURE mon.usp_RunTempdbReport
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY EXEC mon.usp_SnapshotTempdbDaily; END TRY BEGIN CATCH END CATCH;
+
+    IF ISNULL(mon.fn_SettingInt('tempdb_report_enabled'), 1) = 0 RETURN;
+    DECLARE @now datetime2(0) = SYSUTCDATETIME(),
+            @tz nvarchar(100) = ISNULL(mon.fn_Setting('display_time_zone'), N'Eastern Standard Time');
+    DECLARE @local_now datetime2(0) = mon.fn_UtcToLocal(@now, @tz);
+    DECLARE @hour int = DATEPART(HOUR, @local_now),
+            @iso_wd int = (DATEPART(WEEKDAY, @local_now) + @@DATEFIRST - 2) % 7 + 1,
+            @yday date = DATEADD(DAY, -1, CONVERT(date, @local_now));
+
+    IF mon.fn_InIntList(ISNULL(NULLIF(LTRIM(mon.fn_Setting('tempdb_report_hours_local')), N''), N'8'), @hour) = 0 RETURN;
+    IF mon.fn_InIntList(ISNULL(mon.fn_Setting('tempdb_report_weekdays'), N'1,2,3,4,5,6,7'), @iso_wd) = 0 RETURN;
+    IF EXISTS (SELECT 1 FROM mon.Notification
+               WHERE notification_type IN ('TEMPDB_REPORT', 'TEMPDB_SKIPPED') AND report_date_local = @yday
+                 AND (send_ok = 1 OR notification_type = 'TEMPDB_SKIPPED')) RETURN;   /* once per day */
+
+    EXEC mon.usp_SendTempdbReport @Date = @yday;
 END;
 GO
 
@@ -6460,6 +7750,7 @@ BEGIN
                 EXEC mon.usp_CollectEvents @ReadErrorLog = @read_elog;
                 IF @read_elog = 1 SET @next_elog = DATEADD(MINUTE, @elog_m, SYSUTCDATETIME());
                 EXEC mon.usp_CollectPerf;
+                EXEC mon.usp_CollectTempdb;          /* [5.8] tempdb / version store / RCSI */
                 EXEC mon.usp_EvaluateIssues @Scope = 'ALL';
                 EXEC mon.usp_SendAlerts;
                 EXEC mon.usp_SetComponentStatus 'ENGINE_CYCLE', 1, @cycle_start;
@@ -6522,13 +7813,17 @@ BEGIN
             @bk_days    int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_backup_days'), N'')), @days),
             @iss_days   int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_issue_days'), N'')), @days),
             @mail_days  int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_email_days'), N'')), @days),
-            @audit_days int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_audit_days'), N'')), 4 * @days);
+            @audit_days int = ISNULL(TRY_CONVERT(int, NULLIF(mon.fn_Setting('retention_audit_days'), N'')), 4 * @days),
+            @tdb_days   int = ISNULL(mon.fn_SettingInt('retention_tempdb_days'), 30),               /* [5.8] */
+            @tdbd_days  int = ISNULL(mon.fn_SettingInt('retention_tempdb_daily_days'), 400);
     DECLARE @cut datetime2(0) = DATEADD(DAY, -@days, SYSUTCDATETIME()),
             @bcut datetime2(0) = DATEADD(DAY, -@bdays, SYSUTCDATETIME()),
             @pcut datetime2(0) = DATEADD(DAY, -@perf_days, SYSUTCDATETIME()),
             @kcut datetime2(0) = DATEADD(DAY, -@bk_days, SYSUTCDATETIME()),
             @icut datetime2(0) = DATEADD(DAY, -@iss_days, SYSUTCDATETIME()),
             @mcut datetime2(0) = DATEADD(DAY, -@mail_days, SYSUTCDATETIME()),
+            @tcut datetime2(0) = DATEADD(DAY, -@tdb_days, SYSUTCDATETIME()),
+            @tdcut datetime2(0) = DATEADD(DAY, -@tdbd_days, SYSUTCDATETIME()),
             @n int, @started datetime2(3) = SYSUTCDATETIME();
 
     BEGIN TRY
@@ -6539,6 +7834,14 @@ BEGIN
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.StorageSample     WHERE sample_utc < @pcut;        SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.WaitStatsSnapshot WHERE snapshot_utc < @pcut;      SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.FileStatsSnapshot WHERE snapshot_utc < @pcut;      SET @n = @@ROWCOUNT; END;
+        /* [5.8] tempdb raw samples (retention_tempdb_days) and daily aggregates / growth events (retention_tempdb_daily_days) */
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbTopConsumer     WHERE sample_utc < @tcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbVersionGenerator WHERE sample_utc < @tcut;       SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbVersionStoreDb  WHERE sample_utc < @tcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbFileSample      WHERE sample_utc < @tcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbSample          WHERE sample_utc < @tcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbGrowthEvent     WHERE event_utc < @tdcut;        SET @n = @@ROWCOUNT; END;
+        SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.TempdbDaily           WHERE report_date < CONVERT(date, @tdcut); SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.AgentJobRun       WHERE run_start_utc < @cut;     SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (5000) FROM mon.AgentFailure      WHERE run_start_utc < @cut;     SET @n = @@ROWCOUNT; END;
         SET @n = 1; WHILE @n > 0 BEGIN DELETE TOP (1000) FROM mon.Deadlock          WHERE event_utc < @cut;         SET @n = @@ROWCOUNT; END;
@@ -6584,6 +7887,7 @@ BEGIN
     BEGIN TRY EXEC mon.usp_EvaluateIssues @Scope = 'WATCHDOG'; END TRY BEGIN CATCH END CATCH;
     BEGIN TRY EXEC mon.usp_SendAlerts;                         END TRY BEGIN CATCH END CATCH;
     BEGIN TRY EXEC mon.usp_RunScheduledEmails;                 END TRY BEGIN CATCH END CATCH;   /* [5.6] summary + full report schedule */
+    BEGIN TRY EXEC mon.usp_RunTempdbReport;                    END TRY BEGIN CATCH END CATCH;   /* [5.8] daily "MON - TempDB RCSI" email */
     IF DATEPART(HOUR, SYSUTCDATETIME()) % 6 = 0
     BEGIN
         BEGIN TRY EXEC mon.usp_Purge; END TRY BEGIN CATCH END CATCH;
@@ -6639,7 +7943,7 @@ DECLARE @owner sysname = SUSER_SNAME(),
         @cmd nvarchar(max) = N'SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
 SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
 EXEC mon.usp_EngineLoop;',
-        @desc nvarchar(512) = N'OPS.mon engine: blocking sampler every 30 s; collectors, issue evaluation and change-only alert mail every 5 min. Loops ~55 min per execution; scheduled every minute (Agent skips starts while running).';
+        @desc nvarchar(512) = N'OPS.mon engine: blocking sampler every 30 s; collectors (incl. tempdb / version store / RCSI), issue evaluation and change-only alert mail every 5 min. Loops ~55 min per execution; scheduled every minute (Agent skips starts while running).';
 
 IF NOT EXISTS (SELECT 1 FROM dbo.sysjobs WHERE name = @job)
 BEGIN
@@ -6678,7 +7982,7 @@ DECLARE @owner sysname = SUSER_SNAME(),
         @cmd nvarchar(max) = N'SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
 SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
 EXEC mon.usp_RunHourly;',
-        @desc nvarchar(512) = N'OPS.mon hourly: engine watchdog (alerts if MON - Engine stops), scheduled summary and full report emails (mon.Setting summary_* / full_report_*), history purge every 6 h.';
+        @desc nvarchar(512) = N'OPS.mon hourly: engine watchdog (alerts if MON - Engine stops), scheduled summary and full report emails (mon.Setting summary_* / full_report_*), daily MON - TempDB RCSI email (tempdb_report_*), history purge every 6 h.';
 
 IF NOT EXISTS (SELECT 1 FROM dbo.sysjobs WHERE name = @job)
 BEGIN
@@ -6730,6 +8034,7 @@ EXEC mon.usp_CollectAgent;
 EXEC mon.usp_CollectOlaCommandLog;
 EXEC mon.usp_CollectEvents @ReadErrorLog = 1;
 EXEC mon.usp_CollectPerf;
+EXEC mon.usp_CollectTempdb;
 EXEC mon.usp_CaptureBlocking;
 EXEC mon.usp_SnapshotBackupInventory @Force = 1;
 EXEC mon.usp_EvaluateIssues @Scope = 'ALL';
@@ -6766,6 +8071,7 @@ GO
 EXEC mon.usp_ShowChecks;
 EXEC mon.usp_ShowBackupRetention @Live = 0;
 EXEC mon.usp_ShowOlaLog @Hours = 168;
+EXEC mon.usp_ShowTempdb @Days = 7;
 GO
 
 /*
@@ -6818,7 +8124,14 @@ GO
         UPDATE OPS.mon.Setting SET setting_value = N'0' WHERE setting_name = 'engine_enabled';   -- stops within 30 s
         UPDATE OPS.mon.Setting SET setting_value = N'1' WHERE setting_name = 'engine_enabled';   -- next minute
 
- 8. When satisfied, retire the previous version (optional, manual):
+ 8. tempdb / RCSI (rev 5.8): the daily "MON - TempDB RCSI" email compares tempdb before and after RCSI.
+        EXEC OPS.mon.usp_SendTempdbReport @PreviewOnly = 1;                         -- html only
+        EXEC OPS.mon.usp_SendTempdbReport @Force = 1;                               -- send now (yesterday)
+        EXEC OPS.mon.usp_SetRcsiCutover @Database = N'YourDb', @EnabledLocal = '2026-10-20 22:00', @Note = N'CHG-1234';
+        EXEC OPS.mon.usp_ShowTempdb;                                                -- now, cutovers, daily, by database, generators, consumers
+        UPDATE OPS.mon.Setting SET setting_value = N'7' WHERE setting_name = 'tempdb_report_hours_local';   -- send at 07:00
+
+ 9. When satisfied, retire the previous version (optional, manual):
         EXEC msdb.dbo.sp_update_job @job_name = N'OPS - Backup and Maintenance Monitor',   @enabled = 0;
         EXEC msdb.dbo.sp_update_job @job_name = N'OPS - Daily Backup and Maintenance Report', @enabled = 0;
 
@@ -6955,6 +8268,7 @@ CREATE OR ALTER PROCEDURE mon.usp_SelfTest
     @Deep       bit = 0,
     @Since      datetime2(0) = NULL,      /* server time: objects created since then must all be in [mon] */
     @Quiet      bit = 0,
+    @Print      bit = 0,                  /* [5.8] also PRINT every ERROR / WARN row (visible in the SSMS Messages tab) */
     @Errors     int = NULL OUTPUT,
     @Warnings   int = NULL OUTPUT
 AS
@@ -6979,7 +8293,9 @@ BEGIN
                  (N'mon.usp_SendAlertsCore'), (N'mon.usp_SendDailyDigest'), (N'mon.usp_CloseDisabledIssues'),
                  (N'mon.usp_SetCheck'), (N'mon.usp_ShowChecks'), (N'mon.usp_ShowBackupRetention'),
                  (N'mon.usp_ShowOlaLog'), (N'mon.usp_ShowEmailStats'),
-                 (N'mon.usp_SendSummary'), (N'mon.usp_RunScheduledEmails'), (N'mon.usp_AckIssue'), (N'mon.usp_ResolveIssue'), (N'mon.usp_ShowDataRetention')) AS r(n);
+                 (N'mon.usp_SendSummary'), (N'mon.usp_RunScheduledEmails'), (N'mon.usp_AckIssue'), (N'mon.usp_ResolveIssue'), (N'mon.usp_ShowDataRetention'),
+                 (N'mon.TempdbSample'), (N'mon.TempdbDaily'), (N'mon.RcsiCutover'), (N'mon.usp_CollectTempdb'), (N'mon.usp_SnapshotTempdbDaily'),
+                 (N'mon.usp_SendTempdbReport'), (N'mon.usp_RunTempdbReport'), (N'mon.usp_SetRcsiCutover'), (N'mon.usp_ShowTempdb')) AS r(n);
 
     /* 2. Every view in [mon] binds (cheap, no side effects) */
     DECLARE v CURSOR LOCAL FAST_FORWARD FOR
@@ -7118,6 +8434,22 @@ BEGIN
     FROM #T;
     SELECT @Errors = ISNULL(@Errors, 0), @Warnings = ISNULL(@Warnings, 0);
 
+    IF @Print = 1
+    BEGIN
+        DECLARE @line nvarchar(4000);
+        DECLARE pr CURSOR LOCAL FAST_FORWARD FOR
+            SELECT CONCAT(N'  ', result, N'  ', check_name, N' - ', ISNULL(object_name, N''), CASE WHEN detail IS NOT NULL THEN CONCAT(N': ', detail) ELSE N'' END)
+            FROM #T WHERE result <> 'OK'
+            ORDER BY CASE result WHEN 'ERROR' THEN 0 ELSE 1 END, seq;
+        OPEN pr; FETCH NEXT FROM pr INTO @line;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            PRINT @line;
+            FETCH NEXT FROM pr INTO @line;
+        END;
+        CLOSE pr; DEALLOCATE pr;
+    END;
+
     IF @Quiet = 0
         SELECT result AS [Result], check_name AS [Check], object_name AS [Object], detail AS [Detail]
         FROM #T
@@ -7140,7 +8472,8 @@ IF @rid IS NULL OR NOT EXISTS (SELECT 1 FROM mon.ReleaseHistory WHERE release_id
 SELECT @since = started_server_time, @prev_engine = prev_engine_enabled, @version = version
 FROM mon.ReleaseHistory WHERE release_id = @rid;
 
-EXEC mon.usp_SelfTest @Deep = 1, @Since = @since, @Quiet = 1, @Errors = @e OUTPUT, @Warnings = @w OUTPUT;
+PRINT N'Self-test (every ERROR / WARN row is also listed in the result set above):';
+EXEC mon.usp_SelfTest @Deep = 1, @Since = @since, @Quiet = 1, @Print = 1, @Errors = @e OUTPUT, @Warnings = @w OUTPUT;
 
 IF @e = 0
 BEGIN
@@ -7155,7 +8488,7 @@ BEGIN
     UPDATE mon.ReleaseHistory SET status = 'FAILED', finished_utc = SYSUTCDATETIME(), selftest_errors = @e, selftest_warnings = @w,
            notes = N'Self-test failed: engine left paused. Fix the errors listed by EXEC OPS.mon.usp_SelfTest @Deep = 1; and re-run the installer.'
     WHERE release_id = @rid;
-    RAISERROR(N'MON %s install FAILED the self-test (%d error(s)). The engine stays PAUSED (engine_enabled = 0) so the previous alerts are not replaced by a broken version. See the result set above, fix, and re-run the installer.', 16, 1, @version, @e);
+    RAISERROR(N'MON %s install FAILED the self-test (%d error(s)). The engine stays PAUSED (engine_enabled = 0) so the previous alerts are not replaced by a broken version. The ERROR rows are printed above in this Messages tab (and in the Results tab); fix them and re-run the installer. Typical on a new instance: Database Mail profile missing (UPDATE OPS.mon.Setting SET setting_value = N''<profile>'' WHERE setting_name = ''mail_profile'').', 16, 1, @version, @e);
 END;
 GO
 

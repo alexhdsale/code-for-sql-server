@@ -873,6 +873,64 @@ BEGIN
 
             IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'PERF')
                 INSERT #Scope VALUES ('PERF');
+
+            /* ======================= TEMPDB VERSION STORE / AUTOGROWTH / RCSI [5.8] ======================= */
+            DECLARE @vs_warn int = ISNULL(mon.fn_SettingInt('tempdb_vs_warn_pct'), 50),
+                    @vs_crit int = ISNULL(mon.fn_SettingInt('tempdb_vs_crit_pct'), 75),
+                    @tr_warn int = ISNULL(mon.fn_SettingInt('vs_tran_warn_minutes'), 30),
+                    @tr_crit int = ISNULL(mon.fn_SettingInt('vs_tran_crit_minutes'), 120),
+                    @gr_warn int = ISNULL(mon.fn_SettingInt('tempdb_growth_warn_per_hour'), 10);
+
+            INSERT #Issue(issue_key, category, severity, is_event, title, detail)
+            SELECT TOP (1) N'TEMPDBVS:SIZE', 'TEMPDB',
+                   CASE WHEN t.version_store_mb * 100.0 / NULLIF(t.size_mb, 0) >= @vs_crit THEN 'CRITICAL' ELSE 'WARNING' END, 0,
+                   CONCAT(N'tempdb version store ', CONVERT(int, t.version_store_mb * 100.0 / NULLIF(t.size_mb, 0)), N'% of tempdb (',
+                          CONVERT(decimal(19,1), t.version_store_mb / 1024.0), N' GB)'),
+                   CONCAT(N'tempdb ', CONVERT(decimal(19,1), t.size_mb / 1024.0), N' GB allocated, ', CONVERT(decimal(19,1), t.used_mb / 1024.0),
+                          N' GB used; ', ISNULL(t.vs_active_tran, 0), N' versioning transaction(s), longest ', mon.fn_Duration(t.vs_longest_tran_s),
+                          CASE WHEN t.vs_longest_session_id IS NOT NULL
+                               THEN CONCAT(N' (session ', t.vs_longest_session_id, N', ', ISNULL(t.vs_longest_login, N'?'), N', db ', ISNULL(t.vs_longest_database, N'?'), N')') ELSE N'' END,
+                          N'; ', ISNULL(t.rcsi_db_count, 0), N' RCSI database(s). Long transactions keep every version alive: find them in EXEC OPS.mon.usp_ShowTempdb.')
+            FROM mon.TempdbSample AS t
+            WHERE t.sample_utc >= DATEADD(MINUTE, -10, @now)
+              AND t.version_store_mb * 100.0 / NULLIF(t.size_mb, 0) >= @vs_warn
+            ORDER BY t.sample_utc DESC;
+
+            INSERT #Issue(issue_key, category, severity, is_event, database_name, title, detail)
+            SELECT TOP (1) N'TEMPDBVS:TRAN', 'TEMPDB',
+                   CASE WHEN t.vs_longest_tran_s >= @tr_crit * 60 THEN 'CRITICAL' ELSE 'WARNING' END, 0, t.vs_longest_database,
+                   CONCAT(N'Transaction holding the version store for ', mon.fn_Duration(t.vs_longest_tran_s), N' - session ',
+                          t.vs_longest_session_id, N' (', ISNULL(t.vs_longest_login, N'?'), N')'),
+                   CONCAT(N'Database ', ISNULL(t.vs_longest_database, N'?'), N', program ', ISNULL(t.vs_longest_program, N'?'),
+                          N'. While it is open the version store cannot be cleaned up behind it (currently ',
+                          CONVERT(decimal(19,1), t.version_store_mb / 1024.0), N' GB, ', ISNULL(t.vs_active_tran, 0),
+                          N' versioning transactions). Check sys.dm_tran_active_snapshot_database_transactions; an idle session with an open transaction should be committed or killed by the owner.')
+            FROM mon.TempdbSample AS t
+            WHERE t.sample_utc >= DATEADD(MINUTE, -10, @now)
+              AND t.vs_longest_tran_s >= @tr_warn * 60
+            ORDER BY t.sample_utc DESC;
+
+            INSERT #Issue(issue_key, category, severity, is_event, title, detail)
+            SELECT N'TEMPDBGROWTH', 'TEMPDB', 'WARNING', 0,
+                   CONCAT(N'tempdb autogrew ', COUNT(*), N' times in the last hour (+', CONVERT(decimal(19,1), SUM(g.growth_mb) / 1024.0), N' GB)'),
+                   CONCAT(N'Files: ', STUFF((SELECT DISTINCT CONCAT(N', ', x.file_name) FROM mon.TempdbGrowthEvent AS x
+                                               WHERE x.event_utc >= DATEADD(HOUR, -1, @now) FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N''),
+                          N'. Pre-size tempdb (equal data files) so growth happens off-peak, not during the workload.')
+            FROM mon.TempdbGrowthEvent AS g
+            WHERE g.event_utc >= DATEADD(HOUR, -1, @now)
+            HAVING COUNT(*) >= @gr_warn;
+
+            INSERT #Issue(issue_key, category, severity, is_event, database_name, title, detail, event_utc)
+            SELECT CONCAT(N'RCSI:', c.database_name, N':', CONVERT(varchar(19), c.change_utc, 126)), 'TEMPDB', 'WARNING', 1, c.database_name,
+                   CONCAT(N'READ COMMITTED SNAPSHOT switched ', CASE WHEN c.is_on = 1 THEN N'ON' ELSE N'OFF' END, N' for ', c.database_name),
+                   CONCAT(N'Detected ', mon.fn_FmtLocal(c.change_utc, @tz), N'. The cutover is recorded in mon.RcsiCutover; the daily "MON - TempDB RCSI" email compares tempdb before and after it. ',
+                          N'Wrong time? EXEC OPS.mon.usp_SetRcsiCutover @Database = N''', c.database_name, N''', @EnabledLocal = ''YYYY-MM-DD HH:MM'';'),
+                   c.change_utc
+            FROM mon.RcsiCutover AS c
+            WHERE c.change_utc >= DATEADD(HOUR, -@lookback, @now);
+
+            IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'TEMPDB')
+                INSERT #Scope VALUES ('TEMPDB');
             IF EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'PERF')
                AND EXISTS (SELECT 1 FROM #CompOk WHERE component_name = 'DATABASE_STATE')
                AND NOT EXISTS (SELECT 1 FROM #EvalError WHERE check_name = 'DATABASE')
