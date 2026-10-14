@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.8.0 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.8.1 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -45,6 +45,7 @@
                     checks TEMPDB_VS, TEMPDB_GROWTH, RCSI. Installer: self-test failures are printed in the
                     Messages tab; a forced mail_profile that does not exist on this instance falls back to
                     the only profile defined here.
+             5.8.1: fix Msg 10714 in usp_CollectTempdb (MERGE with two WHEN MATCHED UPDATE clauses) - 5.8.0 failed its self-test.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -188,7 +189,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.8.0';
+DECLARE @version varchar(20) = '5.8.1';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
