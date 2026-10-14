@@ -1,3 +1,77 @@
+/* JSON array - works on 2016+, keeps one stable query text */
+SELECT  cpv.custom_property_definition_id, cpv.entity_id, cpv.property_value
+FROM    custom_property_value AS cpv
+JOIN    OPENJSON(@ids) WITH (id int '$') AS j
+          ON j.id = cpv.custom_property_definition_id;
+/* @ids = N'[12,45,78,...]' */
+
+
+/* ============================================================
+   Generate plan guides: OPTION (RECOMPILE) for every captured
+   variant of the custom_property_value IN (@P1..@Pn) statement
+   ============================================================ */
+USE assetmanagement_v2;
+GO
+SET NOCOUNT ON;
+
+DECLARE @query_id bigint, @txt nvarchar(max), @pos int,
+        @params nvarchar(max), @stmt nvarchar(max), @name sysname;
+
+DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+SELECT  q.query_id, qt.query_sql_text
+FROM    sys.query_store_query q
+JOIN    sys.query_store_query_text qt ON qt.query_text_id = q.query_text_id
+WHERE   qt.query_sql_text LIKE N'(@P1 %'
+  AND   qt.query_sql_text LIKE N'%FROM custom_property_value%custom_property_definition_id IN (@P1%'
+  AND   q.object_id = 0;                       /* ad hoc / prepared only */
+
+OPEN c; FETCH NEXT FROM c INTO @query_id, @txt;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    /* QS stores prepared text as "(<params>)<statement>" */
+    SET @pos    = CHARINDEX(N')SELECT', @txt);
+    SET @params = SUBSTRING(@txt, 2, @pos - 2);
+    SET @stmt   = SUBSTRING(@txt, @pos + 1, LEN(@txt));
+    SET @name   = N'PG_cpv_in_recompile_' + CAST(@query_id AS nvarchar(20));
+
+    IF NOT EXISTS (SELECT 1 FROM sys.plan_guides WHERE name = @name)
+    BEGIN
+        EXEC sys.sp_create_plan_guide
+             @name   = @name,
+             @stmt   = @stmt,
+             @type   = N'SQL',
+             @module_or_batch = NULL,
+             @params = @params,
+             @hints  = N'OPTION (RECOMPILE)';
+        PRINT N'Created ' + @name;
+    END
+    FETCH NEXT FROM c INTO @query_id, @txt;
+END
+CLOSE c; DEALLOCATE c;
+
+/* Verify */
+SELECT name, is_disabled, LEFT(query_text, 80) AS stmt_start, parameters
+FROM   sys.plan_guides
+WHERE  name LIKE N'PG_cpv_in_recompile_%';
+
+/* UNDO (drop all of them):
+DECLARE @n sysname;
+DECLARE d CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.plan_guides WHERE name LIKE N'PG_cpv_in_recompile_%';
+OPEN d; FETCH NEXT FROM d INTO @n;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    EXEC sys.sp_control_plan_guide @operation = N'DROP', @name = @n;
+    FETCH NEXT FROM d INTO @n;
+END
+CLOSE d; DEALLOCATE d;
+*/
+
+
+EXEC sys.sp_query_store_set_hints @query_id = 5492, @query_hints = N'OPTION (RECOMPILE)';
+/* UNDO: EXEC sys.sp_query_store_clear_hints @query_id = 5492; */
+
+
 Nothing is broken: the plan is a dynamic seek, and it looks odd because of how the parameters are typed.
 
 Why it has this shape
