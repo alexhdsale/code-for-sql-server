@@ -4,7 +4,7 @@
     Target : MS-APP-STG  (Amazon RDS for SQL Server, 2016 SP2 or later)
     Home   : [OPS] database, schema [mon]  (nothing is created in any other schema)
     Author : DBA team / generated with Claude
-    Rev    : 5.8.0 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
+    Rev    : 5.8.1 (successor of OPS.monitor Rev 4 - runs side-by-side with it)
              5.1 adds: check matrix with checkboxes (mon.DatabaseCheck / mon.ServerCheck),
                        audit of every change (mon.CheckChangeLog), backup retention &
                        inventory grid (mon.vw_BackupRetention, daily mon.BackupInventoryDaily),
@@ -45,6 +45,7 @@
                     checks TEMPDB_VS, TEMPDB_GROWTH, RCSI. Installer: self-test failures are printed in the
                     Messages tab; a forced mail_profile that does not exist on this instance falls back to
                     the only profile defined here.
+             5.8.1: fix Msg 10714 in usp_CollectTempdb (MERGE with two WHEN MATCHED UPDATE clauses) - 5.8.0 failed its self-test.
 ================================================================================
 
 WHAT IS NEW COMPARED WITH OPS.monitor REV 4
@@ -188,7 +189,7 @@ BEGIN
 END;
 GO
 
-DECLARE @version varchar(20) = '5.8.0';
+DECLARE @version varchar(20) = '5.8.1';
 DECLARE @prev varchar(20) = (SELECT TOP (1) version FROM mon.ReleaseHistory WHERE status = 'COMPLETED' ORDER BY release_id DESC);
 /* an earlier install whose gate could not find its row (fixed in 5.6.3) is still the version that runs */
 IF @prev IS NULL
@@ -3641,13 +3642,17 @@ BEGIN
                     CASE WHEN @first = 1 THEN 'INSTALL' ELSE 'AUTO' END,
                     CASE WHEN @first = 1 THEN N'RCSI was already ON when tempdb monitoring started; no pre-RCSI baseline. Set the real date: EXEC mon.usp_SetRcsiCutover.'
                          ELSE N'RCSI switched ON (detected by the collector).' END)
-        WHEN MATCHED AND s.is_on = 1 AND t.is_on = 0 THEN
-            UPDATE SET is_on = 1, enabled_utc = @now, disabled_utc = NULL, change_utc = @now,
-                       source = CASE WHEN t.source = 'MANUAL' THEN 'MANUAL' ELSE 'AUTO' END,
-                       note = N'RCSI switched ON (detected by the collector).', modified_utc = @now, modified_by = N'mon.usp_CollectTempdb'
-        WHEN MATCHED AND s.is_on = 0 AND t.is_on = 1 THEN
-            UPDATE SET is_on = 0, disabled_utc = @now, change_utc = @now,
-                       note = N'RCSI switched OFF (detected by the collector).', modified_utc = @now, modified_by = N'mon.usp_CollectTempdb';
+        /* [5.8.1] one WHEN MATCHED ... UPDATE only (Msg 10714): ON and OFF switches handled with CASE */
+        WHEN MATCHED AND s.is_on <> t.is_on THEN
+            UPDATE SET is_on        = s.is_on,
+                       enabled_utc  = CASE WHEN s.is_on = 1 THEN @now ELSE t.enabled_utc END,
+                       disabled_utc = CASE WHEN s.is_on = 1 THEN NULL ELSE @now END,
+                       change_utc   = @now,
+                       source       = CASE WHEN s.is_on = 1 AND t.source <> 'MANUAL' THEN 'AUTO' ELSE t.source END,
+                       note         = CASE WHEN s.is_on = 1 THEN N'RCSI switched ON (detected by the collector).'
+                                           ELSE N'RCSI switched OFF (detected by the collector).' END,
+                       modified_utc = @now,
+                       modified_by  = N'mon.usp_CollectTempdb';
     END TRY
     BEGIN CATCH
         SET @errors = CONCAT(@errors, N' RCSI: ', ERROR_MESSAGE());
