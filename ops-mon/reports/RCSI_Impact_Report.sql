@@ -34,7 +34,7 @@ DECLARE @MinAvgMs       int           = 5;             /* ... and an average dur
 DECLARE @ServerLabel    nvarchar(128) = NULL;          /* NULL = OPS.mon server_label or @@SERVERNAME */
 DECLARE @Recipients     nvarchar(1000)= N'aleksey_kokit@miopartners.com';   /* who gets the HTML report (semicolon separated) */
 DECLARE @SendMail       bit           = 1;             /* 1 = email the HTML through Database Mail; 0 = result sets only */
-DECLARE @MailProfile    sysname       = NULL;          /* NULL = OPS.mon mail_profile, else the only Database Mail profile on the instance */
+DECLARE @MailProfile    sysname       = NULL;          /* NULL = OPS.mon mail_profile (e.g. Notifications), else the default Database Mail profile */
 /* -------------------------------------------------------------------------- */
 
 DECLARE @now datetime2(0) = SYSUTCDATETIME(), @sql nvarchar(max), @db sysname, @msg nvarchar(4000);
@@ -733,12 +733,10 @@ DECLARE @mail_status nvarchar(1000) = N'not sent (@SendMail = 0)', @mailitem_id 
 IF @SendMail = 1
 BEGIN
     BEGIN TRY
+        /* same as OPS.mon: the profile name comes from mon.Setting (or @MailProfile) and goes straight to
+           sp_send_dbmail - no read of msdb.dbo.sysmail_profile (not readable by every login on RDS) */
         IF @profile IS NULL AND OBJECT_ID(N'OPS.mon.Setting') IS NOT NULL
-            SELECT @profile = setting_value FROM OPS.mon.Setting WHERE setting_name = 'mail_profile';
-        IF @profile IS NULL OR NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profile WHERE name = @profile)
-            SELECT @profile = MAX(name) FROM msdb.dbo.sysmail_profile HAVING COUNT(*) = 1;
-        IF @profile IS NULL
-            RAISERROR(N'No Database Mail profile: set @MailProfile.', 16, 1);
+            SELECT @profile = NULLIF(setting_value, N'') FROM OPS.mon.Setting WHERE setting_name = 'mail_profile';
 
         DECLARE @s_avg nvarchar(100) = N'', @s_lock nvarchar(100) = N'';
         SELECT @s_avg = CONCAT(N' | avg ', FORMAT(before_v, 'N1'), N' -> ', FORMAT(after_v, 'N1'), N' ms') FROM #Score WHERE seq = 11 AND before_v IS NOT NULL AND after_v IS NOT NULL;
@@ -746,9 +744,13 @@ BEGIN
         DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @ServerLabel, N'] RCSI impact ', CONVERT(nvarchar(10), @cut_local, 120), N' -> ',
             CONVERT(nvarchar(10), CONVERT(datetime2(0), (@a1 AT TIME ZONE 'UTC') AT TIME ZONE @TimeZone), 120),
             N' | ', @n_better, N' better, ', @n_worse, N' worse, ', @n_same, N' same', @s_avg, @s_lock), 255);
-        EXEC msdb.dbo.sp_send_dbmail @profile_name = @profile, @recipients = @Recipients, @subject = @subject,
-             @body = @html, @body_format = 'HTML', @importance = 'Normal', @mailitem_id = @mailitem_id OUTPUT;
-        SET @mail_status = CONCAT(N'queued: mailitem_id ', @mailitem_id, N' via profile ', @profile, N' to ', @Recipients);
+        IF @profile IS NOT NULL
+            EXEC msdb.dbo.sp_send_dbmail @profile_name = @profile, @recipients = @Recipients, @subject = @subject,
+                 @body = @html, @body_format = 'HTML', @importance = 'Normal', @mailitem_id = @mailitem_id OUTPUT;
+        ELSE   /* default Database Mail profile of the login / instance */
+            EXEC msdb.dbo.sp_send_dbmail @recipients = @Recipients, @subject = @subject,
+                 @body = @html, @body_format = 'HTML', @importance = 'Normal', @mailitem_id = @mailitem_id OUTPUT;
+        SET @mail_status = CONCAT(N'queued: mailitem_id ', @mailitem_id, N' via profile ', ISNULL(@profile, N'(default)'), N' to ', @Recipients);
     END TRY
     BEGIN CATCH
         SET @mail_status = LEFT(CONCAT(N'FAILED: ', ERROR_MESSAGE(), N' (profile ', ISNULL(@profile, N'?'), N')'), 1000);
