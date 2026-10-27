@@ -2,6 +2,9 @@
 
 Newest first. The installer `install/MON_Install.sql` is always the latest version; git tags `ops-mon-vX.Y` mark each release.
 
+## reports — 2026-10-27
+- **`reports/RCSI_Impact_Report.sql`** (+ `RCSI_Impact_Report.ps1`): standalone before/after READ COMMITTED SNAPSHOT report for an instance (built for MS-APP-PROD). Reads the Query Store of every selected database (runtime stats + `sys.query_store_wait_stats`) and OPS.mon 5.8 history (blocking, deadlocks, server waits, CPU, tempdb / version store, I/O latency). Result sets for SSMS + one self-contained HTML: KPI tiles, scorecard (per-hour / per-day rates, BETTER / WORSE / SAME at ±10 %), query waits by category, day-by-day bars, top regressed / improved queries by impact (s/h), queries that waited on locks before the cutover, per-database table. Cutover and databases default to `OPS.mon.RcsiCutover` / `is_read_committed_snapshot_on`. Writes nothing.
+
 ## 5.8.1 — 2026-10-14
 - Fix: 5.8.0 install failed its self-test — `mon.usp_CollectTempdb` was not created (Msg 10714: the RCSI-cutover `MERGE` had two `WHEN MATCHED … UPDATE` clauses; SQL Server allows one). ON and OFF switches are now one `WHEN MATCHED AND s.is_on <> t.is_on` with `CASE`. Re-run the installer; the engine resumes after the self-test passes.
 
