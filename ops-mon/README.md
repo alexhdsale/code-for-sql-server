@@ -19,7 +19,7 @@ Self-contained monitoring for SQL Server / Amazon RDS for SQL Server. Everything
 | `src/sql/*.sql` | Source, one file per area; build with `python build/build_install.py` |
 | `tools/MON-CheckEditor.ps1` | Windows GUI: check matrix (green/red/grey), retention, Ola log, email statistics |
 | `reports/MON_Checks_and_Retention.rdl` | SSMS custom report |
-| `reports/RCSI_Impact_Report.sql` | **RCSI before/after performance report** (Query Store + OPS.mon history → scorecard, waits, top regressed / improved queries); result sets in SSMS + HTML emailed through Database Mail to `@Recipients` |
+| `reports/RCSI_Impact_Report.sql` | **RCSI before/after performance report v2**: same-weekday windows, same-queries index, plain-language findings, blocking by wait type, version store holders / generating tables / fragmentation; result sets in SSMS + HTML emailed through Database Mail to `@Recipients` |
 | `docs/MON_Operations_Guide.md` | **Operations:** deploy, SQL Agent jobs, data retention, email schedule (alerts / summary / full report), issue resolution |
 | `docs/MON_User_Guide_EN.md` | User guide (English); `MON_User_Guide_RU.md` — Russian |
 | `docs/images` | Sample alert / digest emails and screenshots |
