@@ -4,9 +4,9 @@
    Reads  : Query Store of every selected database (runtime stats + wait stats),
             OPS.mon 5.8 history when present (blocking, deadlocks, waits, CPU,
             tempdb / version store, I/O latency). Nothing is written anywhere.
-   Output : result sets for SSMS + ONE HTML document (last result set, column
-            html) - save it as .html, or run RCSI_Impact_Report.ps1 which writes
-            and opens the file.
+   Output : result sets for SSMS (scorecard, per database, waits, top queries,
+            lock-wait queries, notes) + ONE HTML document (last result set, column
+            html) that is also EMAILED through Database Mail to @Recipients.
 
    HOW TO RUN (SSMS, any database context, login that can read the app databases'
    Query Store and OPS.mon):
@@ -14,8 +14,8 @@
         the cutover is taken from OPS.mon.RcsiCutover, the databases = every
         database with is_read_committed_snapshot_on = 1.
      2. Execute the whole file.  Results: scorecard, per-database workload,
-        wait categories, top regressed / improved queries, concurrency, tempdb,
-        I/O latency, html.
+        wait categories, top regressed / improved queries, lock-wait queries,
+        notes, html + mail status.  @SendMail = 0 for the result sets only.
    ============================================================================= */
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
@@ -32,6 +32,9 @@ DECLARE @TopN           int           = 20;            /* queries listed per tab
 DECLARE @MinExecs       int           = 20;            /* a query needs this many executions in BOTH windows to be compared */
 DECLARE @MinAvgMs       int           = 5;             /* ... and an average duration of at least this many ms in one window */
 DECLARE @ServerLabel    nvarchar(128) = NULL;          /* NULL = OPS.mon server_label or @@SERVERNAME */
+DECLARE @Recipients     nvarchar(1000)= N'aleksey_kokit@miopartners.com';   /* who gets the HTML report (semicolon separated) */
+DECLARE @SendMail       bit           = 1;             /* 1 = email the HTML through Database Mail; 0 = result sets only */
+DECLARE @MailProfile    sysname       = NULL;          /* NULL = OPS.mon mail_profile, else the only Database Mail profile on the instance */
 /* -------------------------------------------------------------------------- */
 
 DECLARE @now datetime2(0) = SYSUTCDATETIME(), @sql nvarchar(max), @db sysname, @msg nvarchar(4000);
@@ -533,16 +536,13 @@ td.n{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 td.g{background:#F9FAFB;font-weight:700;color:#374151}
 .pill{display:inline-block;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:700;letter-spacing:.3px;white-space:nowrap}
 .better{background:#16A34A;color:#FFFFFF}.worse{background:#DC2626;color:#FFFFFF}.same{background:#E5E7EB;color:#374151}.info{background:#2563EB;color:#FFFFFF}.na{background:#F3F4F6;color:#9CA3AF}
-.kpis{display:flex;flex-wrap:wrap;gap:8px;padding:14px 24px 0 24px}
-.kpi{flex:1 1 130px;min-width:130px;padding:10px 6px;border:1px solid #E5E7EB;background:#F9FAFB;text-align:center}
-.kpi .v{font-size:22px;line-height:26px;font-weight:700}
-.kpi .l{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#374151;font-weight:600}
-.kpi .s{font-size:11px;color:#6B7280}
-.kpi.better{background:#F0FDF4;border-color:#BBF7D0}.kpi.better .v{color:#15803D}
-.kpi.worse{background:#FEF2F2;border-color:#FECACA}.kpi.worse .v{color:#B91C1C}
-.bar{display:flex;align-items:center;gap:6px;white-space:nowrap}
-.bar i{display:block;height:10px;background:#2563EB}.bar i.a{background:#F59E0B}
-.bar span{font-size:11px;color:#374151}
+.v{font-size:22px;line-height:26px;font-weight:700}
+.l{font-size:10px;line-height:13px;text-transform:uppercase;letter-spacing:.5px;color:#374151;font-weight:600}
+.s{font-size:10px;color:#6B7280}
+table.b{border-collapse:collapse;width:100%}
+table.t table.b td{padding:0;border:0;vertical-align:middle}
+table.t table.b td.f{height:10px;line-height:10px;font-size:1px}
+table.t table.b td.x{font-size:11px;color:#374151;padding-left:6px;white-space:nowrap}
 code{font-family:Consolas,Menlo,monospace;font-size:11px;color:#374151;white-space:pre-wrap;word-break:break-word}
 .foot{padding:16px 24px 22px 24px;border-top:1px solid #E5E7EB;font-size:11px;line-height:16px;color:#6B7280}
 .cut{padding:8px 24px 0 24px;font-size:12px;color:#374151}
@@ -555,11 +555,12 @@ DECLARE @n_better int = (SELECT COUNT(*) FROM #Score WHERE verdict = N'better'),
 
 /* --- KPI tiles: six headline metrics --- */
 SELECT @kpi = STRING_AGG(CONVERT(nvarchar(max), CONCAT(
-    N'<div class="kpi ', CASE s.verdict WHEN N'better' THEN N'better' WHEN N'worse' THEN N'worse' ELSE N'' END, N'">',
-    N'<div class="v">', CASE WHEN s.after_v IS NULL THEN N'-' ELSE FORMAT(s.after_v, CASE WHEN ABS(s.after_v) >= 100 THEN 'N0' ELSE 'N1' END) END, N' ', s.unit, N'</div>',
+    N'<td align="center" valign="top" width="16%" bgcolor="', CASE s.verdict WHEN N'better' THEN N'#F0FDF4' WHEN N'worse' THEN N'#FEF2F2' ELSE N'#F9FAFB' END,
+    N'" style="padding:10px 6px;border:1px solid #FFFFFF;background:', CASE s.verdict WHEN N'better' THEN N'#F0FDF4' WHEN N'worse' THEN N'#FEF2F2' ELSE N'#F9FAFB' END, N'">',
+    N'<div class="v" style="color:', CASE s.verdict WHEN N'better' THEN N'#15803D' WHEN N'worse' THEN N'#B91C1C' ELSE N'#111827' END, N'">', CASE WHEN s.after_v IS NULL THEN N'-' ELSE FORMAT(s.after_v, CASE WHEN ABS(s.after_v) >= 100 THEN 'N0' ELSE 'N1' END) END, N' ', s.unit, N'</div>',
     N'<div class="l">', s.metric, N'</div>',
     N'<div class="s">before ', CASE WHEN s.before_v IS NULL THEN N'-' ELSE FORMAT(s.before_v, CASE WHEN ABS(s.before_v) >= 100 THEN 'N0' ELSE 'N1' END) END,
-    CASE WHEN s.pct IS NOT NULL THEN CONCAT(N' &middot; ', CASE WHEN s.pct > 0 THEN N'+' ELSE N'' END, FORMAT(s.pct, 'N0'), N'%') ELSE N'' END, N'</div></div>')), N'')
+    CASE WHEN s.pct IS NOT NULL THEN CONCAT(N' &middot; ', CASE WHEN s.pct > 0 THEN N'+' ELSE N'' END, FORMAT(s.pct, 'N0'), N'%') ELSE N'' END, N'</div></td>')), N'')
     WITHIN GROUP (ORDER BY s.seq)
 FROM #Score AS s WHERE s.seq IN (11, 20, 30, 34, 53, 40);
 
@@ -582,7 +583,7 @@ SET @h = CONCAT(@h,
     N'AFTER = ', FORMAT(@ah / 24.0, 'N1'), N' days (', CONVERT(nvarchar(16), CONVERT(datetime2(0), (@a0 AT TIME ZONE 'UTC') AT TIME ZONE @TimeZone), 120), N' - ',
     CONVERT(nvarchar(16), CONVERT(datetime2(0), (@a1 AT TIME ZONE 'UTC') AT TIME ZONE @TimeZone), 120), N', first ', @SkipHours, N' h after the switch excluded) &middot; ',
     N'Databases: <b>', @dbs, N'</b></div>',
-    N'<div class="kpis">', @kpi, N'</div>',
+    N'<div style="padding:14px 24px 0 24px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;table-layout:fixed"><tr>', @kpi, N'</tr></table></div>',
     N'<div class="sec"><h2>Scorecard</h2><div class="d">', @n_better, N' better &middot; ', @n_worse, N' worse &middot; ', @n_same, N' unchanged (&lt; 10 %). ',
     N'Rates are per hour / per day so windows of different length compare fairly. Query Store = the selected databases'' own queries; OPS.mon = instance-wide history.</div>',
     N'<table class="t"><tr><th>Area</th><th>Metric</th><th>Before</th><th>After</th><th>Change</th><th>Verdict</th></tr>', @rows, N'</table></div>');
@@ -592,15 +593,19 @@ DECLARE @wmax decimal(19,3) = (SELECT MAX(v) FROM (SELECT SUM(wait_ms) / 1000.0 
                                                    UNION ALL SELECT SUM(wait_ms) / 1000.0 / NULLIF(@ah, 0) FROM #QsWait WHERE win = 'A' GROUP BY wait_category) AS x);
 SELECT @rows = STRING_AGG(CONVERT(nvarchar(max), CONCAT(
     N'<tr><td>', x.wait_category, N'</td>',
-    N'<td><div class="bar"><i style="width:', CONVERT(int, 200 * x.b / NULLIF(@wmax, 0)), N'px"></i><span>', FORMAT(x.b, 'N1'), N' s/h</span></div></td>',
-    N'<td><div class="bar"><i class="a" style="width:', CONVERT(int, 200 * x.a / NULLIF(@wmax, 0)), N'px"></i><span>', FORMAT(x.a, 'N1'), N' s/h</span></div></td>',
+    N'<td width="28%">', mon_bar.b, N'</td>',
+    N'<td width="28%">', mon_bar.a, N'</td>',
     N'<td class="n">', CASE WHEN x.b = 0 THEN N'-' ELSE CONCAT(CASE WHEN x.a > x.b THEN N'+' ELSE N'' END, FORMAT((x.a - x.b) * 100.0 / x.b, 'N0'), N'%') END, N'</td>',
     N'<td><span class="pill ', CASE WHEN x.b = 0 AND x.a = 0 THEN N'same' WHEN x.b = 0 THEN N'worse' WHEN ABS(x.a - x.b) * 100.0 / x.b < 10 THEN N'same' WHEN x.a < x.b THEN N'better' ELSE N'worse' END, N'">',
     CASE WHEN x.b = 0 AND x.a = 0 THEN N'SAME' WHEN x.b = 0 THEN N'NEW' WHEN ABS(x.a - x.b) * 100.0 / x.b < 10 THEN N'SAME' WHEN x.a < x.b THEN N'BETTER' ELSE N'WORSE' END, N'</span></td></tr>')), N'')
     WITHIN GROUP (ORDER BY x.b + x.a DESC)
 FROM (SELECT ISNULL(b.wait_category, a.wait_category) AS wait_category, ISNULL(b.v, 0) AS b, ISNULL(a.v, 0) AS a
       FROM (SELECT wait_category, SUM(wait_ms) / 1000.0 / NULLIF(@bh, 0) AS v FROM #QsWait WHERE win = 'B' GROUP BY wait_category) AS b
-      FULL JOIN (SELECT wait_category, SUM(wait_ms) / 1000.0 / NULLIF(@ah, 0) AS v FROM #QsWait WHERE win = 'A' GROUP BY wait_category) AS a ON a.wait_category = b.wait_category) AS x;
+      FULL JOIN (SELECT wait_category, SUM(wait_ms) / 1000.0 / NULLIF(@ah, 0) AS v FROM #QsWait WHERE win = 'A' GROUP BY wait_category) AS a ON a.wait_category = b.wait_category) AS x
+CROSS APPLY (SELECT CASE WHEN x.b <= 0 THEN 1 WHEN x.b >= @wmax THEN 100 ELSE CONVERT(int, 100 * x.b / NULLIF(@wmax, 0)) + 1 END AS pb,
+                    CASE WHEN x.a <= 0 THEN 1 WHEN x.a >= @wmax THEN 100 ELSE CONVERT(int, 100 * x.a / NULLIF(@wmax, 0)) + 1 END AS pa) AS pc
+CROSS APPLY (SELECT CONCAT(N'<table role="presentation" class="b" cellpadding="0" cellspacing="0" border="0"><tr><td class="f" width="', pc.pb, N'%" bgcolor="#2563EB" style="background:#2563EB">&nbsp;</td><td class="x" width="', 100 - pc.pb, N'%">', FORMAT(x.b, 'N1'), N' s/h</td></tr></table>') AS b,
+                    CONCAT(N'<table role="presentation" class="b" cellpadding="0" cellspacing="0" border="0"><tr><td class="f" width="', pc.pa, N'%" bgcolor="#F59E0B" style="background:#F59E0B">&nbsp;</td><td class="x" width="', 100 - pc.pa, N'%">', FORMAT(x.a, 'N1'), N' s/h</td></tr></table>') AS a) AS mon_bar;
 SET @h = CONCAT(@h, N'<div class="sec"><h2>Query waits by category</h2><div class="d">sys.query_store_wait_stats of the selected databases, seconds of wait per hour of window. Blue = before, amber = after. ',
     N'<b>Lock</b> is what RCSI removes (readers no longer wait for writers); watch <b>Buffer Latch</b> (tempdb) and <b>Tran Log IO</b> for the cost side.</div>',
     N'<table class="t"><tr><th>Category</th><th>Before</th><th>After</th><th>Change</th><th></th></tr>',
@@ -619,12 +624,16 @@ SET @h = CONCAT(@h, N'<div class="sec"><h2>Query waits by category</h2><div clas
 )
 SELECT @rows = STRING_AGG(CONVERT(nvarchar(max), CONCAT(
     N'<tr><td>', CONVERT(nvarchar(10), X.d, 120), CASE WHEN X.d = CONVERT(date, @cut_local) THEN N' <span class="pill info">CUTOVER</span>' ELSE N'' END, N'</td>',
-    N'<td><div class="bar"><i', CASE WHEN X.is_after = 1 THEN N' class="a"' ELSE N'' END, N' style="width:', CONVERT(int, 220 * X.avg_ms / NULLIF(X.max_avg, 0)), N'px"></i><span>', FORMAT(X.avg_ms, 'N1'), N' ms</span></div></td>',
-    N'<td><div class="bar"><i', CASE WHEN X.is_after = 1 THEN N' class="a"' ELSE N'' END, N' style="width:', CONVERT(int, 160 * X.execs / NULLIF(X.max_execs, 0)), N'px;opacity:.6"></i><span>', FORMAT(X.execs, 'N0'), N'</span></div></td>',
+    N'<td width="30%"><table role="presentation" class="b" cellpadding="0" cellspacing="0" border="0"><tr><td class="f" width="', pc.p1, N'%" bgcolor="', pc.c, N'" style="background:', pc.c, N'">&nbsp;</td><td class="x" width="', 100 - pc.p1, N'%">', FORMAT(X.avg_ms, 'N1'), N' ms</td></tr></table></td>',
+    N'<td width="24%"><table role="presentation" class="b" cellpadding="0" cellspacing="0" border="0"><tr><td class="f" width="', pc.p2, N'%" bgcolor="', pc.c2, N'" style="background:', pc.c2, N'">&nbsp;</td><td class="x" width="', 100 - pc.p2, N'%">', FORMAT(X.execs, 'N0'), N'</td></tr></table></td>',
     N'<td class="n">', FORMAT(X.cpu_ms / NULLIF(X.execs, 0), 'N1'), N' ms</td>',
     N'<td class="n">', FORMAT(X.dur_ms / 1000.0 / 3600.0, 'N2'), N' h</td></tr>')), N'')
     WITHIN GROUP (ORDER BY X.d)
-FROM X;
+FROM X
+CROSS APPLY (SELECT CASE WHEN X.avg_ms >= X.max_avg THEN 100 ELSE CONVERT(int, 100 * X.avg_ms / NULLIF(X.max_avg, 0)) + 1 END AS p1,
+                    CASE WHEN X.execs >= X.max_execs THEN 100 ELSE CONVERT(int, 100 * X.execs / NULLIF(X.max_execs, 0)) + 1 END AS p2,
+                    CASE WHEN X.is_after = 1 THEN N'#F59E0B' ELSE N'#2563EB' END AS c,
+                    CASE WHEN X.is_after = 1 THEN N'#FCD34D' ELSE N'#93C5FD' END AS c2) AS pc;
 SET @h = CONCAT(@h, N'<div class="sec"><h2>Day by day</h2><div class="d">Average elapsed time per execution, executions, CPU per execution and total query time per local day (Query Store, both windows). Blue = before the cutover, amber = after.</div>',
     N'<table class="t"><tr><th>Day</th><th>Avg duration</th><th>Executions</th><th>CPU / exec</th><th>Total query time</th></tr>',
     ISNULL(@rows, N'<tr><td colspan="5">No Query Store data.</td></tr>'), N'</table></div>');
@@ -710,7 +719,7 @@ DECLARE @foot nvarchar(max) = CONCAT(
     N'instance metrics (blocking, deadlocks, server waits, CPU, tempdb, version store, I/O latency) from OPS.mon 5.8 history. ',
     N'Verdict thresholds: &plusmn;10 % = unchanged. Compare like with like: if executions per hour changed a lot, the workload itself changed (release, month-end, batch) and per-execution numbers matter more than totals. ',
     N'<b>Expected RCSI signature:</b> lock waits and blocking down, version store and tempdb up, +~2-5 % CPU / writes on modified rows (14-byte version pointer), no change for queries that never waited. ',
-    N'Generated ', CONVERT(nvarchar(16), CONVERT(datetime2(0), (@now AT TIME ZONE 'UTC') AT TIME ZONE @TimeZone), 120), N' ', @TzLabel, N' by RCSI_Impact_Report.sql.');
+    N'Generated ', CONVERT(nvarchar(16), CONVERT(datetime2(0), (@now AT TIME ZONE 'UTC') AT TIME ZONE @TimeZone), 120), N' ', @TzLabel, N' by RCSI_Impact_Report.sql', CASE WHEN @SendMail = 1 THEN CONCAT(N'; emailed to ', @Recipients) ELSE N'' END, N'.');
 
 DECLARE @html nvarchar(max) = CONCAT(
     N'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>RCSI impact - ', @ServerLabel, N'</title>', @css, N'</head><body>',
@@ -719,4 +728,34 @@ DECLARE @html nvarchar(max) = CONCAT(
     N'<div class="sub">', @n_better, N' metrics better &middot; ', @n_worse, N' worse &middot; ', @n_same, N' unchanged &middot; ', @dbs, N'</div></div>',
     @h, N'<div class="foot">', @foot, N'</div></div></body></html>');
 
-SELECT @html AS html, DATALENGTH(@html) / 2048 AS html_kb;
+/* ============================ EMAIL (Database Mail) ============================ */
+DECLARE @mail_status nvarchar(1000) = N'not sent (@SendMail = 0)', @mailitem_id int = NULL, @profile sysname = @MailProfile;
+IF @SendMail = 1
+BEGIN
+    BEGIN TRY
+        IF @profile IS NULL AND OBJECT_ID(N'OPS.mon.Setting') IS NOT NULL
+            SELECT @profile = setting_value FROM OPS.mon.Setting WHERE setting_name = 'mail_profile';
+        IF @profile IS NULL OR NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profile WHERE name = @profile)
+            SELECT @profile = MAX(name) FROM msdb.dbo.sysmail_profile HAVING COUNT(*) = 1;
+        IF @profile IS NULL
+            RAISERROR(N'No Database Mail profile: set @MailProfile.', 16, 1);
+
+        DECLARE @s_avg nvarchar(100) = N'', @s_lock nvarchar(100) = N'';
+        SELECT @s_avg = CONCAT(N' | avg ', FORMAT(before_v, 'N1'), N' -> ', FORMAT(after_v, 'N1'), N' ms') FROM #Score WHERE seq = 11 AND before_v IS NOT NULL AND after_v IS NOT NULL;
+        SELECT @s_lock = CONCAT(N' | lock ', FORMAT(before_v, 'N1'), N' -> ', FORMAT(after_v, 'N1'), N' ms/exec') FROM #Score WHERE seq = 20 AND before_v IS NOT NULL AND after_v IS NOT NULL;
+        DECLARE @subject nvarchar(255) = LEFT(CONCAT(N'[', @ServerLabel, N'] RCSI impact ', CONVERT(nvarchar(10), @cut_local, 120), N' -> ',
+            CONVERT(nvarchar(10), CONVERT(datetime2(0), (@a1 AT TIME ZONE 'UTC') AT TIME ZONE @TimeZone), 120),
+            N' | ', @n_better, N' better, ', @n_worse, N' worse, ', @n_same, N' same', @s_avg, @s_lock), 255);
+        EXEC msdb.dbo.sp_send_dbmail @profile_name = @profile, @recipients = @Recipients, @subject = @subject,
+             @body = @html, @body_format = 'HTML', @importance = 'Normal', @mailitem_id = @mailitem_id OUTPUT;
+        SET @mail_status = CONCAT(N'queued: mailitem_id ', @mailitem_id, N' via profile ', @profile, N' to ', @Recipients);
+    END TRY
+    BEGIN CATCH
+        SET @mail_status = LEFT(CONCAT(N'FAILED: ', ERROR_MESSAGE(), N' (profile ', ISNULL(@profile, N'?'), N')'), 1000);
+    END CATCH;
+    PRINT CONCAT(N'Email ', @mail_status);
+END;
+
+SELECT @mail_status AS [Email], @Recipients AS [Recipients], DATALENGTH(@html) / 2048 AS [HTML KB],
+       CASE WHEN DATALENGTH(@html) / 2048 > 100 THEN N'over ~100 KB: Gmail clips the message (Outlook does not); lower @TopN' ELSE N'' END AS [Size note],
+       @html AS html;
