@@ -6,10 +6,63 @@ One script, **`Install_sp_WhoIsActiveLogging.sql`**, deploys everything into a u
 - Erik Darling's [sp_WhoIsActive Logging](https://github.com/erikdarlingdata/DarlingData/tree/main/sp_WhoIsActive%20Logging) procs
 - The SQL Agent job in `msdb`
 
-## Install
+## Files
+| File | Purpose |
+|---|---|
+| `Install_sp_WhoIsActiveLogging.sql` | installs everything (generated - see *Updating sp_WhoIsActive*) |
+| `Uninstall_sp_WhoIsActiveLogging.sql` | removes everything; WhatIf dry-run mode |
+| `Deploy-WhoIsActiveLogging.ps1` | runs either script on one or many servers via sqlcmd |
+| `servers.example.txt` | sample server list for `-InstanceListFile` |
+| `build/` | template + build script that embeds sp_WhoIsActive |
+
+## Install - manually (SSMS)
 1. Edit the single `USE [Utility];` line (the database must already exist).
 2. Optionally change the `#wia_config` values.
 3. Run the whole script as sysadmin (F5). It's re-runnable.
+
+## Install / uninstall - with the deploy script
+Needs `sqlcmd` (`winget install sqlcmd`). Works in Windows PowerShell 5.1 and PowerShell 7.
+```powershell
+# one server, defaults (Utility DB, 10-day retention, every minute)
+.\Deploy-WhoIsActiveLogging.ps1 -SqlInstance SQL01
+
+# many servers, custom DB/options, create the DB if missing
+.\Deploy-WhoIsActiveLogging.ps1 -InstanceListFile .\servers.txt -Database DBA -CreateDatabase `
+    -RetentionDays 14 -DataCompression PAGE -ScheduleEveryMinutes 1
+
+# dry run of the uninstall (connects and lists what would be removed)
+.\Deploy-WhoIsActiveLogging.ps1 -SqlInstance SQL01,SQL02 -Action Uninstall -WhatIf
+
+# uninstall but keep the logged data
+.\Deploy-WhoIsActiveLogging.ps1 -SqlInstance SQL01 -Action Uninstall -KeepDailyTables
+```
+- Windows auth by default; `-SqlCredential (Get-Credential)` for a SQL login (password goes to sqlcmd through `SQLCMDPASSWORD`, never on the command line).
+- `-TrustServerCertificate` for self-signed certs (sqlcmd 18+ encrypts by default).
+- The script writes a temp copy of the SQL file with your `-Database` and options swapped in, runs it in one sqlcmd session with stop-on-error, and logs each server to `.\logs`.
+- Checks each server for connectivity and sysadmin first. Exit code = number of servers that failed.
+- From `powershell.exe -File` (SQL Agent / Task Scheduler), separate servers with `;`: `-SqlInstance "SQL01;SQL02"`.
+
+| Install switch | SQL option |
+|---|---|
+| `-RetentionDays`, `-DataCompression`, `-ScheduleEveryMinutes`, `-JobName`, `-JobOwner` | same-named `#wia_config` values |
+| `-SkipWhoIsActive` / `-NoClusteredIndex` / `-JobDisabled` / `-KeepExistingJob` / `-NoFirstCollection` | sets the matching flag to 0 |
+
+| Uninstall switch | Effect |
+|---|---|
+| `-WhatIf` | lists what would be removed, changes nothing |
+| `-KeepDailyTables` | keeps `dbo.WhoIsActive_YYYYMMDD` data |
+| `-KeepWhoIsActive` | keeps `dbo.sp_WhoIsActive` |
+| `-KeepJob` | leaves the SQL Agent job |
+
+## Uninstall - manually (SSMS)
+Open `Uninstall_sp_WhoIsActiveLogging.sql`, set the `USE` line to the same DB, optionally set `WhatIf = 1` or `KeepDailyTables = 1` in `#wia_uninstall`, run.
+It removes:
+- the job(s), found by name or by any step that runs `sp_WhoIsActiveLogging_Main` in this DB; a running job is stopped first, and its history is removed too
+- both views and the three logging procedures
+- all daily tables
+- `dbo.sp_WhoIsActive`, unless another module in the DB or another Agent job still uses it, in which case it is kept and the reason is shown
+
+It never touches `master.dbo.sp_WhoIsActive`, the database itself, or the *Data Collector* category. Each step runs on its own with TRY/CATCH, and a result grid shows Done / Skipped / FAILED for each one.
 
 ## What gets created
 | Where | Object |
@@ -52,7 +105,7 @@ Edit `build/Install_template.sql` for changes to the logging part, then rebuild.
   tables with a different column layout (after an sp_WhoIsActive upgrade) are excluded instead of breaking the view.
 - Retention/views scoped to `dbo`; retention can't go below 1 day.
 - Prerequisite checks with `SET NOEXEC ON` (system DB / failed USE, Azure SQL DB, < 2016 SP1).
-- Uninstall block included (commented out).
+- Separate uninstall script and a multi-server PowerShell deploy script.
 
 ## Licenses
 - sp_WhoIsActive © 2007-2026 Adam Machanic — GPLv3 (embedded unmodified; the installer file as a whole is therefore distributed under GPLv3).

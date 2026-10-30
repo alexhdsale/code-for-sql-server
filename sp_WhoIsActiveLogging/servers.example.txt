@@ -1,0 +1,4 @@
+# One SQL Server instance per line. Blank lines and lines starting with # are ignored.
+# Named instance: SERVER\INSTANCE   Custom port: server.domain.com,1433
+SQL01
+SQL02\INST1

@@ -112,7 +112,7 @@ VALUES
     10,                                       /* RetentionDays        */
     N'NONE',                                  /* DataCompression      */
     1,                                        /* CreateClusteredIndex */
-    N'Log sp_WhoIsActive To A Daily Table',   /* JobName (Erik's)     */
+    N'Log sp_WhoIsActive To A Daily Table',   /* JobName              */
     NULL,                                     /* JobOwner             */
     1,                                        /* JobEnabled           */
     1,                                        /* ScheduleEveryMinutes */
@@ -1037,17 +1037,9 @@ GO
  EXECUTE dbo.sp_WhoIsActiveLogging_CreateViews;
 
 --------------------------------------------------------------------------------
- UNINSTALL (commented out on purpose - review, then run in the target database)
+ UNINSTALL
 --------------------------------------------------------------------------------
- EXECUTE msdb.dbo.sp_delete_job @job_name = N'Log sp_WhoIsActive To A Daily Table';
- DROP VIEW IF EXISTS dbo.WhoIsActive_blocking, dbo.WhoIsActive;
- DROP PROCEDURE IF EXISTS dbo.sp_WhoIsActiveLogging_Main,
-                          dbo.sp_WhoIsActiveLogging_Retention,
-                          dbo.sp_WhoIsActiveLogging_CreateViews,
-                          dbo.sp_WhoIsActive;
- -- daily tables: generate DROPs, review, then run
- SELECT N'DROP TABLE dbo.' + QUOTENAME(t.name) + N';'
- FROM sys.tables AS t
- WHERE t.schema_id = SCHEMA_ID(N'dbo')
- AND   t.name LIKE N'WhoIsActive[_][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%';
+ Use Uninstall_sp_WhoIsActiveLogging.sql (same folder): removes the job, views,
+ procedures, daily tables and dbo.sp_WhoIsActive, with a WhatIf dry-run mode.
+ Or: .\Deploy-WhoIsActiveLogging.ps1 -SqlInstance <server> -Action Uninstall
 ------------------------------------------------------------------------------*/
